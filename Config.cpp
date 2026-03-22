@@ -4,7 +4,7 @@
 #include "FileSystemManager.h"
 #include <LittleFS.h>
 #include <string.h>
-#include <TarGZ.h>
+#include "TarGZ.h"
 #include "DiagLog.h"
 #include "DiagConfig.h"
 

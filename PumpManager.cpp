@@ -4,7 +4,6 @@
 #include "Logging.h"
 #include "WebServerManager.h"
 #include "TemperatureControl.h"
-#include "SerialPrint.h"
 #include <Arduino.h>
 #include <FreeRTOS.h>
 #include <semphr.h>
@@ -42,7 +41,7 @@ int previousPumpModes[10];
 unsigned long lastBroadcastTime = 0;
 const unsigned long broadcastInterval = 10000; // 10 seconds
 
-String serialMessage = "";  // Define the global serial message variable
+
 Ticker broadcastPumpTicker; // Ticker for periodic pump state broadcasting
 Ticker pumpOffTicker;       // Ticker to handle the 10-minute timeout
 
@@ -398,20 +397,24 @@ void setPumpMode(int pumpIndex, int mode) {
 }
 
 
+
+
+
 // ***** PrintPumpStates Function *****
 void PrintPumpStates() {
-    serialMessage = ""; // Reset the serial message
     for (int i = 0; i < 10; i++) {
-        String pumpState = (pumpStates[i] == PUMP_ON) ? "on" : "off";
-        String pumpMode = (pumpModes[i] == PUMP_AUTO) ? "auto" :
-                          (pumpModes[i] == PUMP_ON) ? "on" : "off";
-        // Construct the serial message for each pump
-        serialMessage += "Pump " + String(i + 1) + ". State: " + pumpState +
-                         ", Mode: " + pumpMode + "\n";
+        const char* pumpState = (pumpStates[i] == PUMP_ON) ? "on" : "off";
+        const char* pumpMode  = (pumpModes[i] == PUMP_AUTO) ? "auto" :
+                                (pumpModes[i] == PUMP_ON)   ? "on"   : "off";
+
+        LOG_CAT(DBG_PUMP,
+                "[Pump] Pump %d. State: %s, Mode: %s\n",
+                i + 1,
+                pumpState,
+                pumpMode);
     }
-    // Call SerialPrint to print the serialMessage
-    SerialPrint(); // Assuming SerialPrint() prints the global serialMessage
 }
+
 
 // ***** Function to Turn All Pumps Back to "Auto" Mode After 10 Minutes *****
 void turnPumpsBackToAuto() {
@@ -449,24 +452,24 @@ void broadcastPumpState(int pumpIndex) {
             if (i < 9) message += ","; // Add comma except for the last pump
         }
         // Use the new PrintPumpStates function to handle serial printing
-        PrintPumpStates();
+                PrintPumpStates();
     } else { // Broadcast specific pump state for WebSocket
         if (pumpIndex < 0 || pumpIndex >= 10) {
-            // Prepare and set the serial message
-            serialMessage = "Invalid pump index in broadcastPumpState.\n";
-            SerialPrint(); // Print the serialMessage
+            LOG_ERR("[Pump] Invalid pump index in broadcastPumpState.\n");
             return;
         }
         String pumpState = (pumpStates[pumpIndex] == PUMP_ON) ? "on" : "off";
         String pumpMode = (pumpModes[pumpIndex] == PUMP_AUTO) ? "auto" :
                           (pumpModes[pumpIndex] == PUMP_ON) ? "on" : "off";
-        String pumpMessage = "pump" + String(pumpIndex + 1) + "State:" + pumpState +
+                String pumpMessage = "pump" + String(pumpIndex + 1) + "State:" + pumpState +
                              ",pump" + String(pumpIndex + 1) + "Mode:" + pumpMode;
         message = pumpMessage; // For a specific pump, the WebSocket message is just about that pump
-        // Prepare and set the serial message for the specific pump
-        serialMessage = "Pump " + String(pumpIndex + 1) + ". State: " + pumpState +
-                         ", Mode: " + pumpMode + "\n";
-        //SerialPrint(); // Print the serialMessage
+
+        LOG_CAT(DBG_PUMP,
+                "[Pump] Pump %d. State: %s, Mode: %s\n",
+                pumpIndex + 1,
+                pumpState.c_str(),
+                pumpMode.c_str());
     }
     // Send the compiled message to all WebSocket clients
     broadcastMessageOverWebSocket(message, "PumpStates");

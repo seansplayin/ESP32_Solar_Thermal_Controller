@@ -351,6 +351,44 @@ AsyncWebServer123 : It appears the previous changes helped but mcu is still cras
 Removed network recovery code from NetworkManager.cpp file. 
 Updated ESP board manager package 3.3.6 to 3.3.7
 
+SP32_Solar_Thermal_Controller_20260322103855
+
+ESP32_Solar_Thermal_Controller_
+
+ESP32_Solar_Thermal_Controller_
+
+ESP32_Solar_Thermal_Controller_
+
+ESP32_Solar_Thermal_Controller_
+
+ESP32_Solar_Thermal_Controller_
+
+ESP32_Solar_Thermal_Controller_
+
+ESP32_Solar_Thermal_Controller_
+
+ESP32_Solar_Thermal_Controller_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // sprintf is used for formatting outputs and can cause a stack overflow from writing outside it's alloted memory buffer. replace this function with string which uses heap instead of stack memory. Never use sprintf.
 // future remove TasksetupPumpBroadcasting() task and call setupPumpBroadcasting(); as part of updateTemperatures() function.

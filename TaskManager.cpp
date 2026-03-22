@@ -214,7 +214,11 @@ flagZeroLengthTemperatures = false;
 // ---------------- Boot chain tasks ----------------
 
 void TaskSetupRTC(void *pvParameters) {
+  Serial.println("[BOOT] TaskSetupRTC START");
+
   setupRTC();
+
+  Serial.println("[BOOT] TaskSetupRTC DONE");
   xTaskNotifyGive(thInitFileSystem);
   vTaskDelete(NULL);
 }
@@ -222,7 +226,11 @@ void TaskSetupRTC(void *pvParameters) {
 
 void TaskInitFileSystem(void *pvParameters) {
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  Serial.println("[BOOT] TaskInitFileSystem START");
+
   initializeFileSystem();
+
+  Serial.println("[BOOT] TaskInitFileSystem DONE");
   AlarmHistory_onFileSystemReady();
   closeAllOpenPumpLogs();
   if (thFileSystemCleanup != NULL) {
