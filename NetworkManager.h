@@ -1,7 +1,10 @@
-#ifndef NETWORKMANAGER_H
-#define NETWORKMANAGER_H
-#include "Config.h"
-bool isNetworkConnected();
-void setupNetwork();
+// NetworkManager.h
+#ifndef NETWORK_MANAGER_H
+#define NETWORK_MANAGER_H
 
-#endif // NETWORKMANAGER_H
+#include <Arduino.h>
+
+void setupNetwork();
+bool isNetworkConnected();
+
+#endif
