@@ -55,7 +55,7 @@ extern TaskHandle_t thUpdatePumpRuntimes;
 extern TaskHandle_t thPrintCpuStats;
 extern TaskHandle_t thFileSystemCleanup;
 extern TaskHandle_t thTaskLogger;
-extern TaskHandle_t thSystemStatsBroadcaster;
+extern TaskHandle_t thWebSocketTransmitter;
 extern TaskHandle_t thEndofBootup;
 
 // tgzProducer last-run stack stats (WORDS)

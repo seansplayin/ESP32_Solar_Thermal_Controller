@@ -33,10 +33,6 @@
 
 QueueHandle_t logQueue = nullptr;
 
-// Define the mutex handles
-SemaphoreHandle_t pumpStateMutex = NULL;
-SemaphoreHandle_t temperatureMutex = NULL;
-//SemaphoreHandle_t fileSystemMutex = NULL;
 
 // Define flag variables
 bool flagZeroLengthTime = false;
@@ -84,7 +80,7 @@ TaskHandle_t thUpdatePumpRuntimes = NULL;
 TaskHandle_t thPrintCpuStats = NULL;
 TaskHandle_t thFileSystemCleanup = NULL;
 TaskHandle_t thTaskLogger = NULL;
-TaskHandle_t thSystemStatsBroadcaster = NULL;
+TaskHandle_t thWebSocketTransmitter = NULL;
 TaskHandle_t thEndofBootup = NULL;
 
 
@@ -118,7 +114,7 @@ void monitorStacks() {
     {"PumpControl",              thPumpControl,                  4096},
     {"setupPumpBroadcasting",    thsetupPumpBroadcasting,        4096},
     {"StartServer",              thStartServer,                  4096},
-    {"SystemStatsBroadcaster",   thSystemStatsBroadcaster,       4096},
+    {"SystemStatsBroadcaster",   thWebSocketTransmitter,         4096},
     {"SetupFirstPage",           thSetupFirstPage,               2048},
     {"SetupSecondPage",          thSetupSecondPage,              4096},
     {"SetupThirdPage",           thSetupThirdPage,               4096},
@@ -639,60 +635,106 @@ void startAllTasks() {
 
   logQueue = xQueueCreate(20, sizeof(LogEvent));
 
-  // ---------------- Background tasks (run regardless of boot chain) ----------------
-  
-  // PINNED TO CORE 1: Heavy File System writes
+    // =========================
+  // TASK CREATION OPTIONS
+  // Leave ONE line enabled per task:
+  //   - xTaskCreate(...)                = FreeRTOS automatic balancing
+  //   - xTaskCreatePinnedToCore(...)    = explicit core pinning
+  //
+  // Testing goal:
+  //   - Network-related tasks pinned to CORE 0
+  //   - Everything else pinned to CORE 1
+  // =========================
+
+  // ---------------- Heavy File System writes ----------------
+  // xTaskCreate(TaskLogger, "TaskLogger", 4096, NULL, 1, &thTaskLogger);
   xTaskCreatePinnedToCore(TaskLogger, "TaskLogger", 4096, NULL, 1, &thTaskLogger, 1);
-  
-  // PINNED TO CORE 1: DS18B20 OneWire protocol (Disables Interrupts!)
+
+  // ---------------- DS18B20 OneWire protocol (disables interrupts) ----------------
+  // xTaskCreate(TaskUpdateTemperatures, "UpdateTemperature", 4096, NULL, 4, &thUpdateTemperatures);
   xTaskCreatePinnedToCore(TaskUpdateTemperatures, "UpdateTemperature", 4096, NULL, 4, &thUpdateTemperatures, 1);
-  
-  xTaskCreate(TaskPumpControl, "PumpControl", 4096, NULL, 4, &thPumpControl);
-  xTaskCreate(TasksetupPumpBroadcasting, "setupPumpBroadcasting", 4096, NULL, 2, &thsetupPumpBroadcasting);
-  xTaskCreate(TaskcheckTimeAndAct, "checkTimeAndAct", 4096, NULL, 2, &thcheckTimeAndAct);
-  xTaskCreate(TaskcheckAndSyncTime, "checkAndSyncTime", 4096, NULL, 2, &thcheckAndSyncTime);
-  xTaskCreate(TaskbroadcastTemperatures, "broadcastTemperatures", 4096, NULL, 3, &thbroadcastTemperatures);
-  xTaskCreate(TasklogZeroLengthMessages, "logZeroLengthMessages", 2048, NULL, 1, &thlogZeroLengthMessages);
-  xTaskCreate(TaskUpdatePumpRuntimes, "UpdatePumpRuntimes", 8192, NULL, 1, &thUpdatePumpRuntimes);
-  
-  // PINNED TO CORE 1: Heavy File System writes
+
+  // ---------------- Pump / scheduler / broadcast tasks ----------------
+  // xTaskCreate(TaskPumpControl, "PumpControl", 4096, NULL, 4, &thPumpControl);
+  xTaskCreatePinnedToCore(TaskPumpControl, "PumpControl", 4096, NULL, 4, &thPumpControl, 1);
+
+  // xTaskCreate(TasksetupPumpBroadcasting, "setupPumpBroadcasting", 4096, NULL, 2, &thsetupPumpBroadcasting);
+  xTaskCreatePinnedToCore(TasksetupPumpBroadcasting, "setupPumpBroadcasting", 4096, NULL, 2, &thsetupPumpBroadcasting, 1);
+
+  // xTaskCreate(TaskcheckTimeAndAct, "checkTimeAndAct", 4096, NULL, 2, &thcheckTimeAndAct);
+  xTaskCreatePinnedToCore(TaskcheckTimeAndAct, "checkTimeAndAct", 4096, NULL, 2, &thcheckTimeAndAct, 1);
+
+  // xTaskCreate(TaskcheckAndSyncTime, "checkAndSyncTime", 4096, NULL, 2, &thcheckAndSyncTime);
+  xTaskCreatePinnedToCore(TaskcheckAndSyncTime, "checkAndSyncTime", 4096, NULL, 2, &thcheckAndSyncTime, 1);
+
+  // xTaskCreate(TaskbroadcastTemperatures, "broadcastTemperatures", 4096, NULL, 3, &thbroadcastTemperatures);
+  //xTaskCreatePinnedToCore(TaskbroadcastTemperatures, "broadcastTemperatures", 4096, NULL, 3, &thbroadcastTemperatures, 1);
+
+  // xTaskCreate(TasklogZeroLengthMessages, "logZeroLengthMessages", 2048, NULL, 1, &thlogZeroLengthMessages);
+  xTaskCreatePinnedToCore(TasklogZeroLengthMessages, "logZeroLengthMessages", 2048, NULL, 1, &thlogZeroLengthMessages, 1);
+
+  // xTaskCreate(TaskUpdatePumpRuntimes, "UpdatePumpRuntimes", 8192, NULL, 1, &thUpdatePumpRuntimes);
+  xTaskCreatePinnedToCore(TaskUpdatePumpRuntimes, "UpdatePumpRuntimes", 8192, NULL, 1, &thUpdatePumpRuntimes, 1);
+
+  // ---------------- Heavy File System writes ----------------
+  // xTaskCreate(TaskTemperatureLogging, "TaskTemperatureLogging", 4096, NULL, 1, &thTemperatureLogging);
   xTaskCreatePinnedToCore(TaskTemperatureLogging, "TaskTemperatureLogging", 4096, NULL, 1, &thTemperatureLogging, 1);
 
   // ---------------- Boot chain tasks (all gated by notifications) ----------------
-  xTaskCreate(TaskSetupRTC, "SetupRTC", 4096, NULL, 1, &thSetupRTC);
-  
-  // PINNED TO CORE 1: File System mounting
-  xTaskCreatePinnedToCore(TaskInitFileSystem, "InitFileSystem", 4096, NULL, 1, &thInitFileSystem, 1);
-  
-  xTaskCreate(TaskInitSystemConfigDefaults, "initSystemConfigDefaults", 2048, NULL, 1, &thinitSystemConfigDefaults);
-  xTaskCreate(TaskInitTimeConfigDefaults, "initTimeConfigDefaults", 4096, NULL, 1, &thinitTimeConfigDefaults);
+  // xTaskCreate(TaskSetupRTC, "SetupRTC", 4096, NULL, 1, &thSetupRTC);
+  xTaskCreatePinnedToCore(TaskSetupRTC, "SetupRTC", 4096, NULL, 1, &thSetupRTC, 1);
 
-  // Load configs BEFORE bringing up the network
-  xTaskCreate(TaskLoadSystemConfigFromFS, "loadSystemConfigFromFS", 4096, NULL, 1, &thloadSystemConfigFromFS);
+  // xTaskCreate(TaskInitFileSystem, "InitFileSystem", 4096, NULL, 1, &thInitFileSystem);
+  xTaskCreatePinnedToCore(TaskInitFileSystem, "InitFileSystem", 4096, NULL, 1, &thInitFileSystem, 1);
+
+  // xTaskCreate(TaskInitSystemConfigDefaults, "initSystemConfigDefaults", 2048, NULL, 1, &thinitSystemConfigDefaults);
+  xTaskCreatePinnedToCore(TaskInitSystemConfigDefaults, "initSystemConfigDefaults", 2048, NULL, 1, &thinitSystemConfigDefaults, 1);
+
+  // xTaskCreate(TaskInitTimeConfigDefaults, "initTimeConfigDefaults", 4096, NULL, 1, &thinitTimeConfigDefaults);
+  xTaskCreatePinnedToCore(TaskInitTimeConfigDefaults, "initTimeConfigDefaults", 4096, NULL, 1, &thinitTimeConfigDefaults, 1);
+
+  // xTaskCreate(TaskLoadSystemConfigFromFS, "loadSystemConfigFromFS", 4096, NULL, 1, &thloadSystemConfigFromFS);
+  xTaskCreatePinnedToCore(TaskLoadSystemConfigFromFS, "loadSystemConfigFromFS", 4096, NULL, 1, &thloadSystemConfigFromFS, 1);
 
   // ---------------- NETWORK PROTOCOL TASKS ----------------
-  // PINNED TO CORE 0: Network drivers, W5500 interrupts, Server
+  // xTaskCreate(TaskSetupNetwork, "SetupNetwork", 4096, NULL, 5, &thSetupNetwork);
   xTaskCreatePinnedToCore(TaskSetupNetwork, "SetupNetwork", 4096, NULL, 5, &thSetupNetwork, 0);
+
+  // xTaskCreate(TaskInitNTP, "InitNTP", 4096, NULL, 1, &thInitNTP);
   xTaskCreatePinnedToCore(TaskInitNTP, "InitNTP", 4096, NULL, 1, &thInitNTP, 0);
+
+  // xTaskCreate(TaskStartServer, "StartServer", 4096, NULL, 1, &thStartServer);
   xTaskCreatePinnedToCore(TaskStartServer, "StartServer", 4096, NULL, 1, &thStartServer, 0);
 
-  xTaskCreate(TaskInitPumps, "InitPumps", 2048, NULL, 1, &thInitPumps);
+  // ---------------- Remaining init / route / UI tasks ----------------
+  // xTaskCreate(TaskInitPumps, "InitPumps", 2048, NULL, 1, &thInitPumps);
+  xTaskCreatePinnedToCore(TaskInitPumps, "InitPumps", 2048, NULL, 1, &thInitPumps, 1);
 
-  xTaskCreate(TaskSetupFirstPage, "SetupFirstPage", 2048, NULL, 1, &thSetupFirstPage);
-  xTaskCreate(TaskSetupSecondPage, "SetupSecondPage", 4096, NULL, 1, &thSetupSecondPage);
-  xTaskCreate(TaskSetupThirdPage, "SetupThirdPage", 4096, NULL, 1, &thSetupThirdPage);
-  xTaskCreate(TaskSetupLogDataRoute, "SetupLogDataRoute", 2048, NULL, 1, &thSetupLogDataRoute);
+  // xTaskCreate(TaskSetupFirstPage, "SetupFirstPage", 2048, NULL, 1, &thSetupFirstPage);
+  xTaskCreatePinnedToCore(TaskSetupFirstPage, "SetupFirstPage", 2048, NULL, 1, &thSetupFirstPage, 1);
 
-  // Gate refreshCurrentTime behind the route setup (so time display starts after routes are ready)
-  xTaskCreate(TaskrefreshCurrentTime, "refreshCurrentTime", 8192, NULL, 2, &threfreshCurrentTime);
+  // xTaskCreate(TaskSetupSecondPage, "SetupSecondPage", 4096, NULL, 1, &thSetupSecondPage);
+  xTaskCreatePinnedToCore(TaskSetupSecondPage, "SetupSecondPage", 4096, NULL, 1, &thSetupSecondPage, 1);
 
-  xTaskCreate(TaskWebSocketTransmitter, "WSTransmitter", 4096, NULL, 1, &thSystemStatsBroadcaster);
+  // xTaskCreate(TaskSetupThirdPage, "SetupThirdPage", 4096, NULL, 1, &thSetupThirdPage);
+  xTaskCreatePinnedToCore(TaskSetupThirdPage, "SetupThirdPage", 4096, NULL, 1, &thSetupThirdPage, 1);
+
+  // xTaskCreate(TaskSetupLogDataRoute, "SetupLogDataRoute", 2048, NULL, 1, &thSetupLogDataRoute);
+  xTaskCreatePinnedToCore(TaskSetupLogDataRoute, "SetupLogDataRoute", 2048, NULL, 1, &thSetupLogDataRoute, 1);
+
+  // xTaskCreate(TaskrefreshCurrentTime, "refreshCurrentTime", 8192, NULL, 2, &threfreshCurrentTime);
+  xTaskCreatePinnedToCore(TaskrefreshCurrentTime, "refreshCurrentTime", 8192, NULL, 2, &threfreshCurrentTime, 1);
+
+  // xTaskCreate(TaskWebSocketTransmitter, "WSTransmitter", 4096, NULL, 1, &thWebSocketTransmitter);
+  xTaskCreatePinnedToCore(TaskWebSocketTransmitter, "WSTransmitter", 4096, NULL, 1, &thWebSocketTransmitter, 0);
+
+  // xTaskCreate(TaskEndofBootup, "EndofBootup", 4096, NULL, 1, &thEndofBootup);
+  xTaskCreatePinnedToCore(TaskEndofBootup, "EndofBootup", 4096, NULL, 1, &thEndofBootup, 1);
 
   //xTaskCreate(TaskmonitorStacks, "monitorStacks", 4096, NULL, 1, &thmonitorStacks); // Displays memory usage
   //xTaskCreate(TaskPrintCpuStats, "CPUSTATS", 2048, nullptr, tskIDLE_PRIORITY+1, &thPrintCpuStats); // CPU usage
-  //xTaskCreate(TaskFileSystemCleanup, "FileSystemCleanup", 4096, NULL, 1, &thFileSystemCleanup);
-
-  xTaskCreate(TaskEndofBootup, "EndofBootup", 4096, NULL, 1, &thEndofBootup);
+  
+  
 
   AlarmHistory_begin();
 }

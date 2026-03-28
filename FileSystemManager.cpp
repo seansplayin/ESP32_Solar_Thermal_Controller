@@ -22,7 +22,7 @@
 #define FS_CLEANUP_DEBUG 0  // set to 1 temporarily if you want verbose listing
 
 
-SemaphoreHandle_t fileSystemMutex = xSemaphoreCreateMutex();
+SemaphoreHandle_t fileSystemMutex = nullptr;
 bool g_fileSystemReady = false; // Global Flag to enable Temp Log after FS Mount
 
 

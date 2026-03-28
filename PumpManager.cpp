@@ -14,6 +14,7 @@
 #include "AlarmManager.h"
 #include "DiagLog.h"
 
+SemaphoreHandle_t pumpStateMutex = nullptr;
 
 bool previousDHWCallStatus = false;
 bool previousHeatingCallStatus = false;
@@ -112,9 +113,6 @@ unsigned long lastStorageHeatChangeTime   = 0;
 unsigned long lastCircPumpChangeTime      = 0;
 unsigned long lastHeatTapeChangeTime      = 0;
 
-// External Mutex Handles
-extern SemaphoreHandle_t pumpStateMutex;
-extern SemaphoreHandle_t temperatureMutex;
 
 
 // Function Prototypes

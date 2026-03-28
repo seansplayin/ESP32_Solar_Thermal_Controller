@@ -11,7 +11,7 @@
 #include "DiagLog.h"
 #include "AlarmManager.h"
 
-extern SemaphoreHandle_t fileSystemMutex;
+
 
 // External temperature globals
 extern float panelT;

@@ -379,8 +379,10 @@ ESP32_Solar_Thermal_Controller_
 
 
 
-
-
+do this next.
+broadcastMessageOverWebSocket() does a per-client send loop, which is good, but ws.cleanupClients() 
+plus iterating all clients on every single message can still be a little expensive under churn. 
+It is not wrong, just something to keep in mind if you are chasing latency spikes.
 
 
 

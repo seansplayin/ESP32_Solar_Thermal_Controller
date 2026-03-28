@@ -65,7 +65,7 @@ extern float PotHeatXinletT;
 extern float PotHeatXoutletT;  
 extern DateTime CurrentTime; // Assuming this is declared elsewhere
 extern bool g_fileSystemReady;
-extern SemaphoreHandle_t fileSystemMutex;
+
 
 // Temperature broadcast task telemetry (defined in TaskManager.cpp)
 extern volatile uint32_t g_tempBcastCalled;
@@ -896,92 +896,114 @@ void sendSystemStats(AsyncWebSocketClient* client) {
 void TaskWebSocketTransmitter(void* pvParameters) {
     (void)pvParameters;
 
+    esp_task_wdt_add(NULL);
+
     if (g_tempWsPayloadMutex == NULL) {
         g_tempWsPayloadMutex = xSemaphoreCreateMutex();
     }
 
-    uint32_t lastFsMs   = 0;
-    uint32_t lastFastMs = 0;
+    uint32_t lastFsMs   = millis();
+    uint32_t lastFastMs = millis();
 
     String lastHeapStr;
     String lastPsramStr;
 
     for (;;) {
-        bool messageSent = false;
+        esp_task_wdt_reset();
+
+        bool didWork = false;
         const uint32_t now = millis();
 
-        // 1. Pump Status (Highest Priority)
+        // ------------------------------------------------------------
+        // Priority 1: immediate state changes
+        // Service at most ONE queued event per loop, then pace.
+        // ------------------------------------------------------------
+
         if (g_sendPumpStatus) {
             g_sendPumpStatus = false;
             sendPumpStatuses(nullptr);
-            messageSent = true;
+            didWork = true;
         }
-        // 2. Alarms
         else if (g_sendAlarmState) {
             g_sendAlarmState = false;
             broadcastAlarmStateOverWebSocket();
-            messageSent = true;
+            didWork = true;
         }
-        // 3. Configurations
         else if (g_sendConfig) {
             g_sendConfig = false;
             sendConfigurationValues(nullptr);
-            messageSent = true;
+            didWork = true;
         }
         else if (g_sendTimeConfig) {
             g_sendTimeConfig = false;
             sendTimeConfig(nullptr);
-            messageSent = true;
+            didWork = true;
         }
-        // 4. Temperatures (From TemperatureControl task)
         else if (g_sendTemperatures) {
             g_sendTemperatures = false;
-            String payload = "";
-            if (xSemaphoreTake(g_tempWsPayloadMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+
+            String payload;
+            if (g_tempWsPayloadMutex &&
+                xSemaphoreTake(g_tempWsPayloadMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 payload = g_tempWsPayload;
                 xSemaphoreGive(g_tempWsPayloadMutex);
             }
+
             if (payload.length() > 0) {
                 broadcastMessageOverWebSocket(payload, "Temperatures");
-                messageSent = true;
+                didWork = true;
             }
         }
-        // 5. Date Time (From RTCManager task)
         else if (g_sendDateTime) {
             g_sendDateTime = false;
             sendDateTime(nullptr);
-            messageSent = true;
+            didWork = true;
         }
-        // 6. System Stats (Every 5 seconds)
-        else if ((uint32_t)(now - lastFastMs) >= 5000UL) {
+
+        // ------------------------------------------------------------
+        // Priority 2: periodic stats
+        // Only run if no higher-priority work was sent this iteration.
+        // ------------------------------------------------------------
+
+        if (!didWork && (uint32_t)(now - lastFastMs) >= 5000UL) {
             lastFastMs = now;
+
             String heapStr  = getHeapInternalString();
             String psramStr = getPsramString();
+
             if (heapStr != lastHeapStr || psramStr != lastPsramStr) {
                 lastHeapStr  = heapStr;
                 lastPsramStr = psramStr;
-                broadcastMessageOverWebSocket("SysStats:heap=" + heapStr + "|psram=" + psramStr, "SysStats");
-                messageSent = true;
+
+                String msg = "SysStats:heap=" + heapStr + "|psram=" + psramStr;
+                broadcastMessageOverWebSocket(msg, "SysStats");
+                didWork = true;
             }
         }
-        // 7. FS Stats & Telemetry (Every 30 seconds)
-        else if ((uint32_t)(now - lastFsMs) >= 30000UL) {
+
+        if (!didWork && (uint32_t)(now - lastFsMs) >= 30000UL) {
             lastFsMs = now;
-            broadcastMessageOverWebSocket("FSStats:" + getFSStatsString(), "FSStats");
-            
-            const uint32_t called  = (uint32_t)g_tempBcastCalled;
-            const uint32_t skipped = (uint32_t)g_tempBcastSkipped;
-            broadcastMessageOverWebSocket("TempBcast:called=" + String(called) + "|skipped=" + String(skipped), "TempBcast");
-            
-            messageSent = true;
+
+            String fsMsg = "FSStats:" + getFSStatsString();
+            broadcastMessageOverWebSocket(fsMsg, "FSStats");
+            didWork = true;
         }
 
-        // --- THE PACEMAKER ---
-        if (messageSent) {
-            // Absolute guarantee the W5500 gets 30ms to clear its physical buffer
-            vTaskDelay(pdMS_TO_TICKS(30)); 
+        if (!didWork && (uint32_t)(now - lastFsMs) < 1000UL) {
+            String telemMsg = "TempBcast:called=" + String((uint32_t)g_tempBcastCalled) +
+                              "|skipped=" + String((uint32_t)g_tempBcastSkipped);
+            broadcastMessageOverWebSocket(telemMsg, "TempBcast");
+            didWork = true;
+        }
+
+        // ------------------------------------------------------------
+        // Pacemaker
+        // 30 ms after any send gives the W5500 time to drain.
+        // ------------------------------------------------------------
+
+        if (didWork) {
+            vTaskDelay(pdMS_TO_TICKS(30));
         } else {
-            // If nothing to send, sleep briefly to yield CPU
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -1537,8 +1559,7 @@ unsigned long aggregateDecadeLogsReport(int pumpIndex, DateTime currentTime) {
     LittleFS.mkdir("/Pump_Logs");
   }
 
-  if (!LittleFS.exists(filename)) {
-    LOG_CAT(DBG_FS, "Skipping missing file: %s\n", filename.c_str());
+    if (!LittleFS.exists(filename)) {
     xSemaphoreGive(fileSystemMutex);
     return 0;
   }

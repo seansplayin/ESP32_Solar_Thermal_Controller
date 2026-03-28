@@ -3,6 +3,13 @@
 #include "Config.h"
 #include <freertos/task.h>
 
+// -----------------------------------------------------------------------
+// Mutex handles as extern to be accessible in other files - do not change
+// -----------------------------------------------------------------------
+extern SemaphoreHandle_t pumpStateMutex;
+extern SemaphoreHandle_t temperatureMutex;
+extern SemaphoreHandle_t fileSystemMutex;
+
 // Task function declarations
 void TaskRTC(void *pvParameters);
 void TaskNetwork(void *pvParameters);
@@ -17,12 +24,14 @@ void TaskUpdateTemperatures(void *pvParameters);
 void TaskSerialPrint(void *pvParameters);
 void TaskFileSystemCleanup(void *pvParameters);
 void startAllTasks();
+
 // Declare flag variables
 extern bool flagZeroLengthTime;
   extern bool flagZeroLengthPumpState;
   extern bool flagZeroLengthTemperatures;
   extern TaskHandle_t thFileSystemCleanup;
 extern TaskHandle_t thEndofBootup;
+
 // tgz producer last-run stack stats (defined in TarGZ.cpp)
 extern volatile uint32_t tgzLastStackWords;
 extern volatile uint32_t tgzLastHwmWords;

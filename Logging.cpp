@@ -77,6 +77,7 @@ static int lastHourRan = -1;
 static const uint8_t kScheduleWindowSec = 2;
 
 // "once" guards
+static int g_lastturnOnAllPumpsFor10MinutesRan = -1;
 static int g_lastHealthHourRan = -1;         // 0..23
 static int g_lastFsCleanHourRan = -1;        // 0..23
 static int g_lastElapsedDayY = -1, g_lastElapsedDayM = -1, g_lastElapsedDayD = -1;
@@ -90,6 +91,7 @@ enum : uint32_t {
   JOB_FS_CLEAN    = (1u << 0),
   JOB_HEALTHCHECK = (1u << 1),
   JOB_AGGREGATE   = (1u << 2),
+  JOB_turnOnAllPumpsFor10Minutes = (1u << 3),
 };
 
 static inline bool rtcTimeLooksValid(const DateTime& t) {
@@ -706,6 +708,15 @@ void checkTimeAndAct() {
     }
   }
 
+  //turnOnAllPumpsFor10Minutes(); hourly at :40 (windowed + once-per-hour guard)
+  if (CurrentTime.minute() == 40 && withinWindow(CurrentTime)) {
+    int h = CurrentTime.hour();
+    if (h != g_lastturnOnAllPumpsFor10MinutesRan) {
+      g_lastturnOnAllPumpsFor10MinutesRan = h;
+      scheduleJob(JOB_turnOnAllPumpsFor10Minutes);
+    }
+  }
+
   // -----------------------------
   // 2) Execute scheduled jobs (single worker context)
   // -----------------------------
@@ -729,5 +740,9 @@ void checkTimeAndAct() {
 
   if (jobs & JOB_HEALTHCHECK) {
     runHourlyHealthCheck();
+  }
+
+  if (jobs & JOB_turnOnAllPumpsFor10Minutes) {
+    turnOnAllPumpsFor10Minutes();
   }
 }

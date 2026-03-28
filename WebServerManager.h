@@ -8,6 +8,13 @@
 #include "TemperatureControl.h" // Include TemperatureControl header
 #include <freertos/semphr.h>
 
+// -----------------------------------------------------------------------
+// Mutex handles as extern to be accessible in other files - do not change
+// -----------------------------------------------------------------------
+extern SemaphoreHandle_t pumpStateMutex;
+extern SemaphoreHandle_t temperatureMutex;
+extern SemaphoreHandle_t fileSystemMutex;
+
 extern AsyncWebServer server;
 extern AsyncWebSocket ws;
 void setupRoutes();

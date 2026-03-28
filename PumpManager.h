@@ -7,6 +7,13 @@ const int NUM_PUMPS = 10;
 
 extern const char* pumpNames[NUM_PUMPS];
 
+// -----------------------------------------------------------------------
+// Mutex handles as extern to be accessible in other files - do not change
+// -----------------------------------------------------------------------
+extern SemaphoreHandle_t pumpStateMutex;
+extern SemaphoreHandle_t temperatureMutex;
+extern SemaphoreHandle_t fileSystemMutex;
+
 void broadcastPumpState(int pumpIndex = -1);
 void setPumpState(int pumpIndex, int state);
 void togglePumpState(int pumpIndex);

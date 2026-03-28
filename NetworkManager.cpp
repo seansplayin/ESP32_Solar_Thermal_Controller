@@ -22,7 +22,7 @@
 
 // 20MHz ensures stable SPI over jumper wires without truncating frames
 #ifndef ETH_SPI_FREQ_MHZ
-#define ETH_SPI_FREQ_MHZ 20
+#define ETH_SPI_FREQ_MHZ 5
 #endif
 
 static volatile bool eth_connected = false;

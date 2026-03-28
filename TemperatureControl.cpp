@@ -11,9 +11,7 @@
 #include "DiagLog.h"
 
 
-
-// Mutex for temperature data access
-extern SemaphoreHandle_t temperatureMutex;
+SemaphoreHandle_t temperatureMutex = nullptr;
 
 Ticker temperatureTicker;
 
