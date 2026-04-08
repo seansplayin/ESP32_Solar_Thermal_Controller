@@ -151,8 +151,7 @@ AsyncWebServer030.1 :
     Reverted this this version after discovering the global wdt time out code inside the Setup() previously used was incorrect and not changing the wdt reset value from the default of 5 seconds. MCU is stable as long as webpage is not being used and if used w5500 tcpip causes a wdt reset. moved all the tasks back to rtos core selection so they are not longer pinned to a specific core and system is stable. pump runtimes are showing 24/hr/day runtimes. 
 AsyncWebServer030.2 : 
     added new function closeAllOpenPumpLogs() to handle stray start events in pumpX_Log.txt files. 
-AsyncWebServer031 :  
-    Compiles and runs PumpControl still trips 5 second wdt, found bug in wdt code in setup that left wdt reset to default of 5 seconds. increased wdt to 15 seconds and sketch is running with all wdt enabled. reset/crashes occur every couple of days. 
+AsyncWebServer031 :  Compiles and runs PumpControl still trips 5 second wdt, found bug in wdt code in setup that left wdt reset to default of 5 seconds. increased wdt to 15 seconds and sketch is running with all wdt enabled. reset/crashes occur every couple of days. 
 AsyncWebServer032 : 
     rewrite PumpControl function so it no longer calls UpdateTemperatures grabbing temperatureMutex momemtarily to grab global temperature values from temperature arrays to reduce computation load. UpdateTemperatures function is still dominating cpu usage.  
 AsyncWebServer033 : 
@@ -351,19 +350,43 @@ AsyncWebServer123 : It appears the previous changes helped but mcu is still cras
 Removed network recovery code from NetworkManager.cpp file. 
 Updated ESP board manager package 3.3.6 to 3.3.7
 
-SP32_Solar_Thermal_Controller_20260322103855
+SP32_Solar_Thermal_Controller_20260322103855 - Still troubleshooting Network Dropouts. Unable to find island of stability with older sketches or libraries AsyncTCP, ESPAsyncWebServer, ESP board manager, continuing troubleshooing  on latest sketch version and 1 year old libries. commented out TaskbroadcastTemperatures no difference. lowering W5500 spi mhz increases crash frequency, raised to 30 mhz 30+ mninutes without a crash. suspicion data flooding onto ws buss from multiple sources may be causing this.  
 
-ESP32_Solar_Thermal_Controller_
+ESP32_Solar_Thermal_Controller_20260331001314 - Still troubleshooting network dropouts. reduced number of blind calls dumping data to the ws bus. found that second-page and third-page are working properly including lardge directory downloads now and connection was live for 30 minutes with no errors. After connecting to the firstwebpage it loaded successfully but within a minute 
+00:09:46.981 -> Guru Meditation Error: Core  0 panic'ed (LoadProhibited). Exception was unhandled.
+00:09:47.023 -> 
+00:09:47.023 -> Core  0 register dump:
+00:09:47.023 -> PC      : 0x420da412  PS      : 0x00060b30  A0      : 0x820618ff  A1      : 0x3fccd5c0  
+00:09:47.045 -> A2      : 0x00000000  A3      : 0x3c161b58  A4      : 0x42049ed4  A5      : 0x3fccf0c8  
+00:09:47.045 -> A6      : 0x3fcdb750  A7      : 0x3fcb6ed8  A8      : 0xacc4420d  A9      : 0xaca84307  
+00:09:47.045 -> A10     : 0x00060b23  A11     : 0x00000000  A12     : 0x00060b20  A13     : 0x00000000  
+00:09:47.045 -> A14     : 0x00000000  A15     : 0x3fcb6ed8  SAR     : 0x00000009  EXCCAUSE: 0x0000001c  
+00:09:47.077 -> EXCVADDR: 0xaca84396  LBEG    : 0x420597d5  LEND    : 0x420597e3  LCOUNT  : 0x00000000  
+00:09:47.077 -> 
+00:09:47.077 -> 
+00:09:47.077 -> Backtrace: 0x420da40f:0x3fccd5c0 0x420618fc:0x3fccd5e0 0x42060919:0x3fccd600 0x42060935:0x3fccd620 0x42060af4:0x3fccd660 0x42061210:0x3fccd680 0x420da34f:0x3fccd6a0 0x42049dc0:0x3fccd6c0 0x4206090d:0x3fccd6e0 0x42060935:0x3fccd700 0x42061844:0x3fccd740 0x42085d89:0x3fccd760 0x42073815:0x3fccd780 0x420e6ed1:0x3fccd7a0 0x420e6f43:0x3fccd800 0x4037f9e5:0x3fccd820
+00:09:47.110 -> 
+00:09:47.110 -> 
+00:09:47.110 -> 
+00:09:47.110 -> 
+00:09:47.110 -> ELF file SHA256: 9122fd972
+00:09:47.110 -> 
+00:09:47.504 -> Rebooting...
 
-ESP32_Solar_Thermal_Controller_
+ESP32_Solar_Thermal_Controller_20260331074857 - Continued reducing ws.send calls. Iframe for Pump Runtime did experience a duplication of data when I refreshed the firstwebpage connection but new reconnect logic worked and browser was back alive all night long with very few network related errors.
+need to update libraries 
+ESPAsyncWebServer version 3.9.2 ->3.10.3
+Async TCP version 3.4.9 _> 3.4.10
 
-ESP32_Solar_Thermal_Controller_
+ESP32_Solar_Thermal_Controller_20260401071219 - Continued troubleshooting Network disconnects. suspect multiple culprits. continued reducing non-gatekeeper websocket broadcasts and still have many more to eliminate. system is able to reconnect network for the most part but webpage dropped out after 12 hours runtime, no crashes in 23 hours runtime. 
 
-ESP32_Solar_Thermal_Controller_
+ESP32_Solar_Thermal_Controller_20260401074730 - Firstwebpage has a huge ws burst in the first 1.15 seconds sending hello:FirstWebpage, InitPumpStatus, initHeatingCalls, initTemperatures, initConfig, initTimeConfig, initAlarmState, initSystemStats, initDateTime, getUptime, with run through const initMsgs command but also a burst including Heap, PSRAM, File System happen. inside sensSystemStats(AsyncWebSocketClient* client) we combined Heap + PSRAM into one WS frame and FS into a separate frame.. Staggered that burst to allow breathing room for ws. Finished combining stray ws calls into queue for orderly staged ws messages. 
 
-ESP32_Solar_Thermal_Controller_
+ESP32_Solar_Thermal_Controller_20260405235043 - Still troubleshooting W5500 network dropouts. Calling SPI commands with two different SPI peripherals can be unstable in a large complex sketch. Max31865 was using software spi, Created HSPI object on SPI3 hardware controller and it is now using hardware spi to reduce CPU load and discovered SDI&SDO pins were reversed and software was adjusting.  Added FSPI on Fast SPI2 buss creating spiW5500 object and associated spi calls to protect W5500 from global SPI and reduce CPU load.
 
-ESP32_Solar_Thermal_Controller_
+ESP32_Solar_Thermal_Controller_20260406202652 - Many changes made but none helped.
+
+ESP32_Solar_Thermal_Controller_20260406230948 - Powering ESP32 from wall power did not reduce the Network Dropouts. Tasks are now back to unpinned because pinning did not help. Added broadcasttemperatures into WebSocketTransmitter function to create a "Single Sender" dumping data on the WS bus. commented out FSStats call in checkTimeAndAct function but still did not help. Reworked TaskUpdateTemperaturs and TaskPumpControl functions but still did not help. 
 
 ESP32_Solar_Thermal_Controller_
 
@@ -391,7 +414,7 @@ It is not wrong, just something to keep in mind if you are chasing latency spike
 
 
 
-
+// Move checktimeandsync out of Logging.cpp
 // sprintf is used for formatting outputs and can cause a stack overflow from writing outside it's alloted memory buffer. replace this function with string which uses heap instead of stack memory. Never use sprintf.
 // future remove TasksetupPumpBroadcasting() task and call setupPumpBroadcasting(); as part of updateTemperatures() function.
 // future add format littleFS option to webpage

@@ -14,9 +14,7 @@
 
 // RTC DS3231
 RTC_DS3231 rtc;
-//const int pinSDA = 20;
-//const int pinSCL = 21;
-//const int sqwPin = 47; // GPIO pin connected to DS3231 SQW
+
 DateTime CurrentTime; // This holds the current time updated periodically
 //Ticker dateTimeTickerObject; // This is the Ticker object
 
@@ -98,12 +96,15 @@ String getCurrentDateStringMDY() {
 
 
 void broadcastDateTime() {
-    // Flag the gatekeeper to broadcast the time
+    // One-shot helper for explicit sync events only
     extern volatile bool g_sendDateTime;
     g_sendDateTime = true;
 }
 
 void refreshCurrentTime() {
     CurrentTime = rtc.now(); // Refresh the global CurrentTime variable
-    broadcastDateTime(); // Formats time and then broadcasts through ws (websocket)
+
+    // IMPORTANT:
+    // Do NOT continuously flag DateTime for WS broadcast here.
+    // FirstWebpage now keeps time locally after initial sync.
 }

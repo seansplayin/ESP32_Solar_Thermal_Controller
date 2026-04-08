@@ -592,36 +592,23 @@ static String formatBytes(size_t v) {
 
 
 // Returns file system stats: JSON string with used, total, free, pctUsed plus friendly labels
-String getFSStatsString() {
-  static size_t s_total = 0;
-  static size_t s_used  = 0;
-  static uint32_t s_lastMs = 0;
+// Pre-load with safe dummy data so early web clients don't crash
+String g_cachedFsStatsJson = "{\"usedBytes\":0,\"totalBytes\":0,\"freeBytes\":0,\"pctUsed\":0.0,\"usedLabel\":\"--\",\"freeLabel\":\"--\",\"totalLabel\":\"--\"}";
 
-  const uint32_t now = millis();
-  const uint32_t intervalMs = 30000;
+void updateFSStatsCache() {
+  if (!g_fileSystemReady) return;
 
-  size_t total = s_total;
-  size_t used  = s_used;
-
-  // Refresh cache at most every intervalMs
-  if (g_fileSystemReady && (s_total == 0 || (uint32_t)(now - s_lastMs) >= intervalMs)) {
-
-    // Non-blocking (short) lock attempt — if busy, return cached values
-    if (xSemaphoreTake(fileSystemMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      s_total  = LittleFS.totalBytes();
-      s_used   = LittleFS.usedBytes();
-      s_lastMs = now;
-
-      total = s_total;
-      used  = s_used;
-
-      xSemaphoreGive(fileSystemMutex);
-    }
+  // Non-blocking (short) lock attempt. If the FS is busy appending a log, skip and try next time.
+  if (!takeFileSystemMutexWithRetry("[FSCache]", pdMS_TO_TICKS(100), 2)) {
+    return;
   }
 
-  if (total == 0) {
-    return String("FS: unknown");
-  }
+  // Perform the heavy flash read
+  size_t total = LittleFS.totalBytes();
+  size_t used  = LittleFS.usedBytes();
+
+  // Release the flash mutex IMMEDIATELY so logging tasks can proceed
+  xSemaphoreGive(fileSystemMutex);
 
   size_t freeBytes = (total > used) ? (total - used) : 0;
   float pctUsed    = (total > 0) ? ((float)used / (float)total) * 100.0f : 0.0f;
@@ -630,13 +617,17 @@ String getFSStatsString() {
   String usedStr  = formatBytes(used);
   String freeStr  = formatBytes(freeBytes);
 
-  String out = "{\"usedBytes\":" + String(used) +
+  // Update the global RAM cache
+  g_cachedFsStatsJson = "{\"usedBytes\":" + String(used) +
                ",\"totalBytes\":" + String(total) +
                ",\"freeBytes\":" + String(freeBytes) +
                ",\"pctUsed\":" + String(pctUsed, 1) +
                ",\"usedLabel\":\"" + usedStr + "\"" +
                ",\"freeLabel\":\"" + freeStr + "\"" +
                ",\"totalLabel\":\"" + totalStr + "\"}";
+}
 
-  return out;
+// The WebSocket transmitter will now call this, which returns instantly from RAM (0ms)
+String getFSStatsString() {
+  return g_cachedFsStatsJson;
 }

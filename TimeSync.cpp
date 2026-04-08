@@ -52,7 +52,7 @@ void checkAndSyncTime() {
         initNTP();
         lastSyncDate = now;
 
-        //turnOnAllPumpsFor10Minutes();  // your existing test hook
+        
     }
 }
 }

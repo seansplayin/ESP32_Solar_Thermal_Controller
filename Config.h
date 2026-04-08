@@ -89,7 +89,7 @@ const int W5500_MISO = 13;
 const int W5500_SCK = 12;
 const int W5500_SS = 10;
 const int W5500_INT = 4;
-const int W5500_RST = 9;
+const int W5500_RST = 41;
 // -----------------------------------------------------------------------
 
 
@@ -97,8 +97,8 @@ const int W5500_RST = 9;
 // -----------------------------------------------------------------------
 // Pin numbers for DS3231 Real time clock 
 // -----------------------------------------------------------------------
-const int pinSDA = 40;
-const int pinSCL = 41;
+const int pinSDA = 8;
+const int pinSCL = 9;
 const int sqwPin = 42; 
 // -----------------------------------------------------------------------
 
@@ -116,8 +116,8 @@ const int DHW_HEATING_PIN     = 3; // was on gpio 36 and home solar controller w
 // -----------------------------------------------------------------------
 // pin # for one wire temperature sensors - one buss inside one buss outside
 // -----------------------------------------------------------------------
-const int ONE_WIRE_BUS_1 = 20; // One Wire Bus for DS18B20 Temperature Sensors 
-const int ONE_WIRE_BUS_2 = 21; // One Wire Bus 2 for DS18B20 Temperature Sensors
+const int ONE_WIRE_BUS_1 = 1; // One Wire Bus for DS18B20 Temperature Sensors 
+const int ONE_WIRE_BUS_2 = 2; // One Wire Bus 2 for DS18B20 Temperature Sensors
 // -----------------------------------------------------------------------
 
 
@@ -125,10 +125,10 @@ const int ONE_WIRE_BUS_2 = 21; // One Wire Bus 2 for DS18B20 Temperature Sensors
 // -----------------------------------------------------------------------
 // Adafruit_MAX31865(5, 19, 45, 18); - Pin specifications for Max31865
 // -----------------------------------------------------------------------
-#define MAX31865_CS_PIN    5   // spi Cable Select
-#define MAX31865_DO_PIN    19  // spi MISO/SDO (Serial Data Out)
-#define MAX31865_DI_PIN    45  // spi MOSI/SDI (Serial Data In)
-#define MAX31865_CLK_PIN   18  // spi Clock
+constexpr int MAX31865_CS_PIN  =  5;   // spi Cable Select
+constexpr int MAX31865_DO_PIN  =  21;  // spi MISO/SDO (Serial Data Out) on Max31865 pin is identified as Do
+constexpr int MAX31865_DI_PIN  =  45;  // spi MOSI/SDI (Serial Data In)  on Max31865 pin is identified as Di
+constexpr int MAX31865_CLK_PIN =  18;  // spi Clock
 // -----------------------------------------------------------------------
 
 
@@ -163,7 +163,7 @@ const int CIRC_PUMP_RELAY       = 15;
 const int DHW_PUMP_RELAY        = 16;
 const int STORAGE_HEAT_RELAY    = 17;
 const int BOILER_CIRC_RELAY     = 47;
-const int RECIRC_VALVE_RELAY    = 8; // was on pin 35 house controller will need this changed when uplaoding this sketch
+const int RECIRC_VALVE_RELAY    = 40; // was on pin 35 house controller will need this changed when uplaoding this sketch
 const int Pump_9_Unused_Relay   = 38;
 const int Pump_10_Unused_Relay  = 39;
 // -----------------------------------------------------------------------
@@ -405,7 +405,7 @@ float getTempByIndex(int idx);
 
 
 // -----------------------------------------------------------------------
-// Runtime System Configuration (editable via web UI)
+// Freezed Protection Runtime System Configuration (editable via web UI)
 // -----------------------------------------------------------------------
 struct SystemConfig {
     // ---- Serial diagnostics (runtime toggles; future web UI) ----
@@ -485,33 +485,35 @@ extern TimeConfig g_timeConfig;
 
 #endif // CONFIG_H
 
-// ---------------------------------------------------------
-// ESP32-S3_DevkitC-1 Top View Pin Identification
-// ---------------------------------------------------------
-//  https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/_images/ESP32-S3_DevKitC-1_pinlayout_v1.1.jpg
-//                               ESP32-S3-DevkitC-1
-//                                ESP32-S3-WROOM-1
-//                            ________________________    
-//.                                3V3________GND
-//                                 3V3________TX=GPIO43
-//                          RST----RST________RX=GPIO44
-//                W5500_INT_PIN=GPIoO4________1=GPIoO1    
-//              MAX31865_CS_PIN=GPIoO5________2=GPIoO2    
-//        Pump_1_LEAD_RELAY_PIN=GPIoO6________GPIo42=RTC DS3231 sqwPin
-//         Pump_2_LAD_RELAY_PIN=GPIoO7________GPIo41=RTC DS3231 pinSCL
-//   Pump_4_CIRC_PUMP_RELAY_PIN=GPIo15________GPIo40=RTC DS3231 pinSDA
-//    Pump_5_DHW_PUMP_RELAY_PIN=GPIo16________GPIo39=PUMP_10_Unused_RELAY
-//Pump_6_STORAGE_HEAT_RELAY_PIN=GPIo17________GPIo38=PUMP_9_Unused_RELAY
-//            MAX31865_CLK_PIN =GPIo18________GPIo37 (Reserved for PSRAM Now)  
-//         PUMP_8_RECIRC_VALVE =GPIoO8________GPIo36=formorly DHW_HEATING_PIN = 36 >GPIO3 (Reserved for PSRAM Now)
-//              DHW_Heating_Pin =GPIO3________GPIo35=PUMP_8_RECIRC_VALVE >GPIO8
-//                              GPIO46________GPIoO0  
-//            W5500_Reset_Pin  =GPioO9________GPIo45=MAX31865_SDO_MISO_PIN
-//            W5500_SS_PIN     =GPIo10________GPIo48=FURANCE_HEATING_PIN
-//            W5500_MOSI_PIN   =GPIo11________GPIo47=Pump_7_BOILER_CIRC_RELAY_PIN
-//            W5500_SCK_PIN    =GPIo12________GPIo21=ONE_WIRE_BUS_2
-//            W5500_MISO_PIN   =GPIo13________GPIo20=ONE_WIRE_BUS
-// Pump_3__HEAT_TAPE_RELAY_PIN =GPIo14________GPIo19=MAX31865_SDI_MOSI_PIN
-//                             5V0--5V________GND
-//                              GND--G________GND
-//                                  UART     USB
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//                                                   ESP32-S3_DevkitC-1 Top View Pin Identification
+// |---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+// |                  https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/_images/ESP32-S3_DevKitC-1_pinlayout_v1.1.jpg                                              |
+// |                                                                ESP32-S3-DevkitC-1-N8R8                                                                                    |
+// |                                                                    ESP32-S3-WROOM-1                                                                                       |
+// |                                                                   ___________________                                                                                     |    
+// |                                                            3Volt  |~3V~~~~~~~~~~~GR~|  GROUND                                                                             |
+// |                                                            3Volt  |~3V~~~~~~~~~~~43~|  GPIO43 = USB TX - Unused to enable native USB connection                           |
+// |                                                            RESET  |~RS~~~~~~~~~~~44~|  GPIO44 = USB RX - Unused to enable native USB connection                           |
+// |                                           W5500_INT_PIN = GPIoO4  |~04~~~~~~~~~~~01~|  GPIoO1 = ONE_WIRE_BUS                                                              |
+// |                                         MAX31865_CS_PIN = GPIoO5  |~05~~~~~~~~~~~02~|  GPIoO2 = ONE_WIRE_BUS_2                                                            |
+// |                                   Pump_1_LEAD_RELAY_PIN = GPIoO6  |~06~~~~~~~~~~~42~|  GPIo42 = RTC DS3231 sqwPin                                                         |
+// |                                    Pump_2_LAD_RELAY_PIN = GPIoO7  |~07~~~~~~~~~~~41~|  GPIo41 = Formerly RTC DS3231 pinSCL now = W5500_Reset_Pin                          |
+// |                              Pump_4_CIRC_PUMP_RELAY_PIN = GPIo15  |~15~~~~~~~~~~~40~|  GPIo40 = Formerly RTC DS3231 pinSDA now = PUMP_8_RECIRC_VALVE                      |
+// |                               Pump_5_DHW_PUMP_RELAY_PIN = GPIo16  |~16~~~~~~~~~~~39~|  GPIo39 = PUMP_10_Unused_RELAY                                                      |
+// |                           Pump_6_STORAGE_HEAT_RELAY_PIN = GPIo17  |~17~~~~~~~~~~~38~|  GPIo38 = PUMP_9_Unused_RELAY                                                       |
+// |                                        MAX31865_CLK_PIN = GPIo18  |~18~~~~~~~~~~~37~|  GPIo37 = (Reserved for PSRAM Now)                                                  |
+// |      Formerly PUMP_8_RECIRC_VALVE now RTC DS3231 pinSDA = GPIoO8  |~08~~~~~~~~~~~36~|  GPIo36 = formerly DHW_HEATING_PIN = 36 >GPIO3 (Reserved for PSRAM Now)             |
+// |                                         DHW_Heating_Pin = GPIoO3  |~03~~~~~~~~~~~35~|  GPIo35 = formerly PUMP_8_RECIRC_VALVE >GPIO8 (Reserved for PSRAM Now)              |
+// |                                  strapping pin - Unused = GPIO46  |~46~~~~~~~~~~~00~|  GPIoO0 = Unused - Strapping pin                                                    |
+// |          Formorly W5500_Reset_Pin now RTC DS3231 pinSCL = GPioO9  |~09~~~~~~~~~~~45~|  GPIo45 = MAX31865_SDO_MISO_PIN                                                     |
+// |                                        W5500_SS_PIN     = GPIo10  |~10~~~~~~~~~~~48~|  GPIo48 = FURANCE_HEATING_PIN                                                       |
+// |                                        W5500_MOSI_PIN   = GPIo11  |~11~~~~~~~~~~~47~|  GPIo47 = Pump_7_BOILER_CIRC_RELAY_PIN                                              |
+// |                                        W5500_SCK_PIN    = GPIo12  |~12~~~~~~~~~~~21~|  GPIo21 = Formerly ONE_WIRE_BUS_2 now = MAX31865_SDI_MOSI_PIN                       |
+// |                                        W5500_MISO_PIN   = GPIo13  |~13~~~~~~~~~~~20~|  GPIo20 = Formerly ONE_WIRE_BUS now = unused & Reserved for USB+                    |
+// |                             Pump_3__HEAT_TAPE_RELAY_PIN = GPIo14  |~14~~~~~~~~~~~19~|  GPIo19 = Formorly MAX31865_SDI_MOSI_PIN now = unused & Reserved for USB-           |
+// |                                                            5Volt  |~5V~~~~~~~~~~~GR~|  GROUND                                                                             |
+// |                                                           Ground  |~GR~~~~~~~~~~~GR~|  GROUND                                                                             |
+// |                                                                   |   UART    USB   |                                                                                     |
+// |                                                                   |__|---|___|---|__|                                                                                     | 
+// |___________________________________________________________________________________________________________________________________________________________________________|

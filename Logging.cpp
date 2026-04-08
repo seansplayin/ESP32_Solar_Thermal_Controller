@@ -80,6 +80,7 @@ static const uint8_t kScheduleWindowSec = 2;
 static int g_lastturnOnAllPumpsFor10MinutesRan = -1;
 static int g_lastHealthHourRan = -1;         // 0..23
 static int g_lastFsCleanHourRan = -1;        // 0..23
+static int g_lastNtpSyncY = -1, g_lastNtpSyncM = -1, g_lastNtpSyncD = -1;
 static int g_lastElapsedDayY = -1, g_lastElapsedDayM = -1, g_lastElapsedDayD = -1;
 static int g_lastAggY = -1, g_lastAggM = -1, g_lastAggD = -1;
 
@@ -670,13 +671,24 @@ void maybeRunHealthCheckHourly() {
     }
   }
 }
-
 void checkTimeAndAct() {
   // If RTC isn't valid yet, do not run time-based jobs
   if (!rtcTimeLooksValid(CurrentTime)) return;
 
   // -----------------------------
-  // 1) Schedule jobs (windowed)
+  // 1) High-Frequency / Non-Job Updates
+  // -----------------------------
+  /*
+  // Update the File System stats cache every 5 minutes (e.g., :00, :05, :10...)
+  static int g_lastFsStatsMinute = -1;
+  int currentMin = CurrentTime.minute();
+  if (currentMin % 5 == 0 && currentMin != g_lastFsStatsMinute) {
+    g_lastFsStatsMinute = currentMin;
+    updateFSStatsCache();
+  }
+*/
+  // -----------------------------
+  // 2) Schedule jobs (windowed)
   // -----------------------------
 
   // Set Elapsed_Day near end of day (allow window so we don't miss it)
@@ -708,7 +720,7 @@ void checkTimeAndAct() {
     }
   }
 
-  //turnOnAllPumpsFor10Minutes(); hourly at :40 (windowed + once-per-hour guard)
+  // turnOnAllPumpsFor10Minutes(); hourly at :40 (windowed + once-per-hour guard)
   if (CurrentTime.minute() == 40 && withinWindow(CurrentTime)) {
     int h = CurrentTime.hour();
     if (h != g_lastturnOnAllPumpsFor10MinutesRan) {
@@ -717,8 +729,23 @@ void checkTimeAndAct() {
     }
   }
 
+  // Daily 3AM NTP sync (windowed + once-per-day guard)
+  if (CurrentTime.hour() == 3 && CurrentTime.minute() == 0 && withinWindow(CurrentTime)) {
+    if (g_lastNtpSyncY != CurrentTime.year() ||
+        g_lastNtpSyncM != CurrentTime.month() ||
+        g_lastNtpSyncD != CurrentTime.day()) {
+
+      g_lastNtpSyncY = CurrentTime.year();
+      g_lastNtpSyncM = CurrentTime.month();
+      g_lastNtpSyncD = CurrentTime.day();
+
+      LOG_CAT(DBG_TIMESYNC, "[TimeSync] 3AM daily sync window hit, calling initNTP()\n");
+      initNTP();
+    }
+  }
+
   // -----------------------------
-  // 2) Execute scheduled jobs (single worker context)
+  // 3) Execute scheduled jobs (single worker context)
   // -----------------------------
   uint32_t jobs = claimJobs();
   if (!jobs) return;

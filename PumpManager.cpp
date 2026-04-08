@@ -357,8 +357,8 @@ void sendHeatingCallStatus(bool dhwCallActive, bool heatingCallActive) {
     heatingCallData += "DHW:" + dhwStatus + ",";
     heatingCallData += "Heating:" + heatingStatus;
 
-    // Send the message to all connected WebSocket clients
-    ws.textAll(heatingCallData);
+    // Queue for the gatekeeper task
+    queueWsBroadcast(heatingCallData, "HeatingCalls");
 }
 
 
@@ -436,22 +436,10 @@ void turnOnAllPumpsFor10Minutes() {
 
 // ***** Broadcast Pump State Function *****  
 void broadcastPumpState(int pumpIndex) {
-    String message = "";
     if (pumpIndex == -1) {
-        // Broadcast all pump states for WebSocket
-        for (int i = 0; i < 10; i++) {
-            String pumpState = (pumpStates[i] == PUMP_ON) ? "on" : "off";
-            String pumpMode = (pumpModes[i] == PUMP_AUTO) ? "auto" :
-                              (pumpModes[i] == PUMP_ON) ? "on" : "off";
-            // Prepare WebSocket message
-            String pumpMessage = "pump" + String(i + 1) + "State:" + pumpState +
-                                 ",pump" + String(i + 1) + "Mode:" + pumpMode;
-            message += pumpMessage;
-            if (i < 9) message += ","; // Add comma except for the last pump
-        }
-        // Use the new PrintPumpStates function to handle serial printing
-                PrintPumpStates();
-    } else { // Broadcast specific pump state for WebSocket
+        // Serial diagnostics only
+        PrintPumpStates();
+    } else { // Log specific pump state only
         if (pumpIndex < 0 || pumpIndex >= 10) {
             LOG_ERR("[Pump] Invalid pump index in broadcastPumpState.\n");
             return;
@@ -459,9 +447,6 @@ void broadcastPumpState(int pumpIndex) {
         String pumpState = (pumpStates[pumpIndex] == PUMP_ON) ? "on" : "off";
         String pumpMode = (pumpModes[pumpIndex] == PUMP_AUTO) ? "auto" :
                           (pumpModes[pumpIndex] == PUMP_ON) ? "on" : "off";
-                String pumpMessage = "pump" + String(pumpIndex + 1) + "State:" + pumpState +
-                             ",pump" + String(pumpIndex + 1) + "Mode:" + pumpMode;
-        message = pumpMessage; // For a specific pump, the WebSocket message is just about that pump
 
         LOG_CAT(DBG_PUMP,
                 "[Pump] Pump %d. State: %s, Mode: %s\n",
@@ -469,8 +454,9 @@ void broadcastPumpState(int pumpIndex) {
                 pumpState.c_str(),
                 pumpMode.c_str());
     }
-    // Send the compiled message to all WebSocket clients
-    broadcastMessageOverWebSocket(message, "PumpStates");
+
+    // Let the gatekeeper send the consolidated PumpStatus JSON
+    g_sendPumpStatus = true;
 }
 
 

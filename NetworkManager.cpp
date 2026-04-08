@@ -20,16 +20,34 @@
 #define ETH_PHY_IRQ  W5500_INT
 #define ETH_PHY_RST  W5500_RST
 
-// 20MHz ensures stable SPI over jumper wires without truncating frames
 #ifndef ETH_SPI_FREQ_MHZ
-#define ETH_SPI_FREQ_MHZ 5
+#define ETH_SPI_FREQ_MHZ 10
 #endif
 
+// EXPLICITLY CLAIM FSPI TO LOCK W5500
+SPIClass spiW5500(FSPI);
+
 static volatile bool eth_connected = false;
+static volatile bool eth_link_up   = false;
+
+// ---------------- Network recovery state ----------------
+static TaskHandle_t s_netRecoverTask = nullptr;
+static volatile bool s_netRecoverPending = false;
+static volatile bool s_ethRestartInProgress = false;
+static volatile uint32_t s_lastLinkDownMs = 0;
+static volatile uint32_t s_lastLinkUpMs   = 0;
+static volatile uint32_t s_lastRecoverMs  = 0;
+static volatile uint32_t s_lastGotIpMs    = 0;
+
+static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000;   
+static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000;  
+static const uint32_t NET_RECOVER_WAIT_IP_MS  = 15000;  
+
+static void requestNetworkRecovery();
+static void NetworkRecoveryTask(void* pvParameters);
 
 // =========================================================================
 // --- Custom Rate-Limited Log Interceptor (Smart Cache) ---
-// Prevents high-frequency SPI corruption events from overwhelming the UART
 // =========================================================================
 static vprintf_like_t s_old_vprintf = nullptr;
 
@@ -86,37 +104,153 @@ int w5500_rate_limited_vprintf(const char *fmt, va_list ap) {
 static void hardResetW5500() {
   pinMode(ETH_PHY_RST, OUTPUT);
   digitalWrite(ETH_PHY_RST, LOW);
-  vTaskDelay(pdMS_TO_TICKS(100)); 
+  vTaskDelay(pdMS_TO_TICKS(100));
   digitalWrite(ETH_PHY_RST, HIGH);
-  vTaskDelay(pdMS_TO_TICKS(250)); 
+  vTaskDelay(pdMS_TO_TICKS(250));
+}
+
+static void requestNetworkRecovery() {
+  s_netRecoverPending = true;
+
+  if (s_netRecoverTask != nullptr) {
+    xTaskNotifyGive(s_netRecoverTask);
+  }
+}
+
+static void NetworkRecoveryTask(void* pvParameters) {
+  (void)pvParameters;
+
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if (!s_netRecoverPending) continue;
+
+    while (s_netRecoverPending) {
+      uint32_t now = millis();
+
+      if (eth_connected) {
+        s_netRecoverPending = false;
+        break;
+      }
+
+      if (eth_link_up) {
+        uint32_t upFor = now - s_lastLinkUpMs;
+        if (upFor < NET_RECOVER_WAIT_IP_MS) {
+          vTaskDelay(pdMS_TO_TICKS(250));
+          continue;
+        }
+      }
+
+      uint32_t downFor = now - s_lastLinkDownMs;
+      if (downFor < NET_DOWN_DEBOUNCE_MS) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        continue;
+      }
+
+      uint32_t sinceRecover = now - s_lastRecoverMs;
+      if (sinceRecover < NET_RECOVER_COOLDOWN_MS) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        continue;
+      }
+
+      s_netRecoverPending = false;
+      s_lastRecoverMs = now;
+
+      LOG_ERR("[Network] Debounced recovery: restarting W5500 / ETH stack\n");
+      eth_link_up = false;
+      eth_connected = false;
+
+      ETH.end();
+      vTaskDelay(pdMS_TO_TICKS(300));
+
+      spiW5500.end(); // USED LOCKED SPI
+      vTaskDelay(pdMS_TO_TICKS(50));
+
+      hardResetW5500();
+
+      gpio_uninstall_isr_service();
+      vTaskDelay(pdMS_TO_TICKS(20));
+
+      pinMode(W5500_INT, INPUT_PULLUP);
+      spiW5500.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_SS);
+
+      bool ethStarted = ETH.begin(
+        ETH_PHY_TYPE,
+        ETH_PHY_ADDR,
+        ETH_PHY_CS,
+        ETH_PHY_IRQ,
+        ETH_PHY_RST,
+        spiW5500, // USED LOCKED SPI
+        ETH_SPI_FREQ_MHZ
+      );
+
+      if (!ethStarted) {
+        LOG_ERR("[Network] Recovery ETH.begin failed\n");
+        AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet recovery ETH.begin failed");
+        break;
+      }
+
+      uint32_t waitStart = millis();
+      while (!eth_connected && (millis() - waitStart < NET_RECOVER_WAIT_IP_MS)) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+      }
+
+      if (eth_connected && ETH.localIP() != IPAddress(0, 0, 0, 0)) {
+        LOG_CAT(DBG_NET, "[Network] Recovery successful. IP: %s\n",
+                ETH.localIP().toString().c_str());
+      } else {
+        LOG_ERR("[Network] Recovery timed out waiting for IP\n");
+        AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet recovery timed out waiting for IP");
+      }
+
+      break;
+    }
+  }
 }
 
 void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  (void)info;
+
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
       LOG_CAT(DBG_NET, "[Network] Ethernet Started\n");
       ETH.setHostname("esp32s3-solar");
       break;
 
-    case ARDUINO_EVENT_ETH_CONNECTED:
+        case ARDUINO_EVENT_ETH_CONNECTED:
       LOG_CAT(DBG_NET, "[Network] Ethernet Connected\n");
+      eth_link_up = true;
+      s_lastLinkUpMs = millis();
       break;
 
     case ARDUINO_EVENT_ETH_GOT_IP:
       LOG_CAT(DBG_NET, "[Network] Ethernet Got IP: %s\n", ETH.localIP().toString().c_str());
+      eth_link_up = true;
       eth_connected = true;
+      s_lastLinkUpMs = millis();
+      s_lastGotIpMs = millis();
+      s_netRecoverPending = false;
       break;
 
     case ARDUINO_EVENT_ETH_LOST_IP:
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       LOG_ERR("[Network] Ethernet Disconnected/Lost IP\n");
+      eth_link_up = false;
       eth_connected = false;
-      AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet Hardware Link Dropped");
+      s_lastLinkDownMs = millis();
+      if (!s_ethRestartInProgress) {
+        requestNetworkRecovery();
+      }
       break;
 
     case ARDUINO_EVENT_ETH_STOP:
       LOG_ERR("[Network] Ethernet Stopped\n");
+      eth_link_up = false;
       eth_connected = false;
+      s_lastLinkDownMs = millis();
+      if (!s_ethRestartInProgress) {
+        requestNetworkRecovery();
+      }
       break;
 
     default:
@@ -129,38 +263,68 @@ void setupNetwork() {
   esp_log_level_set("w5500", ESP_LOG_ERROR);
 
   if (s_old_vprintf == nullptr) {
-      s_old_vprintf = esp_log_set_vprintf(w5500_rate_limited_vprintf);
+    s_old_vprintf = esp_log_set_vprintf(w5500_rate_limited_vprintf);
   }
 
-  // We only reset the W5500 ONCE at boot, before the driver takes over.
-  hardResetW5500();
-  Network.onEvent(onEvent);
-  
-  LOG_CAT(DBG_NET, "[Network] Attempting initial setup...\n");
-  
+  if (s_netRecoverTask == nullptr) {
+    xTaskCreatePinnedToCore(
+      NetworkRecoveryTask,
+      "NetRecover",
+      4096,
+      nullptr,
+      3,
+      &s_netRecoverTask,
+      1
+    );
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(500));
+
+  // Configure INT pin BEFORE reset
   pinMode(W5500_INT, INPUT_PULLUP);
-  SPI.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_SS);
-  
-  bool ethStarted = ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_CS, ETH_PHY_IRQ, ETH_PHY_RST, SPI, ETH_SPI_FREQ_MHZ);
+
+  // Start explicitly named FSPI BEFORE reset so bus is valid
+  spiW5500.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_SS);
+
+  hardResetW5500();
+
+  vTaskDelay(pdMS_TO_TICKS(200)); 
+
+  Network.onEvent(onEvent);
+
+  LOG_CAT(DBG_NET, "[Network] Attempting initial setup...\n");
+
+  bool ethStarted = ETH.begin(
+    ETH_PHY_TYPE,
+    ETH_PHY_ADDR,
+    ETH_PHY_CS,
+    ETH_PHY_IRQ,
+    ETH_PHY_RST,
+    spiW5500, // USED LOCKED SPI
+    ETH_SPI_FREQ_MHZ
+  );
 
   if (!ethStarted) {
     LOG_ERR("[Network] ETH.begin failed!\n");
+    AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Initial ETH.begin failed");
     return;
   }
 
   unsigned long startTime = millis();
-  const unsigned long timeout = 15000; 
+  const unsigned long timeout = 15000;
   while (!eth_connected && (millis() - startTime < timeout)) {
-    vTaskDelay(pdMS_TO_TICKS(200)); 
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
 
   if (eth_connected && ETH.localIP() != IPAddress(0, 0, 0, 0)) {
     LOG_CAT(DBG_NET, "[Network] Setup successful. IP: %s\n", ETH.localIP().toString().c_str());
   } else {
     LOG_ERR("[Network] Initial IP assignment timeout (Will continue in background).\n");
+    s_lastLinkDownMs = millis();
+    requestNetworkRecovery();
   }
 }
 
 bool isNetworkConnected() {
-  return eth_connected && ETH.localIP() != IPAddress(0, 0, 0, 0);
+  return eth_link_up && eth_connected && ETH.localIP() != IPAddress(0, 0, 0, 0);
 }

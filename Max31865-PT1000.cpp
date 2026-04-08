@@ -8,11 +8,18 @@
 #include "esp_task_wdt.h"
 #include "DiagLog.h"
 #include "AlarmManager.h"
+#include <SPI.h>
 
 #define RREF      4300.0
 #define RNOMINAL  1000.0
 
-Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS_PIN, MAX31865_DO_PIN, MAX31865_DI_PIN, MAX31865_CLK_PIN);
+// 1. Create a dedicated HSPI instance to force Max31865 to use Hardware SPI
+SPIClass spiMAX(HSPI);
+
+//Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS_PIN, MAX31865_DO_PIN, MAX31865_DI_PIN, MAX31865_CLK_PIN);
+// 2. Use the 2-argument constructor: (CS_PIN, &SPI_PORT) this will force hardware spi mode.
+Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS_PIN, &spiMAX);
+
 
 float pt1000Current = 0.0;
 float pt1000Average = 0.0;
@@ -22,6 +29,11 @@ float pt1000Values[pt1000NumReadings];
 int pt1000Index = 0;
 
 void initPT1000Sensor() {
+
+    // 3. Initialize the HSPI bus BEFORE beginning the thermo sensor
+    // spiMAX.begin(SCK, MISO, MOSI, SS);
+    spiMAX.begin(MAX31865_CLK_PIN, MAX31865_DO_PIN, MAX31865_DI_PIN, MAX31865_CS_PIN);
+
     thermo.begin(MAX31865_4WIRE);
 
     for (int i = 0; i < pt1000NumReadings; i++) {

@@ -42,6 +42,8 @@ void closeAllOpenPumpLogs();
 // ================================
 // MEMORY / DISK STATS
 // ================================
+extern String g_cachedFsStatsJson;
+void updateFSStatsCache();
 String getFSStatsString();
 
 // ================================

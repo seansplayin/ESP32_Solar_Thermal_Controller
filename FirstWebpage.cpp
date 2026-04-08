@@ -740,11 +740,29 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
         console.log('WebSocket connected');
         wsBackoffMs = 1000; // reset backoff on success
 
-        ws.send('hello:FirstWebpage');
-        ws.send('init');
+        // IMPORTANT:
+        // Keep FirstWebpage init intentionally slow and front-load only the
+        // smallest / highest-value items first. Heavy items come later.
+        const initMsgs = [
+          [0,    'hello:FirstWebpage'],
+          [250,  'initPumpStatus'],
+          [550,  'initHeatingCalls'],
+          [900,  'initAlarmState'],
+          [1300, 'initConfig'],
+          [1700, 'initTimeConfig'],
+          [2200, 'initDateTime'],
+          [2600, 'getUptime'],
+          [3400, 'initSystemStats'],
+          [4500, 'initTemperatures']
+        ];
 
-        // One-time sync; browser ticks locally after this
-        if (ws.readyState === WebSocket.OPEN) ws.send('getUptime');
+        initMsgs.forEach(function(item) {
+          setTimeout(function () {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(item[1]);
+            }
+          }, item[0]);
+        });
       };
 
       ws.onmessage = function (event) {
@@ -753,7 +771,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
       ws.onclose = function () {
         console.log('WebSocket closed - scheduling reconnect');
-        // Exponential backoff
+
         var delay = wsBackoffMs;
         wsBackoffMs = Math.min(wsBackoffMs * 2, wsBackoffMaxMs);
 
@@ -863,17 +881,10 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     }
 
 
-    ws.onopen = function () {
-      console.log('WebSocket connected');
-      ws.send('hello:FirstWebpage');
-      ws.send('init');
-
-      // One-time sync; browser ticks locally after this
-      if (ws.readyState === WebSocket.OPEN) ws.send('getUptime');
-    };
-
     setInterval(function () {
-      if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send('ping');
+      }
     }, 30000);
 
     let currentConfig = {};
@@ -954,11 +965,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       }
 
 
-    ws.onmessage = function (event) {
-      handleWebSocketMessage(event.data);
-    };
-
-    document.getElementById('allAutoButton').addEventListener('click', function () {
+        document.getElementById('allAutoButton').addEventListener('click', function () {
       ws.send('setAllPumps:auto');
     });
 

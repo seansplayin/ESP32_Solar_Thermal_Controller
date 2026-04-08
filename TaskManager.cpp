@@ -123,7 +123,6 @@ void monitorStacks() {
     {"checkTimeAndAct",          thcheckTimeAndAct,              4096},
     {"checkAndSyncTime",         thcheckAndSyncTime,             4096},
     {"SerialPrint",              thSerialPrint,                  2048},
-    {"broadcastTemperatures",    thbroadcastTemperatures,        4096},
     {"logZeroLengthMessages",    thlogZeroLengthMessages,        2048},
     {"UpdatePumpRuntimes",       thUpdatePumpRuntimes,           8192},
     {"TaskTemperatureLogging",   thTemperatureLogging,           4096},
@@ -392,26 +391,49 @@ void TaskrefreshCurrentTime(void *pv) {
 // ---------------- Background tasks (unchanged behavior) ----------------
 
 void TaskUpdateTemperatures(void *pvParameters) {
-  esp_task_wdt_add(NULL);
-  for (;;) {
-    updateTemperatures();
-    esp_task_wdt_reset();
-    vTaskDelay(pdMS_TO_TICKS(5000));
-  }
+    (void)pvParameters;
+    
+    // 1. Register this task with the Watchdog Timer
+    esp_task_wdt_add(NULL); 
+    
+    const TickType_t xFrequency = pdMS_TO_TICKS(5000); // 5 Seconds
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    for (;;) {
+        // 2. CRITICAL: Pet the watchdog so the ESP32 doesn't reboot!
+        esp_task_wdt_reset(); 
+
+        // 3. Read the physical hardware (DS18B20s, PT1000)
+        updateTemperatures(); 
+
+        // 4. Run your 2-decimal change detection logic.
+        broadcastTemperatures(); 
+
+        // 5. Sleep exactly until the next interval
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
 }
 
 
 void TaskPumpControl(void *pvParameters) {
+  (void)pvParameters; // Good practice to prevent compiler warnings
+  
   const TickType_t bootDelayTicks = pdMS_TO_TICKS(15000);
   vTaskDelay(bootDelayTicks);
 
-  esp_task_wdt_add(NULL);
+  // 1. Register with Watchdog
+  esp_task_wdt_add(NULL); 
+  
   TickType_t xLastWakeTime = xTaskGetTickCount();
+  
   for (;;) {
-    esp_task_wdt_reset();
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
+    // 2. Pet the Watchdog at the start of every loop
+    esp_task_wdt_reset(); 
+    
     PumpControl();
-    esp_task_wdt_reset();
+    
+    // 3. Sleep for 1 second
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
   }
 }
 
@@ -436,47 +458,6 @@ void TaskcheckTimeAndAct(void *pvParameters) {
     esp_task_wdt_reset();
     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
     checkTimeAndAct();
-    esp_task_wdt_reset();
-  }
-}
-
-
-void TaskcheckAndSyncTime(void *pvParameters) {
-  esp_task_wdt_add(NULL);
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  for (;;) {
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
-    esp_task_wdt_reset();
-    checkAndSyncTime();
-    esp_task_wdt_reset();
-  }
-}
-
-
-void TaskbroadcastTemperatures(void *pvParameters) {
-  esp_task_wdt_add(NULL);
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  for (;;) {
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5000));
-    esp_task_wdt_reset();
-
-    // Only broadcast if at least one client is connected AND can accept data now
-    ws.cleanupClients();
-    bool anyWritableClient = false;
-    for (auto& client : ws.getClients()) {
-      if (client.status() != WS_CONNECTED) continue;
-      if (client.queueIsFull()) continue;
-      if (!client.canSend()) continue;
-      anyWritableClient = true;
-      break;
-    }
-    if (anyWritableClient) {
-      g_tempBcastCalled++;
-      broadcastTemperatures();
-    } else {
-      g_tempBcastSkipped++;
-    }
-
     esp_task_wdt_reset();
   }
 }
@@ -618,123 +599,109 @@ void TaskFileSystemCleanup(void *pvParameters) {
 
 
 
-// ========================= TASKS (FULL SECTION) =========================
-// This task section matches the boot-chain order used by startAllTasks().
-// Boot chain (notify gated):
-//   SetupRTC -> InitFileSystem -> InitSystemConfigDefaults -> InitTimeConfigDefaults
-//   -> LoadSystemConfigFromFS(+diag) -> SetupNetwork -> InitNTP -> InitPumps -> StartServer
-//   -> SetupFirstPage -> SetupSecondPage -> SetupThirdPage -> SetupLogDataRoute -> refreshCurrentTime
-//
-// WDT bugfix included in TaskSetupNetwork and TaskInitNTP:
-//   - Do NOT esp_task_wdt_add() before ulTaskNotifyTake() blocking call.
-// =======================================================================
+// ====================================================== TASKS (FULL SECTION) ===================================================
 
 void startAllTasks() {
 
   AlarmManager_begin();
 
-  logQueue = xQueueCreate(20, sizeof(LogEvent));
+  logQueue = xQueueCreate(30, sizeof(LogEvent));
 
-    // =========================
-  // TASK CREATION OPTIONS
-  // Leave ONE line enabled per task:
-  //   - xTaskCreate(...)                = FreeRTOS automatic balancing
-  //   - xTaskCreatePinnedToCore(...)    = explicit core pinning
-  //
-  // Testing goal:
-  //   - Network-related tasks pinned to CORE 0
-  //   - Everything else pinned to CORE 1
-  // =========================
 
-  // ---------------- Heavy File System writes ----------------
-  // xTaskCreate(TaskLogger, "TaskLogger", 4096, NULL, 1, &thTaskLogger);
-  xTaskCreatePinnedToCore(TaskLogger, "TaskLogger", 4096, NULL, 1, &thTaskLogger, 1);
+  // =============================================================================================================================
+  // ----------------------------------------- CORE 0: Background, Heavy I/O, Web, & Sensors -------------------------------------
+  // Pinning OneWire here prevents it from blinding the Ethernet MAC interrupts on Core 1.
+  // =============================================================================================================================
+  //xTaskCreatePinnedToCore(TaskLogger, "TaskLogger", 4096, NULL, 1, &thTaskLogger, 0);
+   xTaskCreate(TaskLogger, "TaskLogger", 4096, NULL, 1, &thTaskLogger);
 
-  // ---------------- DS18B20 OneWire protocol (disables interrupts) ----------------
-  // xTaskCreate(TaskUpdateTemperatures, "UpdateTemperature", 4096, NULL, 4, &thUpdateTemperatures);
-  xTaskCreatePinnedToCore(TaskUpdateTemperatures, "UpdateTemperature", 4096, NULL, 4, &thUpdateTemperatures, 1);
+  //xTaskCreatePinnedToCore(TaskUpdateTemperatures, "UpdateTemperature", 4096, NULL, 4, &thUpdateTemperatures, 0);
+   xTaskCreate(TaskUpdateTemperatures, "UpdateTemperature", 4096, NULL, 4, &thUpdateTemperatures);
 
-  // ---------------- Pump / scheduler / broadcast tasks ----------------
-  // xTaskCreate(TaskPumpControl, "PumpControl", 4096, NULL, 4, &thPumpControl);
-  xTaskCreatePinnedToCore(TaskPumpControl, "PumpControl", 4096, NULL, 4, &thPumpControl, 1);
+  //xTaskCreatePinnedToCore(TaskTemperatureLogging, "TaskTemperatureLogging", 4096, NULL, 1, &thTemperatureLogging, 0);
+   xTaskCreate(TaskTemperatureLogging, "TaskTemperatureLogging", 4096, NULL, 1, &thTemperatureLogging);
 
-  // xTaskCreate(TasksetupPumpBroadcasting, "setupPumpBroadcasting", 4096, NULL, 2, &thsetupPumpBroadcasting);
-  xTaskCreatePinnedToCore(TasksetupPumpBroadcasting, "setupPumpBroadcasting", 4096, NULL, 2, &thsetupPumpBroadcasting, 1);
+  //xTaskCreatePinnedToCore(TaskUpdatePumpRuntimes, "UpdatePumpRuntimes", 8192, NULL, 1, &thUpdatePumpRuntimes, 0);
+   xTaskCreate(TaskUpdatePumpRuntimes, "UpdatePumpRuntimes", 8192, NULL, 1, &thUpdatePumpRuntimes);
 
-  // xTaskCreate(TaskcheckTimeAndAct, "checkTimeAndAct", 4096, NULL, 2, &thcheckTimeAndAct);
-  xTaskCreatePinnedToCore(TaskcheckTimeAndAct, "checkTimeAndAct", 4096, NULL, 2, &thcheckTimeAndAct, 1);
+  //xTaskCreatePinnedToCore(TaskInitNTP, "InitNTP", 4096, NULL, 1, &thInitNTP, 0);
+   xTaskCreate(TaskInitNTP, "InitNTP", 4096, NULL, 1, &thInitNTP);
 
-  // xTaskCreate(TaskcheckAndSyncTime, "checkAndSyncTime", 4096, NULL, 2, &thcheckAndSyncTime);
-  xTaskCreatePinnedToCore(TaskcheckAndSyncTime, "checkAndSyncTime", 4096, NULL, 2, &thcheckAndSyncTime, 1);
 
-  // xTaskCreate(TaskbroadcastTemperatures, "broadcastTemperatures", 4096, NULL, 3, &thbroadcastTemperatures);
-  //xTaskCreatePinnedToCore(TaskbroadcastTemperatures, "broadcastTemperatures", 4096, NULL, 3, &thbroadcastTemperatures, 1);
+  //xTaskCreatePinnedToCore(TaskWebSocketTransmitter, "WSTransmitter", 4096, NULL, 1, &thWebSocketTransmitter, 0);
+   xTaskCreate(TaskWebSocketTransmitter, "WSTransmitter", 4096, NULL, 1, &thWebSocketTransmitter);
 
-  // xTaskCreate(TasklogZeroLengthMessages, "logZeroLengthMessages", 2048, NULL, 1, &thlogZeroLengthMessages);
-  xTaskCreatePinnedToCore(TasklogZeroLengthMessages, "logZeroLengthMessages", 2048, NULL, 1, &thlogZeroLengthMessages, 1);
 
-  // xTaskCreate(TaskUpdatePumpRuntimes, "UpdatePumpRuntimes", 8192, NULL, 1, &thUpdatePumpRuntimes);
-  xTaskCreatePinnedToCore(TaskUpdatePumpRuntimes, "UpdatePumpRuntimes", 8192, NULL, 1, &thUpdatePumpRuntimes, 1);
 
-  // ---------------- Heavy File System writes ----------------
-  // xTaskCreate(TaskTemperatureLogging, "TaskTemperatureLogging", 4096, NULL, 1, &thTemperatureLogging);
-  xTaskCreatePinnedToCore(TaskTemperatureLogging, "TaskTemperatureLogging", 4096, NULL, 1, &thTemperatureLogging, 1);
+// =============================================================================================================================
+// -------------------------------------------Boot sequence and routing (Run once and die)--------------------------------------
+// =============================================================================================================================
+  //xTaskCreatePinnedToCore(TaskSetupRTC, "SetupRTC", 4096, NULL, 1, &thSetupRTC, 0);
+   xTaskCreate(TaskSetupRTC, "SetupRTC", 4096, NULL, 1, &thSetupRTC);
 
-  // ---------------- Boot chain tasks (all gated by notifications) ----------------
-  // xTaskCreate(TaskSetupRTC, "SetupRTC", 4096, NULL, 1, &thSetupRTC);
-  xTaskCreatePinnedToCore(TaskSetupRTC, "SetupRTC", 4096, NULL, 1, &thSetupRTC, 1);
+  //xTaskCreatePinnedToCore(TaskInitFileSystem, "InitFileSystem", 4096, NULL, 1, &thInitFileSystem, 0);
+   xTaskCreate(TaskInitFileSystem, "InitFileSystem", 4096, NULL, 1, &thInitFileSystem);
 
-  // xTaskCreate(TaskInitFileSystem, "InitFileSystem", 4096, NULL, 1, &thInitFileSystem);
-  xTaskCreatePinnedToCore(TaskInitFileSystem, "InitFileSystem", 4096, NULL, 1, &thInitFileSystem, 1);
+  //xTaskCreatePinnedToCore(TaskInitSystemConfigDefaults, "initSystemConfigDefaults", 2048, NULL, 1, &thinitSystemConfigDefaults, 0);
+   xTaskCreate(TaskInitSystemConfigDefaults, "initSystemConfigDefaults", 2048, NULL, 1, &thinitSystemConfigDefaults);
 
-  // xTaskCreate(TaskInitSystemConfigDefaults, "initSystemConfigDefaults", 2048, NULL, 1, &thinitSystemConfigDefaults);
-  xTaskCreatePinnedToCore(TaskInitSystemConfigDefaults, "initSystemConfigDefaults", 2048, NULL, 1, &thinitSystemConfigDefaults, 1);
+  //xTaskCreatePinnedToCore(TaskInitTimeConfigDefaults, "initTimeConfigDefaults", 4096, NULL, 1, &thinitTimeConfigDefaults, 0);
+   xTaskCreate(TaskInitTimeConfigDefaults, "initTimeConfigDefaults", 4096, NULL, 1, &thinitTimeConfigDefaults);
 
-  // xTaskCreate(TaskInitTimeConfigDefaults, "initTimeConfigDefaults", 4096, NULL, 1, &thinitTimeConfigDefaults);
-  xTaskCreatePinnedToCore(TaskInitTimeConfigDefaults, "initTimeConfigDefaults", 4096, NULL, 1, &thinitTimeConfigDefaults, 1);
+  //xTaskCreatePinnedToCore(TaskLoadSystemConfigFromFS, "loadSystemConfigFromFS", 4096, NULL, 1, &thloadSystemConfigFromFS, 0);
+   xTaskCreate(TaskLoadSystemConfigFromFS, "loadSystemConfigFromFS", 4096, NULL, 1, &thloadSystemConfigFromFS);
 
-  // xTaskCreate(TaskLoadSystemConfigFromFS, "loadSystemConfigFromFS", 4096, NULL, 1, &thloadSystemConfigFromFS);
-  xTaskCreatePinnedToCore(TaskLoadSystemConfigFromFS, "loadSystemConfigFromFS", 4096, NULL, 1, &thloadSystemConfigFromFS, 1);
+  //xTaskCreatePinnedToCore(TaskInitPumps, "InitPumps", 2048, NULL, 1, &thInitPumps, 0);
+   xTaskCreate(TaskInitPumps, "InitPumps", 2048, NULL, 1, &thInitPumps);
 
-  // ---------------- NETWORK PROTOCOL TASKS ----------------
-  // xTaskCreate(TaskSetupNetwork, "SetupNetwork", 4096, NULL, 5, &thSetupNetwork);
-  xTaskCreatePinnedToCore(TaskSetupNetwork, "SetupNetwork", 4096, NULL, 5, &thSetupNetwork, 0);
+  //xTaskCreatePinnedToCore(TaskSetupFirstPage, "SetupFirstPage", 2048, NULL, 1, &thSetupFirstPage, 0);
+   xTaskCreate(TaskSetupFirstPage, "SetupFirstPage", 2048, NULL, 1, &thSetupFirstPage);
 
-  // xTaskCreate(TaskInitNTP, "InitNTP", 4096, NULL, 1, &thInitNTP);
-  xTaskCreatePinnedToCore(TaskInitNTP, "InitNTP", 4096, NULL, 1, &thInitNTP, 0);
+  //xTaskCreatePinnedToCore(TaskSetupSecondPage, "SetupSecondPage", 4096, NULL, 1, &thSetupSecondPage, 0);
+   xTaskCreate(TaskSetupSecondPage, "SetupSecondPage", 4096, NULL, 1, &thSetupSecondPage);
 
-  // xTaskCreate(TaskStartServer, "StartServer", 4096, NULL, 1, &thStartServer);
-  xTaskCreatePinnedToCore(TaskStartServer, "StartServer", 4096, NULL, 1, &thStartServer, 0);
+  //xTaskCreatePinnedToCore(TaskSetupThirdPage, "SetupThirdPage", 4096, NULL, 1, &thSetupThirdPage, 0);
+   xTaskCreate(TaskSetupThirdPage, "SetupThirdPage", 4096, NULL, 1, &thSetupThirdPage);
 
-  // ---------------- Remaining init / route / UI tasks ----------------
-  // xTaskCreate(TaskInitPumps, "InitPumps", 2048, NULL, 1, &thInitPumps);
-  xTaskCreatePinnedToCore(TaskInitPumps, "InitPumps", 2048, NULL, 1, &thInitPumps, 1);
+  //xTaskCreatePinnedToCore(TaskSetupLogDataRoute, "SetupLogDataRoute", 2048, NULL, 1, &thSetupLogDataRoute, 0);
+   xTaskCreate(TaskSetupLogDataRoute, "SetupLogDataRoute", 2048, NULL, 1, &thSetupLogDataRoute);
 
-  // xTaskCreate(TaskSetupFirstPage, "SetupFirstPage", 2048, NULL, 1, &thSetupFirstPage);
-  xTaskCreatePinnedToCore(TaskSetupFirstPage, "SetupFirstPage", 2048, NULL, 1, &thSetupFirstPage, 1);
+  //xTaskCreatePinnedToCore(TaskrefreshCurrentTime, "refreshCurrentTime", 8192, NULL, 2, &threfreshCurrentTime, 0);
+   xTaskCreate(TaskrefreshCurrentTime, "refreshCurrentTime", 8192, NULL, 2, &threfreshCurrentTime);
 
-  // xTaskCreate(TaskSetupSecondPage, "SetupSecondPage", 4096, NULL, 1, &thSetupSecondPage);
-  xTaskCreatePinnedToCore(TaskSetupSecondPage, "SetupSecondPage", 4096, NULL, 1, &thSetupSecondPage, 1);
+  //xTaskCreatePinnedToCore(TaskEndofBootup, "EndofBootup", 4096, NULL, 1, &thEndofBootup, 0);
+   xTaskCreate(TaskEndofBootup, "EndofBootup", 4096, NULL, 1, &thEndofBootup);
 
-  // xTaskCreate(TaskSetupThirdPage, "SetupThirdPage", 4096, NULL, 1, &thSetupThirdPage);
-  xTaskCreatePinnedToCore(TaskSetupThirdPage, "SetupThirdPage", 4096, NULL, 1, &thSetupThirdPage, 1);
 
-  // xTaskCreate(TaskSetupLogDataRoute, "SetupLogDataRoute", 2048, NULL, 1, &thSetupLogDataRoute);
-  xTaskCreatePinnedToCore(TaskSetupLogDataRoute, "SetupLogDataRoute", 2048, NULL, 1, &thSetupLogDataRoute, 1);
+// =============================================================================================================================
+// ----------------------------------- CORE 1: Real-time Control & Native Networking -------------------------------------------
+// ------------Core 1 is deliberately left mostly empty to service LwIP, async_tcp, and w5500_tsk flawlessly.-------------------
+// =============================================================================================================================
+  
+  //xTaskCreatePinnedToCore(TaskSetupNetwork, "SetupNetwork", 8192, NULL, 5, &thSetupNetwork, 1);
+   xTaskCreate(TaskSetupNetwork, "SetupNetwork", 8192, NULL, 5, &thSetupNetwork);
 
-  // xTaskCreate(TaskrefreshCurrentTime, "refreshCurrentTime", 8192, NULL, 2, &threfreshCurrentTime);
-  xTaskCreatePinnedToCore(TaskrefreshCurrentTime, "refreshCurrentTime", 8192, NULL, 2, &threfreshCurrentTime, 1);
+  //xTaskCreatePinnedToCore(TaskPumpControl, "PumpControl", 4096, NULL, 4, &thPumpControl, 1);
+   xTaskCreate(TaskPumpControl, "PumpControl", 4096, NULL, 4, &thPumpControl);
 
-  // xTaskCreate(TaskWebSocketTransmitter, "WSTransmitter", 4096, NULL, 1, &thWebSocketTransmitter);
-  xTaskCreatePinnedToCore(TaskWebSocketTransmitter, "WSTransmitter", 4096, NULL, 1, &thWebSocketTransmitter, 0);
+  //xTaskCreatePinnedToCore(TasksetupPumpBroadcasting, "setupPumpBroadcasting", 4096, NULL, 2, &thsetupPumpBroadcasting, 1);
+   xTaskCreate(TasksetupPumpBroadcasting, "setupPumpBroadcasting", 4096, NULL, 2, &thsetupPumpBroadcasting);
 
-  // xTaskCreate(TaskEndofBootup, "EndofBootup", 4096, NULL, 1, &thEndofBootup);
-  xTaskCreatePinnedToCore(TaskEndofBootup, "EndofBootup", 4096, NULL, 1, &thEndofBootup, 1);
+  //xTaskCreatePinnedToCore(TaskcheckTimeAndAct, "checkTimeAndAct", 4096, NULL, 2, &thcheckTimeAndAct, 1);
+   xTaskCreate(TaskcheckTimeAndAct, "checkTimeAndAct", 4096, NULL, 2, &thcheckTimeAndAct);
+
+  //xTaskCreatePinnedToCore(TasklogZeroLengthMessages, "logZeroLengthMessages", 2048, NULL, 1, &thlogZeroLengthMessages, 1);
+   xTaskCreate(TasklogZeroLengthMessages, "logZeroLengthMessages", 2048, NULL, 1, &thlogZeroLengthMessages);
+
+  //xTaskCreatePinnedToCore(TaskStartServer, "StartServer", 4096, NULL, 1, &thStartServer, 1);
+   xTaskCreate(TaskStartServer, "StartServer", 4096, NULL, 1, &thStartServer);
 
   //xTaskCreate(TaskmonitorStacks, "monitorStacks", 4096, NULL, 1, &thmonitorStacks); // Displays memory usage
   //xTaskCreate(TaskPrintCpuStats, "CPUSTATS", 2048, nullptr, tskIDLE_PRIORITY+1, &thPrintCpuStats); // CPU usage
-  
-  
 
   AlarmHistory_begin();
 }
+
+  
+  
+  
