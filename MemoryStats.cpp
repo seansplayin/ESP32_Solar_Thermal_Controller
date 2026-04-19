@@ -26,6 +26,44 @@ static String formatUsage(size_t freeBytes, size_t totalBytes, size_t minFreeByt
   return out;
 }
 
+// Cached stats used by websocket/UI paths.
+// Start safe; checkTimeAndAct() will refresh them on schedule.
+String g_cachedHeapStatsString  = "--";
+String g_cachedPsramStatsString = "N/A";
+
+void updateHeapStatsCache() {
+  const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+
+  size_t freeHeap  = heap_caps_get_free_size(caps);
+  size_t totalHeap = heap_caps_get_total_size(caps);
+  size_t minFree   = heap_caps_get_minimum_free_size(caps);
+
+  g_cachedHeapStatsString = formatUsage(freeHeap, totalHeap, minFree);
+}
+
+void updatePsramStatsCache() {
+  const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+
+  size_t total = heap_caps_get_total_size(caps);
+  if (total == 0) {
+    g_cachedPsramStatsString = "N/A";
+    return;
+  }
+
+  size_t free    = heap_caps_get_free_size(caps);
+  size_t minFree = heap_caps_get_minimum_free_size(caps);
+
+  g_cachedPsramStatsString = formatUsage(free, total, minFree);
+}
+
+String getCachedHeapInternalString() {
+  return g_cachedHeapStatsString;
+}
+
+String getCachedPsramString() {
+  return g_cachedPsramStatsString;
+}
+
 String getHeapInternalString() {
   const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 

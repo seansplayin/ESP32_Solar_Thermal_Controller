@@ -31,12 +31,6 @@ extern volatile bool g_sendTimeConfig;
 extern volatile bool g_sendTemperatures;
 extern volatile bool g_sendDateTime;
 
-// Generic one-shot queued WS message (for non-periodic broadcasts)
-extern volatile bool g_sendQueuedWsMessage;
-extern String g_queuedWsMessage;
-extern String g_queuedWsType;
-extern SemaphoreHandle_t g_queuedWsMutex;
-
 extern String g_tempWsPayload;
 extern SemaphoreHandle_t g_tempWsPayloadMutex;
 

@@ -97,15 +97,11 @@ void initSystemConfigDefaults() {
 
 }
 
+
 bool loadSystemConfigFromFS() {
   if (!g_fileSystemReady) return false;
 
   if (!takeFileSystemMutexWithRetry("[Config] load", pdMS_TO_TICKS(1000), 2)) return false;
-
-    // One-time migration: move legacy root file into /Json_Config_Files if needed
-  if (!LittleFS.exists(SYSTEM_CONFIG_PATH) && LittleFS.exists(SYSTEM_CONFIG_PATH_OLD)) {
-    LittleFS.rename(SYSTEM_CONFIG_PATH_OLD, SYSTEM_CONFIG_PATH);
-  }
 
   if (!LittleFS.exists(SYSTEM_CONFIG_PATH)) {
     xSemaphoreGive(fileSystemMutex);
@@ -171,7 +167,11 @@ bool loadSystemConfigFromFS() {
 bool saveSystemConfigToFS() {
   if (!g_fileSystemReady) return false;
 
-  if (!takeFileSystemMutexWithRetry("[Config] save", pdMS_TO_TICKS(1000), 2)) return false;
+    if (!takeFileSystemMutexWithRetry("[Config] save", pdMS_TO_TICKS(1000), 2)) return false;
+
+  if (!LittleFS.exists("/Json_Config_Files")) {
+    LittleFS.mkdir("/Json_Config_Files");
+  }
 
   DynamicJsonDocument doc(1024);
 
@@ -229,11 +229,6 @@ bool loadTimeConfigFromFS() {
 
   if (!takeFileSystemMutexWithRetry("[TimeConfig] load", pdMS_TO_TICKS(1000), 2)) return false;
 
-    // One-time migration: move legacy root file into /Json_Config_Files if needed
-  if (!LittleFS.exists(TIME_CONFIG_PATH) && LittleFS.exists(TIME_CONFIG_PATH_OLD)) {
-    LittleFS.rename(TIME_CONFIG_PATH_OLD, TIME_CONFIG_PATH);
-  }
-
   if (!LittleFS.exists(TIME_CONFIG_PATH)) {
     xSemaphoreGive(fileSystemMutex);
     return false;
@@ -261,11 +256,15 @@ bool saveTimeConfigToFS() {
 
   if (!takeFileSystemMutexWithRetry("[TimeConfig] save", pdMS_TO_TICKS(1000), 2)) return false;
 
+  if (!LittleFS.exists("/Json_Config_Files")) {
+    LittleFS.mkdir("/Json_Config_Files");
+  }
+
   DynamicJsonDocument doc(256);
   doc["timeZoneId"] = g_timeConfig.timeZoneId;
   doc["dstEnabled"] = g_timeConfig.dstEnabled;
 
-    File f = LittleFS.open(TIME_CONFIG_PATH, "w");
+  File f = LittleFS.open(TIME_CONFIG_PATH, "w");
   if (!f) { xSemaphoreGive(fileSystemMutex); return false; }
   serializeJson(doc, f);
   f.close();

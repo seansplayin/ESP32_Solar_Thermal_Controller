@@ -1,4 +1,4 @@
-// WebServerManager1.cpp
+// WebServerManager.cpp
 #include "WebServerManager.h"
 #include "Logging.h"
 #include "Config.h"
@@ -39,18 +39,34 @@ volatile bool g_sendTimeConfig = false;
 volatile bool g_sendTemperatures = false;
 volatile bool g_sendDateTime = false;
 
-// Generic one-shot queued WS message (for non-periodic broadcasts)
-volatile bool g_sendQueuedWsMessage = false;
-String g_queuedWsMessage = "";
-String g_queuedWsType = "";
-SemaphoreHandle_t g_queuedWsMutex = NULL;
-
 String g_tempWsPayload = "";
 SemaphoreHandle_t g_tempWsPayloadMutex = NULL;
+
+// Real outbound WS queue (broadcast + one-client)
+static SemaphoreHandle_t g_queuedWsMutex = NULL;
+
+struct QueuedWsMessage {
+  uint32_t clientId;   // 0 = broadcast
+  uint8_t  retryCount; // small retry budget for one-client init messages
+  String   message;
+  String   messageType;
+};
+
+static constexpr size_t WS_OUTBOUND_QUEUE_LEN = 24;
+static QueuedWsMessage g_wsOutboundQueue[WS_OUTBOUND_QUEUE_LEN];
+static size_t g_wsOutboundHead = 0;
+static size_t g_wsOutboundTail = 0;
+static size_t g_wsOutboundCount = 0;
 
 // WS backpressure cooldown
 static volatile uint32_t g_wsBackpressureUntilMs = 0;
 static volatile uint32_t g_wsLastWritableMs      = 0;
+
+// Staged initAll state (one client at a time by design for this A/B test)
+static volatile uint32_t g_initAllClientId = 0;
+static volatile uint8_t  g_initAllStep     = 0;
+static volatile uint32_t g_initAllNextMs   = 0;
+static constexpr uint32_t WS_INITALL_STEP_MS = 250UL;
 
 static bool hasWritableWSClient() {
   ws.cleanupClients();
@@ -75,16 +91,106 @@ static bool ensureQueuedWsMutex() {
   return (g_queuedWsMutex != NULL);
 }
 
-void queueWsBroadcast(const String& message, const String& messageType) {
-  if (message.length() == 0) return;
-  if (!ensureQueuedWsMutex()) return;
+static bool hasQueuedWsMessages() {
+  if (!ensureQueuedWsMutex()) return false;
 
+  bool hasMessages = false;
   if (xSemaphoreTake(g_queuedWsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    g_queuedWsMessage = message;
-    g_queuedWsType    = messageType;
-    g_sendQueuedWsMessage = true;
+    hasMessages = (g_wsOutboundCount > 0);
     xSemaphoreGive(g_queuedWsMutex);
   }
+  return hasMessages;
+}
+
+static AsyncWebSocketClient* findWsClientById(uint32_t clientId) {
+  if (clientId == 0) return nullptr;
+
+  ws.cleanupClients();
+
+  for (auto &client : ws.getClients()) {
+    if (client.id() == clientId && client.status() == WS_CONNECTED) {
+      return &client;
+    }
+  }
+  return nullptr;
+}
+
+static bool enqueueWsMessage(uint32_t clientId,
+                             const String& message,
+                             const String& messageType,
+                             uint8_t retryCount = 0) {
+  if (message.length() == 0) return false;
+  if (!ensureQueuedWsMutex()) return false;
+
+  if (xSemaphoreTake(g_queuedWsMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    return false;
+  }
+
+  if (g_wsOutboundCount >= WS_OUTBOUND_QUEUE_LEN) {
+    LOG_CAT(DBG_WEB,
+            "[WS] Outbound queue full, dropping type=%s len=%u\n",
+            messageType.c_str(), (unsigned)message.length());
+    xSemaphoreGive(g_queuedWsMutex);
+    return false;
+  }
+
+  QueuedWsMessage &slot = g_wsOutboundQueue[g_wsOutboundTail];
+  slot.clientId   = clientId;
+  slot.retryCount = retryCount;
+  slot.message    = message;
+  slot.messageType = messageType;
+
+  g_wsOutboundTail = (g_wsOutboundTail + 1) % WS_OUTBOUND_QUEUE_LEN;
+  g_wsOutboundCount++;
+
+  xSemaphoreGive(g_queuedWsMutex);
+  return true;
+}
+
+static bool dequeueWsMessage(QueuedWsMessage& out) {
+  if (!ensureQueuedWsMutex()) return false;
+
+  if (xSemaphoreTake(g_queuedWsMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    return false;
+  }
+
+  if (g_wsOutboundCount == 0) {
+    xSemaphoreGive(g_queuedWsMutex);
+    return false;
+  }
+
+  out = g_wsOutboundQueue[g_wsOutboundHead];
+  g_wsOutboundQueue[g_wsOutboundHead].message = "";
+  g_wsOutboundQueue[g_wsOutboundHead].messageType = "";
+
+  g_wsOutboundHead = (g_wsOutboundHead + 1) % WS_OUTBOUND_QUEUE_LEN;
+  g_wsOutboundCount--;
+
+  xSemaphoreGive(g_queuedWsMutex);
+  return true;
+}
+
+static void queueWsClient(AsyncWebSocketClient* client,
+                          const String& message,
+                          const String& messageType) {
+  if (!client) return;
+  if (client->status() != WS_CONNECTED) return;
+
+  enqueueWsMessage(client->id(), message, messageType, 0);
+}
+
+static void queueWsToClientOrBroadcast(AsyncWebSocketClient* client,
+                                       const String& message,
+                                       const String& messageType) {
+  if (client) {
+    queueWsClient(client, message, messageType);
+  } else {
+    enqueueWsMessage(0, message, messageType, 0);
+  }
+}
+
+void queueWsBroadcast(const String& message, const String& messageType) {
+  enqueueWsMessage(0, message, messageType, 0);
 }
 
 // Global flag to indicate that pump runtime data needs to be updated
@@ -291,10 +397,18 @@ String getFormattedTime();
 String getFormattedDate();
 void sendDateTime(AsyncWebSocketClient* client);
 void sendUptime(AsyncWebSocketClient* client);
+String getFSStatsString();
+void sendSystemStats(AsyncWebSocketClient* client); 
+bool safeHasValue(float temp);
+void sendConfigurationValues(AsyncWebSocketClient* client);
+void sendTimeConfig(AsyncWebSocketClient* client);
+String wsBytesToString(const uint8_t* data, size_t len);
+void handleWebSocketMessage(void* arg, uint8_t* data, size_t len);
+
 void sendAllData(AsyncWebSocketClient* client);
 void sendSystemStats(AsyncWebSocketClient* client); 
 void broadcastMessageOverWebSocket(const String& message, const String& messageType);
-void sendTimeConfig(AsyncWebSocketClient* client);
+
 DateTime parseDateTimeFromLogFile(const String& datetimeStr);
 unsigned long calculateTotalLogRuntime(const String& logFilename);
 String prepareLogData(int pumpIndex, String timeframe);
@@ -313,6 +427,114 @@ void refreshRuntimeCache();
 
 static void sendAlarmStateWs(uint32_t n);
 static void onAlarmStateChanged(uint32_t activeCount);
+static void startInitAllForClient(AsyncWebSocketClient* client);
+static bool processInitAllStep(uint32_t now);
+
+static void startInitAllForClient(AsyncWebSocketClient* client) {
+  if (!client) return;
+  if (client->status() != WS_CONNECTED) return;
+
+  g_initAllClientId = client->id();
+  g_initAllStep     = 1;
+  g_initAllNextMs   = millis();
+
+  LOG_CAT(DBG_WEB, "[WS] initAll scheduled for client id=%u\n",
+          (unsigned)g_initAllClientId);
+}
+
+static bool processInitAllStep(uint32_t now) {
+  if (g_initAllClientId == 0 || g_initAllStep == 0) return false;
+
+  // Keep the queue shallow: only schedule the next init step when the
+  // outbound queue is currently empty.
+  if (hasQueuedWsMessages()) return false;
+
+  if ((int32_t)(now - g_initAllNextMs) < 0) return false;
+
+  AsyncWebSocketClient* client = findWsClientById(g_initAllClientId);
+  if (client == nullptr) {
+    LOG_CAT(DBG_WEB,
+            "[WS] initAll cancelled; client id=%u no longer connected\n",
+            (unsigned)g_initAllClientId);
+    g_initAllClientId = 0;
+    g_initAllStep = 0;
+    g_initAllNextMs = 0;
+    return false;
+  }
+
+  switch (g_initAllStep) {
+    case 1:
+      sendPumpStatuses(client);
+      break;
+
+    case 2: {
+      String heatingCallData = "HeatingCalls:";
+      heatingCallData += "DHW:";
+      heatingCallData += (digitalRead(DHW_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
+      heatingCallData += ",Heating:";
+      heatingCallData += (digitalRead(FURNACE_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
+      queueWsClient(client, heatingCallData, "HeatingCalls");
+      break;
+    }
+
+    case 3: {
+      uint32_t n = AlarmManager_activeCount();
+      queueWsClient(
+        client,
+        (n > 0) ? ("AlarmState:ALARM,count=" + String(n))
+                :  "AlarmState:OK,count=0",
+        "AlarmState"
+      );
+      break;
+    }
+
+    case 4:
+      sendConfigurationValues(client);
+      break;
+
+    case 5:
+      sendTimeConfig(client);
+      break;
+
+    case 6:
+      sendDateTime(client);
+      break;
+
+    case 7:
+      sendUptime(client);
+      break;
+
+    case 8:
+      sendSystemStats(client);
+      break;
+
+    case 9:
+      sendTemperatures(client);
+      break;
+
+    default:
+      g_initAllClientId = 0;
+      g_initAllStep = 0;
+      g_initAllNextMs = 0;
+      return false;
+  }
+
+  LOG_CAT(DBG_WEB,
+          "[WS] initAll step %u queued for client id=%u\n",
+          (unsigned)g_initAllStep,
+          (unsigned)g_initAllClientId);
+
+  if (g_initAllStep >= 9) {
+    g_initAllClientId = 0;
+    g_initAllStep = 0;
+    g_initAllNextMs = 0;
+  } else {
+    g_initAllStep++;
+    g_initAllNextMs = now + WS_INITALL_STEP_MS;
+  }
+
+  return true;
+}
 
 static void sendAlarmStateWs(uint32_t n) {
   if (n > 0) {
@@ -334,11 +556,9 @@ void broadcastAlarmStateOverWebSocket() {
 
 
 void sendConfigurationValues(AsyncWebSocketClient* client) {
-        if (client && client->queueIsFull()) {
-        LOG_CAT(DBG_WEB, "[WS] Client queue is full, skipping configuration data transmission.\n");
+    if (client && client->status() != WS_CONNECTED) {
         return;
     }
-
 
     String configData = "Configuration:";
 
@@ -375,45 +595,35 @@ void sendConfigurationValues(AsyncWebSocketClient* client) {
     configData += ",collectorFreezeSensors:";
     bool first = true;
     for (uint8_t* s = g_config.collectorFreezeSensors; *s; s++) {
-    if (!first) configData += "|";   // <-- CHANGED
-    configData += String(*s);
-    first = false;
+      if (!first) configData += "|";
+      configData += String(*s);
+      first = false;
     }
-
 
     configData += ",lineFreezeSensors:";
     first = true;
     for (uint8_t* s = g_config.lineFreezeSensors; *s; s++) {
-    if (!first) configData += "|";   // <-- CHANGED
-    configData += String(*s);
-    first = false;
+      if (!first) configData += "|";
+      configData += String(*s);
+      first = false;
     }
-
 
     // ---------------------------------------------------
 
-    if (client) {
-        client->text(configData);
-    } else {
-        queueWsBroadcast(configData, "Configuration");
-    }
+    queueWsToClientOrBroadcast(client, configData, "Configuration");
 }
 
 // ---- TimeConfig sender (new) ----
 void sendTimeConfig(AsyncWebSocketClient* client) {
-    if (client && client->queueIsFull()) {
-        LOG_CAT(DBG_WEB, "[WS] Client queue full, skipping time config transmission.\n");
+    if (client && client->status() != WS_CONNECTED) {
         return;
     }
+
     String msg = "TimeConfig:";
     msg += "timeZoneId=" + g_timeConfig.timeZoneId;
     msg += ",dstEnabled=" + String(g_timeConfig.dstEnabled ? 1 : 0);
 
-    if (client) {
-        client->text(msg);
-    } else {
-        queueWsBroadcast(msg, "TimeConfig");
-    }
+    queueWsToClientOrBroadcast(client, msg, "TimeConfig");
 }
 
 void serveStaticAssets(AsyncWebServer& server) {
@@ -475,6 +685,13 @@ void handleWebSocketEvent(AsyncWebSocket* server,
 
   if (type == WS_EVT_DISCONNECT) {
     LOG_CAT(DBG_WEB, "WebSocket client disconnected (id=%u)\n", client ? client->id() : 0);
+
+    if (client && g_initAllClientId == client->id()) {
+      g_initAllClientId = 0;
+      g_initAllStep = 0;
+      g_initAllNextMs = 0;
+      LOG_CAT(DBG_WEB, "[WS] initAll cancelled on disconnect for id=%u\n", client->id());
+    }
     
     // Log the client disconnect to the Alarm History
     AlarmManager_event(ALM_WS_DISCONNECT, ALM_INFO, "WS Client ID %u Disconnected", client ? client->id() : 0);
@@ -504,73 +721,86 @@ void handleWebSocketEvent(AsyncWebSocket* server,
 
   // Legacy init (kept tiny on purpose)
   if (msg == "init") {
-    if (client && !client->queueIsFull() && client->canSend()) {
-      g_sendPumpStatus = true;   // let gatekeeper send consolidated pump status
+    if (client) {
+      sendPumpStatuses(client);
       sendDateTime(client);
       sendUptime(client);
     }
     return;
   }
 
+  // Consolidated FirstWebpage startup:
+  // browser sends one init request; server now schedules the full response
+  // set in paced steps instead of queueing everything immediately.
+  if (msg == "initAll") {
+    if (client) {
+      startInitAllForClient(client);
+    }
+    return;
+  }
+
   if (msg == "initPumpStatus") {
-    if (client && !client->queueIsFull() && client->canSend()) {
-      g_sendPumpStatus = true;   // centralized path
+    if (client) {
+      sendPumpStatuses(client);
     }
     return;
   }
 
   if (msg == "initHeatingCalls") {
-    if (client && !client->queueIsFull()) {
+    if (client) {
       String heatingCallData = "HeatingCalls:";
       heatingCallData += "DHW:";
       heatingCallData += (digitalRead(DHW_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
       heatingCallData += ",Heating:";
       heatingCallData += (digitalRead(FURNACE_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
-      client->text(heatingCallData);
+      queueWsClient(client, heatingCallData, "HeatingCalls");
     }
     return;
   }
 
   if (msg == "initTemperatures") {
-    if (client && !client->queueIsFull()) {
+    if (client) {
       sendTemperatures(client);
     }
     return;
   }
 
   if (msg == "initConfig") {
-    if (client && !client->queueIsFull()) {
+    if (client) {
       sendConfigurationValues(client);
     }
     return;
   }
 
   if (msg == "initTimeConfig") {
-    if (client && !client->queueIsFull()) {
+    if (client) {
       sendTimeConfig(client);
     }
     return;
   }
 
   if (msg == "initAlarmState") {
-    if (client && !client->queueIsFull()) {
+    if (client) {
       uint32_t n = AlarmManager_activeCount();
-      client->text((n > 0)
-        ? ("AlarmState:ALARM,count=" + String(n))
-        :  "AlarmState:OK,count=0");
+      queueWsClient(
+        client,
+        (n > 0) ? ("AlarmState:ALARM,count=" + String(n))
+                :  "AlarmState:OK,count=0",
+        "AlarmState"
+      );
     }
     return;
   }
 
   if (msg == "initSystemStats") {
-    if (client && !client->queueIsFull()) {
+    if (client) {
       sendSystemStats(client);
     }
     return;
   }
 
   if (msg == "initDateTime") {
-    if (client && !client->queueIsFull()) {
+    if (client) {
       sendDateTime(client);
     }
     return;
@@ -839,8 +1069,8 @@ void sendPumpStatuses(AsyncWebSocketClient* client) {
         return;
     }
 
-    // For one-client init path, skip if that client cannot accept data.
-    if (client && (client->status() != WS_CONNECTED || client->queueIsFull() || !client->canSend())) {
+    // For one-client init path, only require a connected client.
+    if (client && client->status() != WS_CONNECTED) {
         return;
     }
 
@@ -874,11 +1104,7 @@ void sendPumpStatuses(AsyncWebSocketClient* client) {
     String pumpStatusData;
     serializeJson(pumps, pumpStatusData);
 
-    if (client) {
-        client->text("PumpStatus:" + pumpStatusData);
-    } else {
-        broadcastMessageOverWebSocket("PumpStatus:" + pumpStatusData, "PumpStatus");
-    }
+    queueWsToClientOrBroadcast(client, "PumpStatus:" + pumpStatusData, "PumpStatus");
 }
 
 // **New: Send Updated Temperatures**
@@ -919,7 +1145,7 @@ void sendTemperatures(AsyncWebSocketClient* client) {
         tempData.remove(tempData.length() - 1);
     }
 
-    client->text(tempData);
+    queueWsToClientOrBroadcast(client, tempData, "Temperatures");
 }
 
 
@@ -942,23 +1168,13 @@ String getFormattedDate() {
 // Send date and time to client
 void sendDateTime(AsyncWebSocketClient* client) {
     String dateTimeData = "DateTime:currentTime:" + getFormattedTime() + ",currentDate:" + getFormattedDate();
-
-    if (client) {
-        client->text(dateTimeData);
-    } else {
-        queueWsBroadcast(dateTimeData, "DateTime");
-    }
+    queueWsToClientOrBroadcast(client, dateTimeData, "DateTime");
 }
 
 // Send uptime to client
 void sendUptime(AsyncWebSocketClient* client) {
     String uptimeData = "Uptime:" + uptime_formatter::getUptime();
-
-    if (client) {
-        client->text(uptimeData);
-    } else {
-        queueWsBroadcast(uptimeData, "Uptime");
-    }
+    queueWsToClientOrBroadcast(client, uptimeData, "Uptime");
 }
 
 // Send heap + filesystem stats to client.
@@ -966,22 +1182,20 @@ void sendUptime(AsyncWebSocketClient* client) {
 //   "SysStats:heap=...|psram=..."
 //   "FSStats:{...json...}"
 void sendSystemStats(AsyncWebSocketClient* client) {
-    String heapStr  = getHeapInternalString(); // INTERNAL heap only
-    String psramStr = getPsramString();        // PSRAM only
-    String fsJson   = getFSStatsString();      // JSON string
+    String heapStr  = getCachedHeapInternalString(); // cached INTERNAL heap only
+    String psramStr = getCachedPsramString();        // cached PSRAM only
+    String fsJson   = getFSStatsString();            // cached JSON string
 
     String sysStatsMsg = "SysStats:heap=" + heapStr + "|psram=" + psramStr;
 
     if (client) {
-        client->text(sysStatsMsg);
-        client->text("FSStats:" + fsJson);
+        queueWsClient(client, sysStatsMsg, "SysStats");
+        queueWsClient(client, "FSStats:" + fsJson, "FSStats");
     } else {
         queueWsBroadcast(sysStatsMsg, "SysStats");
         queueWsBroadcast("FSStats:" + fsJson, "FSStats");
     }
 }
-
-
 
 
 
@@ -991,11 +1205,13 @@ void TaskWebSocketTransmitter(void* pvParameters) {
 
     esp_task_wdt_add(NULL);
 
-    if (g_tempWsPayloadMutex == NULL) {
+        if (g_tempWsPayloadMutex == NULL) {
         g_tempWsPayloadMutex = xSemaphoreCreateMutex();
     }
-    if (g_queuedWsMutex == NULL) {
-        g_queuedWsMutex = xSemaphoreCreateMutex();
+    if (!ensureQueuedWsMutex()) {
+        LOG_ERR("[WS] Failed to create outbound queue mutex\n");
+        vTaskDelete(NULL);
+        return;
     }
 
     uint32_t lastFsMs        = millis();
@@ -1054,21 +1270,43 @@ void TaskWebSocketTransmitter(void* pvParameters) {
             broadcastAlarmStateOverWebSocket();
             didWork = true;
         }
-        else if (g_sendQueuedWsMessage) {
-            String queuedMsg;
-            String queuedType;
+        else if (processInitAllStep(now)) {
+            didWork = true;
+        }
+        else if (hasQueuedWsMessages()) {
+            QueuedWsMessage queuedItem;
 
-            if (g_queuedWsMutex &&
-                xSemaphoreTake(g_queuedWsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                queuedMsg  = g_queuedWsMessage;
-                queuedType = g_queuedWsType;
-                g_sendQueuedWsMessage = false;
-                xSemaphoreGive(g_queuedWsMutex);
-            }
+            if (dequeueWsMessage(queuedItem)) {
+                if (queuedItem.clientId == 0) {
+                    broadcastMessageOverWebSocket(queuedItem.message, queuedItem.messageType);
+                    didWork = true;
+                } else {
+                    AsyncWebSocketClient* target = findWsClientById(queuedItem.clientId);
 
-            if (queuedMsg.length() > 0) {
-                broadcastMessageOverWebSocket(queuedMsg, queuedType);
-                didWork = true;
+                    if (target == nullptr) {
+                        LOG_CAT(DBG_WEB,
+                                "[WS] Dropping queued one-client message; client id=%u no longer connected. type=%s\n",
+                                (unsigned)queuedItem.clientId,
+                                queuedItem.messageType.c_str());
+                    } else if (target->queueIsFull() || !target->canSend()) {
+                        if (queuedItem.retryCount < 3) {
+                            enqueueWsMessage(queuedItem.clientId,
+                                             queuedItem.message,
+                                             queuedItem.messageType,
+                                             queuedItem.retryCount + 1);
+                            didWork = true;  // enforce pacing even on retry
+                        } else {
+                            LOG_CAT(DBG_WEB,
+                                    "[WS] Dropping queued one-client message after retries. id=%u type=%s len=%u\n",
+                                    (unsigned)queuedItem.clientId,
+                                    queuedItem.messageType.c_str(),
+                                    (unsigned)queuedItem.message.length());
+                        }
+                    } else {
+                        target->text(queuedItem.message);
+                        didWork = true;
+                    }
+                }
             }
         }
         else if (g_sendConfig) {
@@ -1114,11 +1352,11 @@ void TaskWebSocketTransmitter(void* pvParameters) {
         // (No need to check hasWritableWSClient() here since buffersReady checked it above)
         // ------------------------------------------------------------
 
-        if (!didWork && (uint32_t)(now - lastFastMs) >= 5000UL) {
+                if (!didWork && (uint32_t)(now - lastFastMs) >= 5000UL) {
             lastFastMs = now;
 
-            String heapStr  = getHeapInternalString();
-            String psramStr = getPsramString();
+            String heapStr  = getCachedHeapInternalString();
+            String psramStr = getCachedPsramString();
 
             if (heapStr != lastHeapStr || psramStr != lastPsramStr) {
                 lastHeapStr  = heapStr;
@@ -1138,9 +1376,7 @@ void TaskWebSocketTransmitter(void* pvParameters) {
             didWork = true;
         }
 
-        // IMPORTANT:
-        // Disable TempBcast telemetry spam for now while stabilizing the link.
-        // We can reintroduce it later as HTTP or a much slower diagnostic path.
+        
 
         if (didWork) {
             vTaskDelay(pdMS_TO_TICKS(30));
@@ -1152,9 +1388,8 @@ void TaskWebSocketTransmitter(void* pvParameters) {
 
 
 void sendAllData(AsyncWebSocketClient* client) {
-if (client && client->queueIsFull()) {
-
-    LOG_CAT(DBG_WEB, "[WS] Client queue full, skipping sendAllData.\n");
+  if (client && client->status() != WS_CONNECTED) {
+    LOG_CAT(DBG_WEB, "[WS] Client not connected, skipping sendAllData.\n");
     return;
   }
 
@@ -1163,77 +1398,47 @@ if (client && client->queueIsFull()) {
   if (xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
     String tempData = "Temperatures:";
 
+    // Build the temperature message
+    tempData += "panelT:" + validateTemp(panelT);
+    tempData += ",CSupplyT:" + validateTemp(CSupplyT);
+    tempData += ",storageT:" + validateTemp(storageT);
+    tempData += ",outsideT:" + validateTemp(outsideT);
+    tempData += ",CircReturnT:" + validateTemp(CircReturnT);
+    tempData += ",supplyT:" + validateTemp(supplyT);
+    tempData += ",CreturnT:" + validateTemp(CreturnT);
+    tempData += ",DhwSupplyT:" + validateTemp(DhwSupplyT);
+    tempData += ",DhwReturnT:" + validateTemp(DhwReturnT);
+    tempData += ",HeatingSupplyT:" + validateTemp(HeatingSupplyT);
+    tempData += ",HeatingReturnT:" + validateTemp(HeatingReturnT);
+    tempData += ",dhwT:" + validateTemp(dhwT);
+    tempData += ",PotHeatXinletT:" + validateTemp(PotHeatXinletT);
+    tempData += ",PotHeatXoutletT:" + validateTemp(PotHeatXoutletT);
+    tempData += ",pt1000Current:" + validateTemp(pt1000Current);
+    tempData += ",pt1000Average:" + validateTemp(pt1000Average);
 
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      tempData += ",DTemp" + String(i + 1) + ":" + validateTemp(DTemp[i]);
+      tempData += ",DTempAverage" + String(i + 1) + ":" + validateTemp(DTempAverage[i]);
+    }
 
+    // IMPORTANT:
+    // Do NOT do live Heap/PSRAM reads here.
+    // Those values are now sent separately through the cached SysStats path.
+    tempData.replace("Temperatures:,", "Temperatures:");
 
-// Build the temperature message
-tempData += "panelT:" + validateTemp(panelT);
-tempData += ",CSupplyT:" + validateTemp(CSupplyT);
-tempData += ",storageT:" + validateTemp(storageT);
-tempData += ",outsideT:" + validateTemp(outsideT);
-tempData += ",CircReturnT:" + validateTemp(CircReturnT);
-tempData += ",supplyT:" + validateTemp(supplyT);
-tempData += ",CreturnT:" + validateTemp(CreturnT);
-tempData += ",DhwSupplyT:" + validateTemp(DhwSupplyT);
-tempData += ",DhwReturnT:" + validateTemp(DhwReturnT);
-tempData += ",HeatingSupplyT:" + validateTemp(HeatingSupplyT);
-tempData += ",HeatingReturnT:" + validateTemp(HeatingReturnT);
-tempData += ",dhwT:" + validateTemp(dhwT);
-tempData += ",PotHeatXinletT:" + validateTemp(PotHeatXinletT);
-tempData += ",PotHeatXoutletT:" + validateTemp(PotHeatXoutletT);
-tempData += ",pt1000Current:" + validateTemp(pt1000Current);
-tempData += ",pt1000Average:" + validateTemp(pt1000Average);
-for (int i = 0; i < NUM_SENSORS; i++) {
-tempData += ",DTemp" + String(i + 1) + ":" + validateTemp(DTemp[i]);
-tempData += ",DTempAverage" + String(i + 1) + ":" + validateTemp(DTempAverage[i]);
-}
+    if (tempData.length() > strlen("Temperatures:")) {
+      queueWsToClientOrBroadcast(client, tempData, "Temperatures");
+    } else {
+      LOG_CAT(DBG_WEB, "[Warning] No valid temperature data to broadcast.\n");
+    }
 
+    xSemaphoreGive(temperatureMutex);
+  } else {
+    LOG_CAT(DBG_WEB, "[WS] Failed to take temperatureMutex in sendAllData.\n");
+  }
 
-// Memory (PSRAM & HEAP RAM) Reporting for FirstWebpage
-const uint32_t I = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-const uint32_t P = MALLOC_CAP_SPIRAM   | MALLOC_CAP_8BIT;
-
-// --- Internal heap stats ---
-size_t freeHeap  = heap_caps_get_free_size(I);
-size_t totalHeap = heap_caps_get_total_size(I);
-float pctHeapUsed = (totalHeap ? ((float)(totalHeap - freeHeap) / (float)totalHeap) * 100.0f : 0.0f);
-
-String heapJson =
-  "{\"freeBytes\":" + String(freeHeap) +
-  ",\"totalBytes\":" + String(totalHeap) +
-  ",\"pctUsed\":" + String(pctHeapUsed, 1) + "}";
-
-tempData += ",heapStats:" + heapJson;
-
-// --- PSRAM stats ---
-size_t totalPsram = heap_caps_get_total_size(P);
-size_t freePsram  = heap_caps_get_free_size(P);
-float pctPsramUsed = (totalPsram ? ((float)(totalPsram - freePsram) / (float)totalPsram) * 100.0f : 0.0f);
-
-String psramJson =
-  "{\"freeBytes\":" + String(freePsram) +
-  ",\"totalBytes\":" + String(totalPsram) +
-  ",\"pctUsed\":" + String(pctPsramUsed, 1) + "}";
-
-tempData += ",psramStats:" + psramJson;
-
-
-
-
-tempData.replace("Temperatures:,", "Temperatures:");
-// Check if any temperature is valid
-if (tempData.length() > strlen("Temperatures:")) {
-client->text(tempData);
-} else {
-LOG_CAT(DBG_WEB, "[Warning] No valid temperature data to broadcast.\n");
-}
-// Release the mutex after operation
-xSemaphoreGive(temperatureMutex);
-} else {
-LOG_CAT(DBG_WEB, "[WS] Failed to take temperatureMutex in sendAllData.\n");
-}
-sendDateTime(client);
-sendUptime(client);
+  sendDateTime(client);
+  sendUptime(client);
 }
 
 

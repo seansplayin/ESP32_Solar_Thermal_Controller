@@ -54,13 +54,14 @@ static const int   NUM_SENSORS = 14;           // 1..14
 extern bool g_fileSystemReady;  // from FileSystemManager
 extern bool g_timeValid;        // from RTCManager / TimeSync
 
-// Call this **once**, after network, web server, pumps, etc. are all up
+// Temperature logging stays disabled until valid time exists.
 static bool g_tempLogEnabled = false;
 
 void enableTemperatureLogging()
 {
+    if (g_tempLogEnabled) return;   // idempotent
     g_tempLogEnabled = true;
-    LOG_CAT(DBG_TEMPLOG, "[TempLog] Enabled after system boot complete\n");
+    LOG_CAT(DBG_TEMPLOG, "[TempLog] Enabled after valid time acquired\n");
 }
 
 // RAM cache — unlimited size, grows as needed
@@ -388,17 +389,19 @@ void TaskTemperatureLogging_Run(void*)
         // 3) Don’t do anything until time is valid and sane
         DateTime dt = getCurrentTimeAtomic();
         if (!g_timeValid) {
-            int year = dt.year();
-            if (year < 2025 || year > 2100) {
+            // Re-check the raw RTC directly. CurrentTime may still be stale/default
+            // even though the RTC itself already holds a valid value.
+            if (syncCurrentTimeFromRTCIfValid()) {
+                dt = getCurrentTimeAtomic();
+                LOG_CAT(DBG_TEMPLOG,
+                        "[TempLog] RTC year %d looks valid, enabling time.\n", dt.year());
+            } else {
+                int year = dt.year();
                 LOG_CAT(DBG_TEMPLOG,
                         "[TempLog] Waiting for valid time, g_timeValid=0, RTC year=%d\n",
                         year);
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;   // stay alive, keep waiting
-            } else {
-                LOG_CAT(DBG_TEMPLOG,
-                        "[TempLog] RTC year %d looks valid, enabling time.\n", year);
-                markTimeValid();   // let the rest of the system know time is OK
             }
         }
 

@@ -92,6 +92,9 @@ void tryNtpUpdate() {
 
         // Update CurrentTime with the new RTC time
         CurrentTime = rtc.now();
+        if (CurrentTime.year() >= 2025 && CurrentTime.year() <= 2100) {
+            markTimeValid();
+        }
 
         printCurrentRtcTime(); 
         ntpRetryTicker.detach(); 
@@ -102,6 +105,10 @@ void tryNtpUpdate() {
         AlarmManager_set(ALM_TIME_SYNC_FAIL, ALM_WARN, "NTP Server Unreachable - Retrying");
 
         CurrentTime = rtc.now();
+        if (CurrentTime.year() >= 2025 && CurrentTime.year() <= 2100) {
+            markTimeValid();
+        }
+
         printCurrentRtcTime(); 
         ntpRetryTicker.once(600, tryNtpUpdate); 
     }

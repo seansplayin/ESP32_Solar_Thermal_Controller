@@ -730,6 +730,45 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     var wsBackoffMs = 1000;           // starts at 1s
     var wsBackoffMaxMs = 30000;       // max 30s
 
+    // WS liveness / wake handling
+    var wsLastRxMs = 0;
+    var wsHealthTimer = null;
+    var wsResyncTimer = null;
+
+    function scheduleFreshClockAndUptime(delayMs) {
+      if (wsResyncTimer) {
+        clearTimeout(wsResyncTimer);
+        wsResyncTimer = null;
+      }
+
+      wsResyncTimer = setTimeout(function () {
+        wsResyncTimer = null;
+        requestFreshClockAndUptime();
+      }, delayMs || 150);
+    }
+
+    function startWsHealthWatchdog() {
+      if (wsHealthTimer) {
+        clearInterval(wsHealthTimer);
+        wsHealthTimer = null;
+      }
+
+      wsHealthTimer = setInterval(function () {
+        if (!ws) return;
+
+        // If the socket is OPEN but we have received nothing for too long,
+        // assume the session is stale/zombie and force a reconnect.
+        if (ws.readyState === WebSocket.OPEN) {
+          var age = Date.now() - wsLastRxMs;
+
+          if (wsLastRxMs !== 0 && age > 95000) {
+            console.log('WS watchdog: stale connection detected, forcing reconnect');
+            try { ws.close(); } catch (e) {}
+          }
+        }
+      }, 15000);
+    }
+
     function wsConnect() {
       // Clear any pending reconnect
       if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
@@ -739,21 +778,15 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       ws.onopen = function () {
         console.log('WebSocket connected');
         wsBackoffMs = 1000; // reset backoff on success
+        wsLastRxMs = Date.now();
+        startWsHealthWatchdog();
 
-        // IMPORTANT:
-        // Keep FirstWebpage init intentionally slow and front-load only the
-        // smallest / highest-value items first. Heavy items come later.
+        // Keep browser->ESP startup minimal:
+        // 1) identify the page
+        // 2) request one consolidated init sequence
         const initMsgs = [
-          [0,    'hello:FirstWebpage'],
-          [250,  'initPumpStatus'],
-          [550,  'initHeatingCalls'],
-          [900,  'initAlarmState'],
-          [1300, 'initConfig'],
-          [1700, 'initTimeConfig'],
-          [2200, 'initDateTime'],
-          [2600, 'getUptime'],
-          [3400, 'initSystemStats'],
-          [4500, 'initTemperatures']
+          [0,   'hello:FirstWebpage'],
+          [300, 'initAll']
         ];
 
         initMsgs.forEach(function(item) {
@@ -766,11 +799,17 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       };
 
       ws.onmessage = function (event) {
+        wsLastRxMs = Date.now();
         handleWebSocketMessage(event.data);
       };
 
       ws.onclose = function () {
         console.log('WebSocket closed - scheduling reconnect');
+
+        if (wsHealthTimer) {
+          clearInterval(wsHealthTimer);
+          wsHealthTimer = null;
+        }
 
         var delay = wsBackoffMs;
         wsBackoffMs = Math.min(wsBackoffMs * 2, wsBackoffMaxMs);
@@ -802,18 +841,30 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
           pumpStates[i] = { state: '--', mode: 'Auto', name: 'Pump ' + i };
     }
 
-        // ---- Local ticking (reduces WS traffic massively) ----
+    // ---- Local ticking (sleep/wake resilient) ----
     var uptimeSecondsBase = null;
     var uptimeTickTimer   = null;
+    var uptimePerfBaseMs  = null;
 
-    var controllerClockBase = null;   // JS Date object
-    var clockTickTimer      = null;
+    var controllerClockBaseMs = null;   // controller snapshot in epoch ms
+    var clockTickTimer        = null;
+    var clockPerfBaseMs       = null;
+
+    function requestFreshClockAndUptime() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send('initDateTime');
+        ws.send('getUptime');
+      } else if (!ws || ws.readyState === WebSocket.CLOSED) {
+        wsConnect();
+      }
+    }
+
+
 
     function parseUptimeToSeconds(s) {
       // "0 days, 12 hours, 52 minutes, 59 seconds"
       var days = 0, hours = 0, minutes = 0, seconds = 0;
       var m;
-
 
       m = s.match(/(\d+)\s*days?/i);    if (m) days = parseInt(m[1], 10);
       m = s.match(/(\d+)\s*hours?/i);   if (m) hours = parseInt(m[1], 10);
@@ -824,54 +875,58 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     }
 
     function formatUptimeFromSeconds(total) {
-  // IMPORTANT: declare these vars (your console error is from missing "hours")
-  var days = Math.floor(total / 86400);
-  total -= (days * 86400);
+      var days = Math.floor(total / 86400);
+      total -= (days * 86400);
 
-  var hours = Math.floor(total / 3600);
-  total -= (hours * 3600);
+      var hours = Math.floor(total / 3600);
+      total -= (hours * 3600);
 
-  var minutes = Math.floor(total / 60);
-  total -= (minutes * 60);
+      var minutes = Math.floor(total / 60);
+      total -= (minutes * 60);
 
-  var seconds = total;
+      var seconds = total;
 
-  return days + " days, " + hours + " hours, " + minutes + " minutes, " + seconds + " seconds";
-}
-
+      return days + " days, " + hours + " hours, " + minutes + " minutes, " + seconds + " seconds";
+    }
 
     function startUptimeTickerFromString(uptimeStr) {
       uptimeSecondsBase = parseUptimeToSeconds(uptimeStr);
+      uptimePerfBaseMs  = performance.now();
 
       if (uptimeTickTimer) clearInterval(uptimeTickTimer);
       uptimeTickTimer = setInterval(function () {
-        if (uptimeSecondsBase == null) return;
-        uptimeSecondsBase++;
+        if (uptimeSecondsBase == null || uptimePerfBaseMs == null) return;
+
+        var elapsedSec = Math.floor((performance.now() - uptimePerfBaseMs) / 1000);
+        var totalSec = uptimeSecondsBase + elapsedSec;
+
         var el = document.getElementById('uptime');
-        if (el) el.textContent = formatUptimeFromSeconds(uptimeSecondsBase);
+        if (el) el.textContent = formatUptimeFromSeconds(totalSec);
       }, 1000);
     }
 
     function startClockTicker(dateStr, timeStr) {
       // dateStr: "YYYY-MM-DD", timeStr: "HH:MM:SS"
-      // Use an ISO-ish string; we tick locally afterwards
       var iso = dateStr + "T" + timeStr;
       var d = new Date(iso);
       if (isNaN(d.getTime())) return;
 
-      controllerClockBase = d;
+      controllerClockBaseMs = d.getTime();
+      clockPerfBaseMs = performance.now();
 
       if (clockTickTimer) clearInterval(clockTickTimer);
       clockTickTimer = setInterval(function () {
-        if (!controllerClockBase) return;
-        controllerClockBase = new Date(controllerClockBase.getTime() + 1000);
+        if (controllerClockBaseMs == null || clockPerfBaseMs == null) return;
 
-        var yyyy = controllerClockBase.getFullYear();
-        var mm   = String(controllerClockBase.getMonth() + 1).padStart(2, '0');
-        var dd   = String(controllerClockBase.getDate()).padStart(2, '0');
-        var hh   = String(controllerClockBase.getHours()).padStart(2, '0');
-        var mi   = String(controllerClockBase.getMinutes()).padStart(2, '0');
-        var ss   = String(controllerClockBase.getSeconds()).padStart(2, '0');
+        var nowMs = controllerClockBaseMs + (performance.now() - clockPerfBaseMs);
+        var current = new Date(nowMs);
+
+        var yyyy = current.getFullYear();
+        var mm   = String(current.getMonth() + 1).padStart(2, '0');
+        var dd   = String(current.getDate()).padStart(2, '0');
+        var hh   = String(current.getHours()).padStart(2, '0');
+        var mi   = String(current.getMinutes()).padStart(2, '0');
+        var ss   = String(current.getSeconds()).padStart(2, '0');
 
         var dateEl = document.getElementById('currentDate');
         var timeEl = document.getElementById('currentTime');
@@ -880,12 +935,30 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       }, 1000);
     }
 
-
     setInterval(function () {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send('ping');
       }
     }, 30000);
+
+   document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) {
+        scheduleFreshClockAndUptime(150);
+      }
+    });
+
+
+    window.addEventListener('focus', function () {
+      scheduleFreshClockAndUptime(150);
+    });
+
+    window.addEventListener('pageshow', function () {
+      scheduleFreshClockAndUptime(150);
+    });
+
+    window.addEventListener('online', function () {
+      scheduleFreshClockAndUptime(150);
+    });
 
     let currentConfig = {};
     let configEditMode = false;

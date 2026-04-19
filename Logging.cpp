@@ -678,15 +678,37 @@ void checkTimeAndAct() {
   // -----------------------------
   // 1) High-Frequency / Non-Job Updates
   // -----------------------------
+  
+  // FS usage cache remains DISABLED for now.
+  // updateFSStatsCache() / LittleFS.usedBytes() has proven destabilizing.
   /*
-  // Update the File System stats cache every 5 minutes (e.g., :00, :05, :10...)
   static int g_lastFsStatsMinute = -1;
   int currentMin = CurrentTime.minute();
   if (currentMin % 5 == 0 && currentMin != g_lastFsStatsMinute) {
     g_lastFsStatsMinute = currentMin;
     updateFSStatsCache();
   }
-*/
+  */
+
+  // Refresh HEAP and PSRAM caches from here, not from the WS transmitter.
+  // Stagger them so only one cache refresh runs at a time.
+  static int g_lastHeapStatsMinuteRan  = -1;
+  static int g_lastPsramStatsMinuteRan = -1;
+
+  int currentMin = CurrentTime.minute();
+
+  // Heap cache at :00, :05, :10, ...
+  if ((currentMin % 5) == 0 && currentMin != g_lastHeapStatsMinuteRan) {
+    g_lastHeapStatsMinuteRan = currentMin;
+    updateHeapStatsCache();
+  }
+
+  // PSRAM cache at :01, :06, :11, ...
+  if ((currentMin % 5) == 1 && currentMin != g_lastPsramStatsMinuteRan) {
+    g_lastPsramStatsMinuteRan = currentMin;
+    updatePsramStatsCache();
+  }
+
   // -----------------------------
   // 2) Schedule jobs (windowed)
   // -----------------------------

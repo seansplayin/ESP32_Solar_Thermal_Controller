@@ -1,11 +1,19 @@
 #pragma once
 #include <Arduino.h>
 
-// Returns: "used / total bytes (xx.x% used, minFree N)"
+// Live reads
 String getHeapInternalString();
-
-// Returns: "used / total bytes (xx.x% used, minFree N)" or "N/A" if no PSRAM
 String getPsramString();
+
+// Cached strings for UI / websocket use
+extern String g_cachedHeapStatsString;
+extern String g_cachedPsramStatsString;
+
+void updateHeapStatsCache();
+void updatePsramStatsCache();
+
+String getCachedHeapInternalString();
+String getCachedPsramString();
 
 // PSRAM and HEAP called by TaskEndofBootup
 void MemoryStats_printSnapshot(const char* tag);

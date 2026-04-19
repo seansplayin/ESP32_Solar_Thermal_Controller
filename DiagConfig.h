@@ -33,10 +33,11 @@ enum : uint32_t {
 };
 
 // Recommended "dev default" and "field default" masks.
-// Pick what you want as your system default in Config defaults.
+// Pick what you want as your system default in Config defaults, this is everything we've built so far.
 //(DBG_MEM | DBG_FS | DBG_PUMPLOG | DBG_TEMPLOG | DBG_ALARMLOG | DBG_1WIRE | DBG_RTD | DBG_NET | DBG_PUMP | DBG_RTC | DBG_TARGZ | DBG_TIMESYNC | DBG_WEB | DBG_TASK | DBG_SENSOR | DBG_CONFIG | DBG_PERF | DBG_PUMP_RUN_TIME_UI);
 static constexpr uint32_t DBG_DEFAULT_DEV_MASK =
-  (DBG_MEM | DBG_FS | DBG_PUMPLOG | DBG_TEMPLOG | DBG_ALARMLOG | DBG_1WIRE | DBG_RTD | DBG_NET | DBG_PUMP | DBG_RTC | DBG_TARGZ | DBG_TIMESYNC | DBG_WEB | DBG_TASK | DBG_SENSOR | DBG_CONFIG | DBG_PERF | DBG_PUMP_RUN_TIME_UI);
+// Removed DBG_RTC because it reports every 5 seconds (when the sensor is read) to the Serial Monitor
+  (DBG_MEM | DBG_FS | DBG_PUMPLOG | DBG_TEMPLOG | DBG_ALARMLOG | DBG_1WIRE | DBG_NET | DBG_PUMP | DBG_RTC | DBG_TARGZ | DBG_TIMESYNC | DBG_WEB | DBG_TASK | DBG_SENSOR | DBG_CONFIG | DBG_PERF | DBG_PUMP_RUN_TIME_UI);
 
 static constexpr uint32_t DBG_DEFAULT_FIELD_MASK =
   (DBG_NET | DBG_RTC | DBG_TIMESYNC); // keep field builds quiet by default

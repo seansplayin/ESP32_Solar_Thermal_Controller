@@ -51,7 +51,7 @@
   #define DIAG_SERIAL_CONFIG_PATH "/Json_Config_Files/diag_serial_config.json"
 #endif
 
-// Move other JSON configs into the same folder
+// JSON config folder
 #ifndef SYSTEM_CONFIG_PATH
   #define SYSTEM_CONFIG_PATH      "/Json_Config_Files/system_config.json"
 #endif
@@ -59,13 +59,6 @@
   #define TIME_CONFIG_PATH        "/Json_Config_Files/time_config.json"
 #endif
 
-// Legacy locations (root) for one-time migration
-#ifndef SYSTEM_CONFIG_PATH_OLD
-  #define SYSTEM_CONFIG_PATH_OLD  "/system_config.json"
-#endif
-#ifndef TIME_CONFIG_PATH_OLD
-  #define TIME_CONFIG_PATH_OLD    "/time_config.json"
-#endif
 // -----------------------------------------------------------------------
 
 
@@ -455,7 +448,7 @@ String getPosixTimeZoneString();
 // Initialize with compile-time defaults (#defines above)
 void initSystemConfigDefaults();
 
-// Load / Save from LittleFS: /system_config.json
+// Load / Save from LittleFS: Json_Config_Files/system_config.json
 bool loadSystemConfigFromFS();
 bool saveSystemConfigToFS();
 

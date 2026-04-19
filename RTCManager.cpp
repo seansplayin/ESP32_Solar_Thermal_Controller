@@ -5,6 +5,7 @@
 #include "WebServerManager.h" // Include this to access ws
 #include "TimeSync.h"
 #include "PumpManager.h"
+#include "TemperatureLogging.h"
 #include <RTClib.h>
 #include <Wire.h>
 #include <Ticker.h>
@@ -25,9 +26,27 @@ bool g_rtcOk = false;
 
 void markTimeValid()
 {
-    g_timeValid = true;
+    if (!g_timeValid) {
+        g_timeValid = true;
+        enableTemperatureLogging();
+    }
 }
 
+bool syncCurrentTimeFromRTCIfValid()
+{
+    if (!g_rtcOk) return false;
+
+    DateTime dt = rtc.now();
+    int year = dt.year();
+
+    if (year >= 2025 && year <= 2100) {
+        CurrentTime = dt;
+        markTimeValid();
+        return true;
+    }
+
+    return false;
+}
 
 void setupRTC() {
     Wire.begin(pinSDA, pinSCL); // Initialize I2C
@@ -36,6 +55,7 @@ void setupRTC() {
         LOG_ERR("[RTC] Couldn't find RTC\n");
 
         g_rtcOk = false;
+        g_timeValid = false;
         AlarmManager_set(ALM_RTC_MISSING, ALM_ALARM, "RTC not detected");
 
         // Keep running so web UI + Alarm Log still work
@@ -44,6 +64,18 @@ void setupRTC() {
 
     g_rtcOk = true;
     AlarmManager_clear(ALM_RTC_MISSING, "RTC detected");
+
+    // Try one immediate promotion from raw RTC -> CurrentTime.
+    // If this early read is not sane yet, later retry paths will promote it.
+    if (syncCurrentTimeFromRTCIfValid()) {
+        LOG_CAT(DBG_RTC,
+                "[RTC] Restored time from RTC at boot: %04d/%02d/%02d %02d:%02d:%02d\n",
+                CurrentTime.year(), CurrentTime.month(), CurrentTime.day(),
+                CurrentTime.hour(), CurrentTime.minute(), CurrentTime.second());
+    } else {
+        g_timeValid = false;
+        LOG_ERR("[RTC] RTC not sane yet at boot; will retry from runtime paths\n");
+    }
 }
 
 

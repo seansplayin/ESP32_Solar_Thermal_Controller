@@ -64,22 +64,67 @@ static bool tgzRingUsePsramEffective() {
   return (TGZ_RING_CACHE_LOCATION == 1) && tgzPsramAvailable();
 }
 
+// Runtime ring size selection:
+// - If PSRAM is available, keep the configured TGZ_RINGBUF_BYTES
+// - If PSRAM is NOT available, choose a much smaller internal-heap ring
+//   based on the current largest free block so fallback actually works.
+static size_t tgzEffectiveRingBytes() {
+  if (tgzRingUsePsramEffective()) {
+    return TGZ_RINGBUF_BYTES;
+  }
+
+  // No-PSRAM mode:
+  // Be extremely conservative so the compressor and HTTP path still have room.
+  const size_t kMinInternalRing        = 4 * 1024;
+  const size_t kTargetInternalRing     = 4 * 1024;
+  const size_t kLz77WorkspaceReserve   = 16 * 1024;
+  const size_t kExtraSafetyReserve     = 8 * 1024;
+  const size_t kTotalReserve           = kLz77WorkspaceReserve + kExtraSafetyReserve;
+
+  size_t lfb = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+
+  // If heap is extremely tight, still try the minimum ring.
+  if (lfb <= (kMinInternalRing + kTotalReserve)) {
+    return kMinInternalRing;
+  }
+
+  size_t candidate = lfb - kTotalReserve;
+
+  // Clamp aggressively for no-PSRAM mode.
+  if (candidate > kTargetInternalRing) candidate = kTargetInternalRing;
+  if (candidate < kMinInternalRing)    candidate = kMinInternalRing;
+
+  // round down to 1 KB boundary for small internal-heap mode
+  candidate &= ~((size_t)1024 - 1);
+  if (candidate < kMinInternalRing) candidate = kMinInternalRing;
+
+  return candidate;
+}
+
+static const char* tgzEffectiveRingLocationName() {
+  return tgzRingUsePsramEffective() ? "PSRAM" : "INTERNAL HEAP";
+}
+
 void TarGZ::begin() {
   if (g_beginDone) return;
   g_beginDone = true;
 
   g_psramAvailable = tgzPsramAvailable();
+  const size_t effectiveRingBytes = tgzEffectiveRingBytes();
 
-    // Startup warning if user requested PSRAM but PSRAM isn't enabled/available
-    if (TGZ_RING_CACHE_LOCATION == 1 && !g_psramAvailable) {
+  // Startup warning if user requested PSRAM but PSRAM isn't enabled/available
+  if (TGZ_RING_CACHE_LOCATION == 1 && !g_psramAvailable) {
     LOG_CAT(DBG_TARGZ,
-      "[TGZ] WARNING: TGZ_RING_CACHE_LOCATION=1 (PSRAM) but PSRAM is NOT available. Falling back to Internal Heap ring buffer.\n");
+      "[TGZ] WARNING: TGZ_RING_CACHE_LOCATION=1 (PSRAM) but PSRAM is NOT available. "
+      "Falling back to compressor-safe Internal Heap ring buffer size=%u bytes.\n",
+      (unsigned)effectiveRingBytes);
   }
 
-  // Warn if ring buffer is below the recommended minimum
-  if (TGZ_RINGBUF_BYTES < (256 * 1024)) {
+  // Warn if effective ring buffer is below the recommended minimum
+  if (effectiveRingBytes < (256 * 1024)) {
     LOG_CAT(DBG_TARGZ,
-      "[TGZ] WARNING: TarGZ using heap (internal memory) ring buffer size smaller that 256 KB downloads may be unstable\n");
+      "[TGZ] WARNING: TarGZ effective ring buffer is smaller than 256 KB; downloads may be slower or less stable. size=%u bytes\n",
+      (unsigned)effectiveRingBytes);
   }
 }
 
@@ -275,16 +320,19 @@ static void tgzProducerTask(void* pv) {
     return;
   }
 
-
   s->producerStarted = true;
+  LOG_CAT(DBG_TARGZ, "[TGZ] producer start: src=%s\n", s->srcPath.c_str());
   tgzPrintMem("producer start");
 
   bool ok = false;
 
   if (!takeFileSystemMutexWithRetry("[FS] tgzProducer", 5000, 3)) {
+    LOG_ERR("[TGZ] producer failed to lock FS mutex\n");
     ok = false;
   } else {
+    LOG_CAT(DBG_TARGZ, "[TGZ] producer compress begin\n");
     ok = tarGzStreamFolder(s->srcPath.c_str(), s->stream);
+    LOG_CAT(DBG_TARGZ, "[TGZ] producer compress end ok=%d\n", ok ? 1 : 0);
     xSemaphoreGive(fileSystemMutex);
   }
 
@@ -294,6 +342,8 @@ static void tgzProducerTask(void* pv) {
 
   tgzLastStackWords = TGZ_PRODUCER_TASK_STACK_WORDS;
   tgzLastHwmWords   = uxTaskGetStackHighWaterMark(nullptr);
+
+  LOG_CAT(DBG_TARGZ, "[TGZ] producer done: hwm_words=%u\n", (unsigned)tgzLastHwmWords);
 
   thTgzProducer = NULL;
   tgzPrintMem("producer done");
@@ -366,28 +416,49 @@ static void handleDownloadCompressed(AsyncWebServerRequest* request) {
   session->srcPath = dir;
   session->outName = filename;
 
+  const size_t ringBytes = tgzEffectiveRingBytes();
+  const size_t heapLfb   = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+  const size_t psramLfb  = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
   // -------------------------------------------------------------------
   // -------------------- TGZ alloc diagnostics ------------------------
   // -------------------------------------------------------------------
-    LOG_CAT(DBG_TARGZ, "[TGZ] request ring=%u bytes (%s), cache_location=%d\n",
-          (unsigned)TGZ_RINGBUF_BYTES,
-          (TGZ_RING_CACHE_LOCATION == 1) ? "PSRAM" : "INTERNAL HEAP",
+  LOG_CAT(DBG_TARGZ, "[TGZ] request ring=%u bytes (%s), cache_location=%d\n",
+          (unsigned)ringBytes,
+          tgzEffectiveRingLocationName(),
           (int)TGZ_RING_CACHE_LOCATION);
 
   LOG_CAT(DBG_TARGZ, "[TGZ] heap free=%u lfb=%u | psram free=%u lfb=%u\n",
           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
-          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+          (unsigned)heapLfb,
           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+          (unsigned)psramLfb);
+
+  if (!tgzRingUsePsramEffective()) {
+    const size_t kExpectedLz77Need = 16 * 1024;
+    LOG_CAT(DBG_TARGZ,
+            "[TGZ] no-PSRAM mode: reserving compressor workspace ~%u bytes, post-ring headroom estimate=%d bytes\n",
+            (unsigned)kExpectedLz77Need,
+            (int)((int)heapLfb - (int)ringBytes - (int)kExpectedLz77Need));
+  }
   // --------------------------------------------------------------------
 
-  // --------------------------------------------------------------------
-
-  session->stream = new TgzRingStream(TGZ_RINGBUF_BYTES);
+  session->stream = new TgzRingStream(ringBytes);
   if (!session->stream || !session->stream->ok()) {
+    LOG_ERR("[TGZ] Ring allocation failed. requested=%u location=%s heap_lfb=%u psram_lfb=%u\n",
+            (unsigned)ringBytes,
+            tgzEffectiveRingLocationName(),
+            (unsigned)heapLfb,
+            (unsigned)psramLfb);
+
     delete session->stream;
     delete session;
-    request->send(500, "text/plain", "Unable to allocate TGZ ring buffer");
+
+    String err = "Unable to allocate TGZ ring buffer. requested=" + String((unsigned)ringBytes) +
+                 " location=" + String(tgzEffectiveRingLocationName()) +
+                 " heap_lfb=" + String((unsigned)heapLfb) +
+                 " psram_lfb=" + String((unsigned)psramLfb);
+    request->send(500, "text/plain", err);
     return;
   }
 
@@ -406,7 +477,12 @@ static void handleDownloadCompressed(AsyncWebServerRequest* request) {
 
                 // Read directly into the provided output buffer (no staging allocation).
         size_t want = maxLen;
-        if (want > TGZ_HTTP_CHUNK_BYTES) want = TGZ_HTTP_CHUNK_BYTES;
+
+        // In no-PSRAM mode, use smaller HTTP chunks to reduce internal-heap pressure
+        // and make long downloads more tolerant of tight memory.
+        size_t effectiveChunk = tgzRingUsePsramEffective() ? TGZ_HTTP_CHUNK_BYTES : 1024;
+
+        if (want > effectiveChunk) want = effectiveChunk;
 
         size_t got = session->stream->readBytes(outBuf, want);
         if (got > 0) {

@@ -213,6 +213,18 @@ void TaskSetupRTC(void *pvParameters) {
 
   setupRTC();
 
+  // Give the RTC a short chance to promote its stored time into CurrentTime
+  // before the rest of the boot chain proceeds.
+  if (!g_timeValid && g_rtcOk) {
+    uint32_t startMs = millis();
+    while (!g_timeValid && (millis() - startMs < 2000UL)) {
+      if (syncCurrentTimeFromRTCIfValid()) {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+
   Serial.println("[BOOT] TaskSetupRTC DONE");
   xTaskNotifyGive(thInitFileSystem);
   vTaskDelete(NULL);
@@ -559,7 +571,8 @@ void TaskUpdatePumpRuntimes(void *pvParameters) {
 
 
 void TaskEndofBootup(void *pvParameters) {
-  enableTemperatureLogging(); // ensures temperature logging is last at boot
+  // Do NOT enable temperature logging here.
+  // Logging now enables automatically the moment valid time is acquired.
   MemoryStats_printSnapshot("BootComplete");
   vTaskDelete(NULL);
 }

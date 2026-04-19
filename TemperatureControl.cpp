@@ -55,7 +55,7 @@ float prev_PotHeatXoutletT = NAN;
 
 // Function to update temperature readings
 void updateTemperatureReadings() {
-    vTaskDelay(1);
+    
 
     panelT          = pt1000Average;      // PT1000
     CSupplyT        = DTempAverage[0];    // DTemp1
@@ -151,26 +151,21 @@ void broadcastTemperatures() {
 
 // This function gets temperatures and performs computation outside of the Mutex and then only takes Mutex to update Global Variables
 void updateTemperatures() {
-  // 1) take the lock for _all_ shared‐state work
-    if (! xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
+  // 1) take the lock for _all_ shared-state work
+  if (!xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
     LOG_ERR("[Temp] Failed to take temperatureMutex\n");
     return;
   }
 
-
-  // 2) tell the DS18B20s to convert (blocking vs. nonblock flag is in init)
-  sensors1.requestTemperatures();
-  sensors2.requestTemperatures();
-
-  // 3) read & average the PT1000
+  // 2) read & average the PT1000
   updatePT1000Readings();
 
-  // 4) read & average the DS18B20s
+  // 3) read the previously completed DS18B20 conversion and kick the next one
   updateDS18B20Readings();
 
-  // 5) now update any derived/shared variables (e.g. System Temperatures)
+  // 4) now update any derived/shared variables (e.g. System Temperatures)
   updateTemperatureReadings();
 
-  // 6) release the lock
+  // 5) release the lock
   xSemaphoreGive(temperatureMutex);
 }

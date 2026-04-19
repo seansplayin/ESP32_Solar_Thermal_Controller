@@ -21,7 +21,7 @@
 #define ETH_PHY_RST  W5500_RST
 
 #ifndef ETH_SPI_FREQ_MHZ
-#define ETH_SPI_FREQ_MHZ 10
+#define ETH_SPI_FREQ_MHZ 3
 #endif
 
 // EXPLICITLY CLAIM FSPI TO LOCK W5500
@@ -39,9 +39,9 @@ static volatile uint32_t s_lastLinkUpMs   = 0;
 static volatile uint32_t s_lastRecoverMs  = 0;
 static volatile uint32_t s_lastGotIpMs    = 0;
 
-static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000;   
-static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000;  
-static const uint32_t NET_RECOVER_WAIT_IP_MS  = 15000;  
+static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000;
+static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000;
+static const uint32_t NET_RECOVER_WAIT_IP_MS  = 30000;  // A/B: give link/DHCP more time before hard restart
 
 static void requestNetworkRecovery();
 static void NetworkRecoveryTask(void* pvParameters);
@@ -110,6 +110,10 @@ static void hardResetW5500() {
 }
 
 static void requestNetworkRecovery() {
+  if (s_ethRestartInProgress) {
+    return;
+  }
+
   s_netRecoverPending = true;
 
   if (s_netRecoverTask != nullptr) {
@@ -155,6 +159,7 @@ static void NetworkRecoveryTask(void* pvParameters) {
 
       s_netRecoverPending = false;
       s_lastRecoverMs = now;
+      s_ethRestartInProgress = true;
 
       LOG_ERR("[Network] Debounced recovery: restarting W5500 / ETH stack\n");
       eth_link_up = false;
@@ -185,6 +190,7 @@ static void NetworkRecoveryTask(void* pvParameters) {
       );
 
       if (!ethStarted) {
+        s_ethRestartInProgress = false;
         LOG_ERR("[Network] Recovery ETH.begin failed\n");
         AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet recovery ETH.begin failed");
         break;
@@ -203,6 +209,7 @@ static void NetworkRecoveryTask(void* pvParameters) {
         AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet recovery timed out waiting for IP");
       }
 
+      s_ethRestartInProgress = false;
       break;
     }
   }
@@ -233,8 +240,19 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
       break;
 
     case ARDUINO_EVENT_ETH_LOST_IP:
+      LOG_ERR("[Network] Ethernet Lost IP\n");
+      // IMPORTANT:
+      // Keep link_up true here. LOST_IP is not the same as PHY/link-down.
+      // Start a grace period for DHCP/IP recovery before allowing a hard restart.
+      eth_connected = false;
+      s_lastLinkUpMs = millis();
+      if (!s_ethRestartInProgress) {
+        requestNetworkRecovery();
+      }
+      break;
+
     case ARDUINO_EVENT_ETH_DISCONNECTED:
-      LOG_ERR("[Network] Ethernet Disconnected/Lost IP\n");
+      LOG_ERR("[Network] Ethernet Disconnected\n");
       eth_link_up = false;
       eth_connected = false;
       s_lastLinkDownMs = millis();
@@ -270,7 +288,7 @@ void setupNetwork() {
     xTaskCreatePinnedToCore(
       NetworkRecoveryTask,
       "NetRecover",
-      4096,
+      8192,
       nullptr,
       3,
       &s_netRecoverTask,
@@ -320,8 +338,15 @@ void setupNetwork() {
     LOG_CAT(DBG_NET, "[Network] Setup successful. IP: %s\n", ETH.localIP().toString().c_str());
   } else {
     LOG_ERR("[Network] Initial IP assignment timeout (Will continue in background).\n");
-    s_lastLinkDownMs = millis();
-    requestNetworkRecovery();
+
+    // A/B:
+    // If the link never came up at all (for example cable unplugged),
+    // do not immediately hammer the W5500 with restart cycles.
+    // Let the controller continue in degraded mode.
+    if (eth_link_up) {
+      s_lastLinkDownMs = millis();
+      requestNetworkRecovery();
+    }
   }
 }
 
