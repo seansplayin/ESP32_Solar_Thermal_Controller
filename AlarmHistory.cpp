@@ -1,3 +1,4 @@
+// AlarmHistory.cpp
 #include "AlarmHistory.h"
 #include "FileSystemManager.h"
 #include <LittleFS.h>
@@ -214,6 +215,10 @@ static bool persistUnlocked() {
   // This keeps file bounded to <= 40*(1+10) lines.
   for (int i=0;i<MAX_GROUPS;i++){
     if (!s_groups[i].used) continue;
+    
+    // YIELD: Give the network stack breathing room during continuous FS writes
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
     Group& g = s_groups[i];
     for (int r=0; r<g.count; r++){
       f.print("{\"id\":"); f.print(g.recs[r].id);
@@ -252,6 +257,9 @@ static void loadFromFSUnlocked() {
 
   char line[256];
   while (f.available()) {
+    // YIELD: Give the network stack breathing room during heavy JSON parsing
+    vTaskDelay(pdMS_TO_TICKS(1));
+
     size_t n = f.readBytesUntil('\n', line, sizeof(line)-1);
     line[n] = '\0';
     if (n < 10) continue;

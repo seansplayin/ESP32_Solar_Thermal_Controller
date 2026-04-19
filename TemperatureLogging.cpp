@@ -1,3 +1,4 @@
+// TemperatureLopgging.cpp
 #include "TemperatureLogging.h"
 #include "Config.h"
 #include "FileSystemManager.h"
@@ -254,6 +255,10 @@ static void flushCache() {
     }
 
     for (int i = 0; i < NUM_SENSORS; i++) {
+        // YIELD: Give the network stack a break between sensors.
+        // Flushing flash memory is high-latency; this prevents cumulative starvation.
+        vTaskDelay(pdMS_TO_TICKS(2));
+
         if (cacheCount[i] == 0 || cache[i] == nullptr) {
             continue;
         }
@@ -455,6 +460,9 @@ void TaskTemperatureLogging_Run(void*)
 
         // 8) Delta check — compare against last value **written to flash**
         for (int i = 0; i < NUM_SENSORS; i++) {
+            // Tiny yield to prevent this loop from becoming a solid block of CPU usage
+            if (i % 4 == 0) vTaskDelay(1); 
+
             float current = getValue(i);
             if (isnan(current)) continue;
 

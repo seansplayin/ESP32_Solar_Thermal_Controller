@@ -210,6 +210,13 @@ public:
 
     size_t written = 0;
     while (written < len && !_cancelled) {
+      
+      // YIELD: This is the critical injection point!
+      // The compression library runs hot. By forcing the producer task to yield 
+      // every time it pushes a chunk to the ring buffer, the FreeRTOS scheduler 
+      // guarantees the Core 3.x LwIP network stack is never starved.
+      vTaskDelay(pdMS_TO_TICKS(2));
+
       size_t space = _cap - _used;
       if (space == 0) {
         if (_semSpace) xSemaphoreTake(_semSpace, pdMS_TO_TICKS(2000));

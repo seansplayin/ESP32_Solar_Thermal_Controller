@@ -1379,7 +1379,9 @@ void TaskWebSocketTransmitter(void* pvParameters) {
         
 
         if (didWork) {
-            vTaskDelay(pdMS_TO_TICKS(30));
+            // YIELD: Increase pacing slightly and ensure the Idle task/Network stack 
+            // can run between every single WebSocket frame sent.
+            vTaskDelay(pdMS_TO_TICKS(50)); 
         } else {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -2132,6 +2134,10 @@ void setupLogDataRoute() {
 void refreshRuntimeCache() {
     DateTime currentTime = getCurrentTimeAtomic();
     for (int i = 0; i < 10; i++) {
+        // YIELD: Do not allow the 70+ consecutive filesystem reads to 
+        // block the network stack. Yield between every pump's data set.
+        vTaskDelay(pdMS_TO_TICKS(5));
+
         cachedRuntimes[i][0] = aggregateDailyLogsReport(i, currentTime);
         cachedRuntimes[i][1] = aggregatePreviousDailyLogsReport(i, currentTime);
         cachedRuntimes[i][2] = aggregateMonthlyLogsReport(i, currentTime);
@@ -2139,8 +2145,11 @@ void refreshRuntimeCache() {
         cachedRuntimes[i][4] = aggregateYearlyLogsReport(i, currentTime);
         cachedRuntimes[i][5] = aggregatePreviousYearlyLogsReport(i, currentTime);
         cachedRuntimes[i][6] = aggregateDecadeLogsReport(i, currentTime);
+    }
 }
-}
+  
+        
+
 
 
     void updateAllRuntimes() {

@@ -1,3 +1,4 @@
+// Max31865-PT1000.h
 #ifndef MAX31865_PT1000_H
 #define MAX31865_PT1000_H
 #include "Config.h"

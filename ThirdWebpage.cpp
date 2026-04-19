@@ -74,7 +74,8 @@ static bool deletePathRecursiveUnlocked(const String &path) {
       ok = LittleFS.remove(childPath) && ok;
     }
 
-    vTaskDelay(1);
+    // YIELD: Guaranteed 2ms gap between every file removal
+    vTaskDelay(pdMS_TO_TICKS(2)); 
     entry = dir.openNextFile();
   }
   dir.close();
@@ -946,12 +947,15 @@ void setupThirdPageRoutes() {
       obj["time"] = time;
       obj["value"] = val;
       lineCount++;
-      if ((lineCount % 200) == 0) {
-        vTaskDelay(1);
+      if ((lineCount % 50) == 0) { // Yield more frequently (every 50 lines)
+        vTaskDelay(pdMS_TO_TICKS(1));
       }
     }
     f.close();
     xSemaphoreGive(fileSystemMutex);
+
+    // YIELD before the heavy JSON string generation
+    vTaskDelay(pdMS_TO_TICKS(1)); 
 
     String out;
     serializeJson(doc, out);
@@ -989,6 +993,7 @@ void setupThirdPageRoutes() {
 
     File entry = root.openNextFile();
     while (entry) {
+      vTaskDelay(pdMS_TO_TICKS(1));
       JsonObject obj = arr.createNestedObject();
 
       String full = String(entry.name());

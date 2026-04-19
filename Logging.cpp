@@ -1,3 +1,4 @@
+// Logging.cpp
 #include "Logging.h"
 #include "TimeSync.h"
 #include "RTCManager.h"
@@ -153,6 +154,7 @@ void listAllFiles() {
   File file = root.openNextFile();
   LOG_CAT(DBG_FS, "Files stored in LittleFS:\n");
   while (file) {
+    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD: Give network stack time to breathe
     LOG_CAT(DBG_FS, "%s\n", file.name());
     file = root.openNextFile();
   }
@@ -179,6 +181,7 @@ void readAndPrintLogFile(const String& filename) {
 
   LOG_CAT(DBG_PUMPLOG, "Contents of %s:\n", fullPath.c_str());
   while (logFile.available()) {
+    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
     String line = logFile.readStringUntil('\n');
     LOG_CAT(DBG_PUMPLOG, "%s\n", line.c_str());
   }
@@ -254,6 +257,7 @@ unsigned long calculateTotalRuntime(const String& logFilename) {
   bool isPumpRunning = false;
 
   while (logFile.available()) {
+    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
     String line = logFile.readStringUntil('\n');
     // Check for START or STOP events and parse the datetime
     if (line.startsWith("START")) {
@@ -296,6 +300,7 @@ void aggregatePumptoDailyLogs(int pumpIndex) {
     File dailyLogFile = LittleFS.open(dailyLogFilename, "r");
     if (dailyLogFile) {
       while (dailyLogFile.available()) {
+        vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
         String line = dailyLogFile.readStringUntil('\n');
         line.trim();
 
@@ -332,6 +337,7 @@ void aggregatePumptoDailyLogs(int pumpIndex) {
 
   // Accumulate runtime from START→STOP, attributing to STOP date
   while (logFile.available()) {
+    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
     String line = logFile.readStringUntil('\n');
     line.trim();
 
@@ -404,6 +410,7 @@ unsigned long calculateTotalMonthlyRuntime(const String& dailyLogFilename) {
   }
   unsigned long totalMonthlyRuntime = 0;
   while (dailyLogFile.available()) {
+    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
     String line = dailyLogFile.readStringUntil('\n');
     // Assuming the line format is "YYYY-MM-DD Total Runtime: XXX seconds"
     int start = line.indexOf("Total Runtime: ") + 15;
@@ -447,6 +454,7 @@ void aggregateDailyToMonthlyLogs(int pumpIndex) {
   if (LittleFS.exists(monthlyLogFilename)) {
     File monthlyLogFile = LittleFS.open(monthlyLogFilename, "r");
     while (monthlyLogFile.available()) {
+      vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
       String line = monthlyLogFile.readStringUntil('\n');
       if (line.startsWith(previousMonth)) {
         // parse existing line to get the old runtime
@@ -497,6 +505,7 @@ unsigned long calculateTotalYearlyRuntime(const String& yearlyLogFilename) {
   }
   unsigned long totalYearlyRuntime = 0;
   while (yearlyLogFile.available()) {
+    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
     String line = yearlyLogFile.readStringUntil('\n');
     // Use the existing `extractRuntimeFromLogLine` function
     totalYearlyRuntime += extractRuntimeFromLogLine(line);
@@ -531,6 +540,7 @@ void aggregateMonthlyToYearlyLogs(int pumpIndex) {
   File yearlyLogFile = LittleFS.open(yearlyLogFilename, "r");
   if (yearlyLogFile) {
     while (yearlyLogFile.available()) {
+      vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
       String line = yearlyLogFile.readStringUntil('\n');
       if (line.startsWith(labelYear)) {
         int start = line.indexOf("Total Runtime: ") + 15;

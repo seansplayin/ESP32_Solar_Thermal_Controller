@@ -21,7 +21,7 @@
 #define ETH_PHY_RST  W5500_RST
 
 #ifndef ETH_SPI_FREQ_MHZ
-#define ETH_SPI_FREQ_MHZ 3
+#define ETH_SPI_FREQ_MHZ 15
 #endif
 
 // EXPLICITLY CLAIM FSPI TO LOCK W5500
@@ -173,10 +173,11 @@ static void NetworkRecoveryTask(void* pvParameters) {
 
       hardResetW5500();
 
-      gpio_uninstall_isr_service();
+
+      // Ethernet recovery results in error "E (3166024) gpio: gpio_install_isr_service(530): GPIO isr service already installed" if "gpio_uninstall_isr_service()"" is commented out but still recovers I think. 
+      gpio_uninstall_isr_service()
       vTaskDelay(pdMS_TO_TICKS(20));
 
-      pinMode(W5500_INT, INPUT_PULLUP);
       spiW5500.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_SS);
 
       bool ethStarted = ETH.begin(
@@ -298,15 +299,14 @@ void setupNetwork() {
 
   vTaskDelay(pdMS_TO_TICKS(500));
 
-  // Configure INT pin BEFORE reset
-  pinMode(W5500_INT, INPUT_PULLUP);
-
   // Start explicitly named FSPI BEFORE reset so bus is valid
   spiW5500.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_SS);
 
   hardResetW5500();
 
   vTaskDelay(pdMS_TO_TICKS(200)); 
+  
+  // REMOVED: Manual pinMode for W5500_INT. The esp_eth driver MUST own this pin.
 
   Network.onEvent(onEvent);
 

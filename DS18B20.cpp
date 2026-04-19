@@ -1,4 +1,4 @@
-// DS18B20.cpp – PERMANENT VERSION with boot-time search + missing sensor alarms
+// DS18B20.cpp 
 #include "DS18B20.h"
 #include "Config.h"
 #include "DiagLog.h"
@@ -160,6 +160,11 @@ float calculateAverage(float values[], int numReadings) {
 
 void updateDS18B20Readings() {
     for (int i = 0; i < NUM_SENSORS; i++) {
+        // YIELD: Give the network stack time to process W5500 interrupts.
+        // Reading a 1-Wire scratchpad takes ~5ms. Yielding here prevents the 
+        // loop from blocking the FreeRTOS scheduler for ~65ms+ straight.
+        vTaskDelay(pdMS_TO_TICKS(1));
+
         // Skip unassigned / missing sensors entirely.
         if (!sensorPresent[i] || sensorMappings[i].address == 0ULL) {
             continue;
