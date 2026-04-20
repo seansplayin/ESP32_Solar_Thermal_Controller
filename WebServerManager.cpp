@@ -1063,6 +1063,7 @@ void handleRequestLogData(String message) {
 
 
 // Send pump statuses to client
+// Send pump statuses to client (Optimized with Local Cache)
 void sendPumpStatuses(AsyncWebSocketClient* client) {
     // For broadcast path, do not even build the JSON unless a client is writable.
     if (client == nullptr && !hasWritableWSClient()) {
@@ -1074,37 +1075,44 @@ void sendPumpStatuses(AsyncWebSocketClient* client) {
         return;
     }
 
-    DynamicJsonDocument doc(2048);
-    JsonArray pumps = doc.to<JsonArray>();
+    static String cachedPayload = "";
+    static bool needsRebuild = true;
 
-    for (int i = 0; i < NUM_PUMPS; i++) {
-        JsonObject pump = pumps.createNestedObject();
-        pump["pumpIndex"] = i + 1;
-        pump["name"] = pumpNames[i];
-        pump["state"] = pumpStates[i] == PUMP_ON ? "ON" : "OFF";
-
-        String modeStr;
-        switch (pumpModes[i]) {
-            case PUMP_ON:
-                modeStr = "on";
-                break;
-            case PUMP_OFF:
-                modeStr = "off";
-                break;
-            case PUMP_AUTO:
-                modeStr = "auto";
-                break;
-            default:
-                modeStr = "unknown";
-                break;
-        }
-        pump["mode"] = modeStr;
+    // If client == nullptr, it means this was triggered by g_sendPumpStatus = true
+    // (a state actually changed). Therefore, we MUST rebuild the cache.
+    if (client == nullptr) {
+        needsRebuild = true;
     }
 
-    String pumpStatusData;
-    serializeJson(pumps, pumpStatusData);
+    // Only do the heavy JSON serialization if the state changed, or cache is empty
+    if (needsRebuild || cachedPayload.length() == 0) {
+        DynamicJsonDocument doc(2048);
+        JsonArray pumps = doc.to<JsonArray>();
 
-    queueWsToClientOrBroadcast(client, "PumpStatus:" + pumpStatusData, "PumpStatus");
+        for (int i = 0; i < NUM_PUMPS; i++) {
+            JsonObject pump = pumps.createNestedObject();
+            pump["pumpIndex"] = i + 1;
+            pump["name"] = pumpNames[i];
+            pump["state"] = pumpStates[i] == PUMP_ON ? "ON" : "OFF";
+
+            String modeStr;
+            switch (pumpModes[i]) {
+                case PUMP_ON:   modeStr = "on"; break;
+                case PUMP_OFF:  modeStr = "off"; break;
+                case PUMP_AUTO: modeStr = "auto"; break;
+                default:        modeStr = "unknown"; break;
+            }
+            pump["mode"] = modeStr;
+        }
+
+        String pumpStatusData;
+        serializeJson(pumps, pumpStatusData);
+        cachedPayload = "PumpStatus:" + pumpStatusData;
+        needsRebuild = false; // Cache is now fresh
+    }
+
+    // Fire the pre-baked string instantly
+    queueWsToClientOrBroadcast(client, cachedPayload, "PumpStatus");
 }
 
 // **New: Send Updated Temperatures**

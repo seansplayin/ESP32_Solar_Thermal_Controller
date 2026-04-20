@@ -65,13 +65,16 @@ void enableTemperatureLogging()
     LOG_CAT(DBG_TEMPLOG, "[TempLog] Enabled after valid time acquired\n");
 }
 
-// RAM cache — unlimited size, grows as needed
+// RAM cache — fixed size to prevent heap fragmentation
+#define CACHE_MAX_ENTRIES 120  // Safely holds up to 2 hours of 1-minute samples
+
 struct LogEntry {
     DateTime dt;   // RTC local time at moment of sample
     float  value;
 };
 
-static LogEntry* cache[NUM_SENSORS]      = { nullptr };
+// Statically allocated fixed arrays (No realloc!)
+static LogEntry  cache[NUM_SENSORS][CACHE_MAX_ENTRIES];
 static int       cacheCount[NUM_SENSORS] = { 0 };
 
 // This is the **only** value we compare against for delta checks
@@ -217,19 +220,16 @@ static void writeToFlash(int sensorIdx0, const DateTime& dt, float value) {
 static void addToCache(int sensorIdx0, float value) {
     DateTime dt = getCurrentTimeAtomic();   // RTC local time
 
-    int newCount = cacheCount[sensorIdx0] + 1;
-    LogEntry* newBuf = (LogEntry*)realloc(cache[sensorIdx0], sizeof(LogEntry) * newCount);
-    if (!newBuf) {
-#ifdef TEMP_LOG_DEBUG_ERRORS
-        LOG_ERR("[TempLog] ERROR: realloc failed for cache\n");
-#endif
-        return;  // keep old cache untouched
+    // Prevent buffer overflow. (Hourly flush guarantees we rarely exceed 60).
+    if (cacheCount[sensorIdx0] >= CACHE_MAX_ENTRIES) {
+        LOG_ERR("[TempLog] WARNING: Cache full for sensor %d! Dropping sample.\n", sensorIdx0 + 1);
+        return; 
     }
 
-    cache[sensorIdx0] = newBuf;
-    cache[sensorIdx0][cacheCount[sensorIdx0]].dt    = dt;
-    cache[sensorIdx0][cacheCount[sensorIdx0]].value = value;
-    cacheCount[sensorIdx0] = newCount;
+    int idx = cacheCount[sensorIdx0];
+    cache[sensorIdx0][idx].dt    = dt;
+    cache[sensorIdx0][idx].value = value;
+    cacheCount[sensorIdx0]++;
 
     lastLoggedValue[sensorIdx0] = value;
     lastLoggedValid[sensorIdx0] = true;
@@ -241,7 +241,7 @@ static void addToCache(int sensorIdx0, float value) {
 }
 
 // ---------------------------------------------------------------------------
-// Flush all caches to flash (called hourly and at midnight)
+// Flush all caches to flash (Batch Write to Minimize Mutex Holds)
 // ---------------------------------------------------------------------------
 static void flushCache() {
     uint32_t nowMs = millis();
@@ -256,83 +256,67 @@ static void flushCache() {
 
     for (int i = 0; i < NUM_SENSORS; i++) {
         // YIELD: Give the network stack a break between sensors.
-        // Flushing flash memory is high-latency; this prevents cumulative starvation.
         vTaskDelay(pdMS_TO_TICKS(2));
 
-        if (cacheCount[i] == 0 || cache[i] == nullptr) {
+        if (cacheCount[i] == 0) {
             continue;
         }
 
-        if (!takeFileSystemMutexWithRetry("[TempLog] flushCache",
-                                          pdMS_TO_TICKS(2000), 3)) {
-#ifdef TEMP_LOG_DEBUG_ERRORS
-            LOG_ERR("[TempLog] ERROR: mutex timeout in flushCache for sensor %d\n", i + 1);
-#endif
-            continue;
-        }
-
-        String currentPath;
-        File   f;
+        // 1. Build the entire payload in RAM *BEFORE* taking the filesystem lock.
+        // A typical line is ~32 bytes. Reserve memory to prevent String reallocation.
+        String payload;
+        payload.reserve(cacheCount[i] * 35);
 
         for (int j = 0; j < cacheCount[i]; j++) {
-            DateTime dt = cache[i][j].dt;
-
-            int year   = dt.year();
-            int month  = dt.month();
-            int day    = dt.day();
-            int hour   = dt.hour();
-            int minute = dt.minute();
-
-            String path = buildFilePath(year, month, day, i + 1);
-
-            // If we changed day/file, close the old one and open the new one
-            if (!f || path != currentPath) {
-                if (f) {
-                    f.close();
-                }
-                currentPath = path;
-
-                // Make sure directory hierarchy exists
-                if (!ensureSensorDir(year, month, i + 1)) {
-#ifdef TEMP_LOG_DEBUG_ERRORS
-                    LOG_ERR("[TempLog] ERROR: ensureSensorDir failed for %s\n", currentPath.c_str());
-#endif
-                    break;
-                }
-
-                f = LittleFS.open(currentPath, "a");
-                if (!f) {
-#ifdef TEMP_LOG_DEBUG_ERRORS
-                    LOG_ERR("[TempLog] ERROR: cannot open %s for flush\n", currentPath.c_str());
-#endif
-                    break;
-                }
-            }
-
             char line[64];
             snprintf(line, sizeof(line),
                      "%04d-%02d-%02d,%02d:%02d:00,%.2f\n",
-                     year, month, day,
-                     hour, minute,
+                     cache[i][j].dt.year(), cache[i][j].dt.month(), cache[i][j].dt.day(),
+                     cache[i][j].dt.hour(), cache[i][j].dt.minute(),
                      cache[i][j].value);
-
-            f.print(line);
-
-            lastWrittenToFlash[i] = cache[i][j].value;
-            lastWrittenDay[i]     = day;
-
-            esp_task_wdt_reset();
-            vTaskDelay(1);   // yield
+            payload += line;
         }
 
-        if (f) {
-            f.close();
+        // Because midnight rollover explicitly triggers a flush, all items currently 
+        // in this cache are guaranteed to belong to the exact same day. 
+        // We use the date from the LAST entry to determine the file path.
+        int lastIdx = cacheCount[i] - 1;
+        int year   = cache[i][lastIdx].dt.year();
+        int month  = cache[i][lastIdx].dt.month();
+        int day    = cache[i][lastIdx].dt.day();
+        String path = buildFilePath(year, month, day, i + 1);
+
+        // 2. Take Mutex, Write the whole chunk, Release Mutex instantly
+        if (!takeFileSystemMutexWithRetry("[TempLog] flushCache", pdMS_TO_TICKS(2000), 3)) {
+#ifdef TEMP_LOG_DEBUG_ERRORS
+            LOG_ERR("[TempLog] ERROR: mutex timeout in flushCache for sensor %d\n", i + 1);
+#endif
+            continue; // Skip this sensor, try again next flush
+        }
+
+        if (ensureSensorDir(year, month, i + 1)) {
+            File f = LittleFS.open(path, "a");
+            if (f) {
+                f.print(payload);
+                f.close();
+                
+                // Update the persisted reference
+                lastWrittenToFlash[i] = cache[i][lastIdx].value;
+                lastWrittenDay[i]     = day;
+            } else {
+#ifdef TEMP_LOG_DEBUG_ERRORS
+                LOG_ERR("[TempLog] ERROR: cannot open %s for flush\n", path.c_str());
+#endif
+            }
+        } else {
+#ifdef TEMP_LOG_DEBUG_ERRORS
+            LOG_ERR("[TempLog] ERROR: ensureSensorDir failed for %s\n", path.c_str());
+#endif
         }
 
         xSemaphoreGive(fileSystemMutex);
 
-        free(cache[i]);
-        cache[i]      = nullptr;
+        // 3. Clear cache count (No free() needed!)
         cacheCount[i] = 0;
 
 #ifdef TEMP_LOG_DEBUG_FLUSH

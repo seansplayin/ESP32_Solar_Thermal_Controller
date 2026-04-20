@@ -353,25 +353,6 @@ Updated ESP board manager package 3.3.6 to 3.3.7
 SP32_Solar_Thermal_Controller_20260322103855 - Still troubleshooting Network Dropouts. Unable to find island of stability with older sketches or libraries AsyncTCP, ESPAsyncWebServer, ESP board manager, continuing troubleshooing  on latest sketch version and 1 year old libries. commented out TaskbroadcastTemperatures no difference. lowering W5500 spi mhz increases crash frequency, raised to 30 mhz 30+ mninutes without a crash. suspicion data flooding onto ws buss from multiple sources may be causing this.  
 
 ESP32_Solar_Thermal_Controller_20260331001314 - Still troubleshooting network dropouts. reduced number of blind calls dumping data to the ws bus. found that second-page and third-page are working properly including lardge directory downloads now and connection was live for 30 minutes with no errors. After connecting to the firstwebpage it loaded successfully but within a minute 
-00:09:46.981 -> Guru Meditation Error: Core  0 panic'ed (LoadProhibited). Exception was unhandled.
-00:09:47.023 -> 
-00:09:47.023 -> Core  0 register dump:
-00:09:47.023 -> PC      : 0x420da412  PS      : 0x00060b30  A0      : 0x820618ff  A1      : 0x3fccd5c0  
-00:09:47.045 -> A2      : 0x00000000  A3      : 0x3c161b58  A4      : 0x42049ed4  A5      : 0x3fccf0c8  
-00:09:47.045 -> A6      : 0x3fcdb750  A7      : 0x3fcb6ed8  A8      : 0xacc4420d  A9      : 0xaca84307  
-00:09:47.045 -> A10     : 0x00060b23  A11     : 0x00000000  A12     : 0x00060b20  A13     : 0x00000000  
-00:09:47.045 -> A14     : 0x00000000  A15     : 0x3fcb6ed8  SAR     : 0x00000009  EXCCAUSE: 0x0000001c  
-00:09:47.077 -> EXCVADDR: 0xaca84396  LBEG    : 0x420597d5  LEND    : 0x420597e3  LCOUNT  : 0x00000000  
-00:09:47.077 -> 
-00:09:47.077 -> 
-00:09:47.077 -> Backtrace: 0x420da40f:0x3fccd5c0 0x420618fc:0x3fccd5e0 0x42060919:0x3fccd600 0x42060935:0x3fccd620 0x42060af4:0x3fccd660 0x42061210:0x3fccd680 0x420da34f:0x3fccd6a0 0x42049dc0:0x3fccd6c0 0x4206090d:0x3fccd6e0 0x42060935:0x3fccd700 0x42061844:0x3fccd740 0x42085d89:0x3fccd760 0x42073815:0x3fccd780 0x420e6ed1:0x3fccd7a0 0x420e6f43:0x3fccd800 0x4037f9e5:0x3fccd820
-00:09:47.110 -> 
-00:09:47.110 -> 
-00:09:47.110 -> 
-00:09:47.110 -> 
-00:09:47.110 -> ELF file SHA256: 9122fd972
-00:09:47.110 -> 
-00:09:47.504 -> Rebooting...
 
 ESP32_Solar_Thermal_Controller_20260331074857 - Continued reducing ws.send calls. Iframe for Pump Runtime did experience a duplication of data when I refreshed the firstwebpage connection but new reconnect logic worked and browser was back alive all night long with very few network related errors.
 need to update libraries 
@@ -390,10 +371,9 @@ ESP32_Solar_Thermal_Controller_20260406230948 - Powering ESP32 from wall power d
 
 ESP32_Solar_Thermal_Controller_20260410065116 - crashing is no longer happening 2+ days with not crahses. Unfortunately Ethernet disconnects are still happening but reconnect function is working properly. in 2+ days runtime around 60 disconnects happened. Modified code so time_contig.json is now in /Json_Config_/Files/.
 
-ESP32_Solar_Thermal_Controller_20260410182525 - Created Web Socket ring queue and now all WS messages go through this system wide single sender. System went almost 10 hours today without a single network disconnect until I unlocked the computer. Massive increase to network stability.  
+ESP32_Solar_Thermal_Controller_20260410182525 - Created Web Socket ring queue and now all WS messages go through this system wide single sender. System went almost 10 hours today without a single network disconnect until I unlocked the computer. Massive increase to network stability. Wrote a single initAll function that will call all the functions with time spacing that are initialized durring webpage connection: hello:FirstWebpage, initPumpStatus, initHeatingCalls, initAlarmState, initConfig, initTimeConfig, initDateTime, getUptime, initSystemStats, initTemperatures, every 30 seconds ping. on browser wake/focus/pageshow/online at lines 903–919, initDateTime, getUptime, Rewrite 
 
-ESP32_Solar_Thermal_Controller_20260412123129 - Reenabled the FsStats in checkTimeAndAct and core panic occurred very quickly, returned to commented out. commented out setInterval(schedule, 2000); on the iframe but ethernet disconnects continued. created a dead-man switch to reset ethernet adapter when ping message were not received but that just obscurred the actual problem, reverted code. Added cache for PSRAM and Heap values to be storred and extended checkTimeAndAct to update values so WS pulls from cache, Ethernet disconnect still occurred as soon as I unlocked computer. 
-Added InitAll to stagger webpage connection/active window requests so they don't hit all at once, still ethernet disconnects when logging in. Slightly modified RTC behavior so boot messages on serial monitor are accurate and so system operation is not blocked if RTC time is invalid and only Logging operations are blocked.
+ESP32_Solar_Thermal_Controller_20260412123129 - Reenabled the FsStats in checkTimeAndAct and core panic occurred very quickly, returned to commented out. commented out setInterval(schedule, 2000); on the iframe but ethernet disconnects continued. created a dead-man switch to reset ethernet adapter when ping message were not received but that just obscurred the actual problem, reverted code. Added cache for PSRAM and Heap values to be storred and extended checkTimeAndAct to update values so WS pulls from cache, Ethernet disconnect still occurred as soon as I unlocked computer. Added InitAll to stagger webpage connection/active window requests so they don't hit all at once, still ethernet disconnects when logging in. Slightly modified RTC behavior so boot messages on serial monitor are accurate and so system operation is not blocked if RTC time is invalid and only Logging operations are blocked.
 
 ESP32_Solar_Thermal_Controller_20260413223807 - improved DS18B20 non-blocking conversion flow, removal of duplicate DS18B20 conversion requests in updateTemperatures(), RTC validity / promotion improvements, staged initAll, NetworkManager recovery hardening
 
@@ -403,6 +383,7 @@ ESP32_Solar_Thermal_Controller_20260416060958 - Continued troubleshooting Networ
 
 ESP32_Solar_Thermal_Controller_20260419142121 - Changes made to the network initialization which did not seem to help. Removed gpio_uninstall_isr_service();, pinMode(W5500_INT, INPUT_PULLUP); from NetworkRecoveryTask but not sure if I like the NetworkRecoveryTask changes but it at least seems to recover after a disconnect happens. Ethernet Adapter is now using phy (dumb) mode and running the ESP Network.h stack rather than it's own internal stack which conflicts with RTOS strickter scheduler in ESP32 Core 3.x+.  Went through entire code base targeting any time consuming blocking code or calls for "while" and "for" because they delay cpu and that could possible delay the W5500's int pin which will cause ack time period to expire resulting in ethernet dropout. Went through entire code base targeting any blocking code that could possible tie up the CPU or delay the W5500's int pin which will cause ack time period to expire resulting in ethernet dropout. Modified Files modified, AlarmHistory.cpp, DS18B20.cpp, HealthCheck.cpp (no changes but checkStacks90() is extremely computationally demanding and was already commented out.), Logging.cpp (Many changes), TarGZ.cpp, Temperature Logging (I believe these changes increased stability), ThirdWebpage.cpp, WebServerManager.cpp (Also may have increased network stability).  Preliminary results looks excellent and even while working at my computer the [WS] Received Message: ping have continued for 50 minutes without a network disconnect and that is the longest I've seen yet until I walked to the kitchen and sat back down. (must be EMI) I also suspect that refreshing the webpage after firmware upload increases stability. 
 
+ESP32_Solar_Thermal_Controller_20260419222557 - added caching to the pumpstats so now as the pumps turn on and off the data is cached and when updating the webpage it jus grabs cachedPayload. 
 
 
 
@@ -418,33 +399,8 @@ broadcastMessageOverWebSocket() does a per-client send loop, which is good, but 
 plus iterating all clients on every single message can still be a little expensive under churn. 
 It is not wrong, just something to keep in mind if you are chasing latency spikes.
 
-Write a single initAll function that will call all the functions with time spacing that are initialized durring webpage connection:
-hello:FirstWebpage
-initPumpStatus
-initHeatingCalls
-initAlarmState
-initConfig
-initTimeConfig
-initDateTime
-getUptime
-initSystemStats
-initTemperatures
-every 30 seconds at lines 897–901
-ping
-on browser wake/focus/pageshow/online at lines 903–919
-initDateTime
-getUptime
-Rewrite 
 
-
-// in future try disableing this since it's called on fucus which aligns with the network disconnects.
-
-    window.addEventListener('focus', function () {
-      scheduleFreshClockAndUptime(150);
-    });
-
-
-
+   
 
 
 // Move checktimeandsync out of Logging.cpp

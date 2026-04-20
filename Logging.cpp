@@ -206,7 +206,7 @@ unsigned long extractTimestamp(const String& line) {
 
 // Helper function to get current month as a string (e.g., "January")
 String getCurrentMonthString() {
-  DateTime now = rtc.now(); // Assuming you have an RTC object named rtc
+  DateTime now = getCurrentTimeAtomic(); // Use cached atomic time
   char monthName[12];
   snprintf(monthName, sizeof(monthName), "%04d-%02d", now.year(), now.month());
   return String(monthName);
@@ -433,7 +433,7 @@ void aggregateDailyToMonthlyLogs(int pumpIndex) {
   unsigned long totalMonthlyRuntime = calculateTotalMonthlyRuntime(dailyLogFilename);
 
   // 2) Figure out which month to label: *last* month, not current
-  DateTime now = rtc.now();
+  DateTime now = getCurrentTimeAtomic(); // Use cached atomic time
   int year  = now.year();
   int month = now.month() - 1;
   if (month < 1) {
@@ -524,7 +524,7 @@ void aggregateMonthlyToYearlyLogs(int pumpIndex) {
   unsigned long totalYearlyRuntime = calculateTotalYearlyRuntime(monthlyLogFilename);
 
   // Decide whether we label the currentYear or (currentYear - 1) if month == 1
-  DateTime now = rtc.now();
+  DateTime now = getCurrentTimeAtomic(); // Use cached atomic time
   int year = now.year();
   if (now.month() == 1) {
     year = year - 1;

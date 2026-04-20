@@ -173,9 +173,6 @@ static void NetworkRecoveryTask(void* pvParameters) {
 
       hardResetW5500();
 
-
-      // Ethernet recovery results in error "E (3166024) gpio: gpio_install_isr_service(530): GPIO isr service already installed" if "gpio_uninstall_isr_service()"" is commented out but still recovers I think. 
-      gpio_uninstall_isr_service()
       vTaskDelay(pdMS_TO_TICKS(20));
 
       spiW5500.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_SS);
