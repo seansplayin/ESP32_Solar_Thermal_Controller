@@ -53,7 +53,7 @@ float prev_dhwT = NAN;
 float prev_PotHeatXinletT = NAN;
 float prev_PotHeatXoutletT = NAN;
 
-// Function to update temperature readings
+// Function to update temperature readings. Associate system temperature to a specific temperature sensor
 void updateTemperatureReadings() {
     
 
@@ -61,8 +61,8 @@ void updateTemperatureReadings() {
     CSupplyT        = DTempAverage[0];    // DTemp1
     storageT        = DTempAverage[1];    // DTemp2
     outsideT        = DTempAverage[2];    // DTemp3
-    supplyT         = DTempAverage[3];    // DTemp4
-    CircReturnT     = DTempAverage[4];    // DTemp5
+    supplyT         = DTempAverage[4];    // DTemp5
+    CircReturnT     = DTempAverage[3];    // DTemp4
     CreturnT        = DTempAverage[5];    // DTemp6
     DhwSupplyT      = DTempAverage[6];    // DTemp7
     DhwReturnT      = DTempAverage[7];    // DTemp8
@@ -80,7 +80,10 @@ void broadcastTemperatures() {
     if (xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
         bool hasChanged = false;
         String message = "Temperatures:";
-                bool first = true;
+        bool first = true;
+
+        static uint32_t prev_pt1000LastGoodReadMs = 0;
+        static uint32_t prev_DTempLastGoodReadMs[NUM_SENSORS] = {0};
 
         // Compare at the same precision we DISPLAY (2 decimals) to avoid float jitter
         auto fixed2Int = [](float v) -> int32_t {
@@ -89,21 +92,36 @@ void broadcastTemperatures() {
             return (scaled >= 0.0f) ? (int32_t)(scaled + 0.5f) : (int32_t)(scaled - 0.5f);
         };
 
+        auto formatReadAgeSeconds = [](uint32_t lastGoodMs) -> String {
+            if (lastGoodMs == 0) return String("N/A");
+            return String((uint32_t)((millis() - lastGoodMs) / 1000UL));
+        };
+
+        auto appendField = [&](const String& name, const String& value) {
+            if (!first) {
+                message += ",";
+            }
+            message += name + ":" + value;
+            hasChanged = true;
+            first = false;
+        };
+
         auto appendTemperature = [&](const String& name, float current, float& previous) {
             const int32_t cur100  = fixed2Int(current);
             const int32_t prev100 = fixed2Int(previous);
 
             if (cur100 != prev100) {
-                if (!first) {
-                    message += ",";
-                }
-                message += name + ":" + (isnan(current) ? "N/A" : String(current, 2));
+                appendField(name, isnan(current) ? "N/A" : String(current, 2));
 
                 // Store previous at the same 2-decimal precision we display
                 previous = isnan(current) ? NAN : ((float)cur100 / 100.0f);
+            }
+        };
 
-                hasChanged = true;
-                first = false;
+        auto appendReadAgeIfChanged = [&](const String& name, uint32_t currentMs, uint32_t& previousMs) {
+            if (currentMs != previousMs) {
+                appendField(name, formatReadAgeSeconds(currentMs));
+                previousMs = currentMs;
             }
         };
 
@@ -124,17 +142,21 @@ void broadcastTemperatures() {
         appendTemperature("PotHeatXinletT", PotHeatXinletT, prev_PotHeatXinletT);
         appendTemperature("PotHeatXoutletT", PotHeatXoutletT, prev_PotHeatXoutletT);
 
-        // Append PT1000 temperatures
+        // Append PT1000 temperatures and last-good-read heartbeat
         appendTemperature("pt1000Current", pt1000Current, prev_pt1000Current);
         appendTemperature("pt1000Average", pt1000Average, prev_pt1000Average);
+        appendReadAgeIfChanged("pt1000GoodAge", pt1000LastGoodReadMs, prev_pt1000LastGoodReadMs);
 
-        // Append DTemp1 to DTemp13
+        // Append DTemp1 to DTemp13, their averages, and last-good-read heartbeats
         for (int i = 0; i < NUM_SENSORS; i++) {
             String tempName = "DTemp" + String(i + 1);
             appendTemperature(tempName, DTemp[i], prev_DTemp[i]);
 
             tempName = "DTempAverage" + String(i + 1);
             appendTemperature(tempName, DTempAverage[i], prev_DTempAverage[i]);
+
+            tempName = "DTempGoodAge" + String(i + 1);
+            appendReadAgeIfChanged(tempName, DTempLastGoodReadMs[i], prev_DTempLastGoodReadMs[i]);
         }
 
         if (hasChanged) {

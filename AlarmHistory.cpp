@@ -91,6 +91,24 @@ static void normalizeDetailForGrouping(const char* in, char* out, size_t outSz)
   out[0] = '\0';
   if (!in) return;
 
+  // Group DS18B20 Offline / Online / Recovered events by logical sensor number.
+  // Example:
+  //   "DS18B20 Sensor 6 Offline" -> "DS18B20 Sensor 6"
+  //   "DS18B20 Sensor 6 Online"  -> "DS18B20 Sensor 6"
+  int ds18SensorNumber = 0;
+  char ds18State[16] = {0};
+
+  if (sscanf(in, "DS18B20 Sensor %d %15s", &ds18SensorNumber, ds18State) == 2) {
+    if (ds18SensorNumber > 0 &&
+        (strcmp(ds18State, "Offline") == 0 ||
+         strcmp(ds18State, "Online") == 0 ||
+         strcmp(ds18State, "Recovered") == 0)) {
+      snprintf(out, outSz, "DS18B20 Sensor %d", ds18SensorNumber);
+      out[outSz - 1] = '\0';
+      return;
+    }
+  }
+
   // Add patterns here as needed
   static const char* kPrefixes[] = {
     "Collector freeze cycle restart",

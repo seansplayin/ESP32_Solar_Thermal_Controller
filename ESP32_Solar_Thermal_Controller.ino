@@ -383,26 +383,34 @@ ESP32_Solar_Thermal_Controller_20260416060958 - Continued troubleshooting Networ
 
 ESP32_Solar_Thermal_Controller_20260419142121 - Changes made to the network initialization which did not seem to help. Removed gpio_uninstall_isr_service();, pinMode(W5500_INT, INPUT_PULLUP); from NetworkRecoveryTask but not sure if I like the NetworkRecoveryTask changes but it at least seems to recover after a disconnect happens. Ethernet Adapter is now using phy (dumb) mode and running the ESP Network.h stack rather than it's own internal stack which conflicts with RTOS strickter scheduler in ESP32 Core 3.x+.  Went through entire code base targeting any time consuming blocking code or calls for "while" and "for" because they delay cpu and that could possible delay the W5500's int pin which will cause ack time period to expire resulting in ethernet dropout. Went through entire code base targeting any blocking code that could possible tie up the CPU or delay the W5500's int pin which will cause ack time period to expire resulting in ethernet dropout. Modified Files modified, AlarmHistory.cpp, DS18B20.cpp, HealthCheck.cpp (no changes but checkStacks90() is extremely computationally demanding and was already commented out.), Logging.cpp (Many changes), TarGZ.cpp, Temperature Logging (I believe these changes increased stability), ThirdWebpage.cpp, WebServerManager.cpp (Also may have increased network stability).  Preliminary results looks excellent and even while working at my computer the [WS] Received Message: ping have continued for 50 minutes without a network disconnect and that is the longest I've seen yet until I walked to the kitchen and sat back down. (must be EMI) I also suspect that refreshing the webpage after firmware upload increases stability. 
 
-ESP32_Solar_Thermal_Controller_20260419222557 - added caching to the pumpstats so now as the pumps turn on and off the data is cached and when updating the webpage it jus grabs cachedPayload. 
+ESP32_Solar_Thermal_Controller_20260419222557 - Network connection is stable and disconnects only happen now from ESD when i sit down at computer. Added caching to the pumpstats so now as the pumps turn on and off the data is cached and when updating the webpage it jus grabs cachedPayload. 
 
+ESP32_Solar_Thermal_Controller_20260424060721 - switched onewire sensor addresses for Home solar and flashed to Home Solar Controller. Problems detecting outdoor onewire sensors immediately. added additional wire one sensor searching logic to search for missing sesors. Format failed, added logic that directly formats the file system if not detected, this is dangerous. 
 
+Home_ESP32_Solar_Thermal_Controller_copy_20260422052457 - PT1000 not working. Tested new sensor at solar collector manifold but no improvement. Consulsion is wiring has problem. Ran new wires in Shielded Cat6 cable and PT1000 is now fixed. While running this new cable I had the Max31865 using a PT1000 probe just dangling there as the ESP32 and durring this time multiple hours went by without a single OneWire Sensor Disconnects. I connected the new CAT 6 Cable to the existing PT1000 sensor installed in the solar collector manifold and then I added a 3.3 + 5Volt Power Supply outdoor and supplied 5V to DS18B20 sensors and then supplied 3.3 volts to Relays. When I got back to my computer all the sudden I noticed the Outdoor DS18B20 one wire sensors are again dropping out. As a test I Returned onewire sensors to 3.3volts supplied from ESP32 but sensor dropouts are continuing. Possibly ground from the Relays. Possible Sketch issue. In trying to get the webpage to detect a disconnect sooner I reduced the webpage ping form 30 to 15 seconds and I reduced the static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000; inside NetworkManager.cpp to 15 seconds " static const uint32_t NET_RECOVER_COOLDOWN_MS = 15000; " and none of the outside onewire DS18B20 sensors were found. I then returned the static const uint32_t NET_RECOVER_COOLDOWN_MS = 15000; back to 30 seconds static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000; and now all the outdoor onewire sensors are found although the do continue showing error 1 and error 2 but recovering. changed static const uint32_t NET_RECOVER_COOLDOWN_MS = 15000; and sensors showed up, observation was just qunicidince.         
+
+ESP32_Solar_Thermal_Controller_20260503112222 - Alarm webpage now shows the DS18B20 temperature sensor disconnects and reconnects. Verified the system logic is referencing the incorrect temperature sensor, dtemp4 and dtemp5 are reversed somehow. not resolved yet.
+
+ESP32_Solar_Thermal_Controller_20260503214542 - Combined Webpage temperatures into a single section. Modified much of the code removing hard coded number of pumps/relays so now it references the actual declared number of system pumps/relays (const int numPumps = 8;   ) in Config.h and now SecondWebpage only shows 8 actual pumps/relays. There is still additional work to be done in many parts of the code to ultimately have a single value set the number of pumps system wide.   
+
+ESP32_Solar_Thermal_Controller_20260503225626 - added Last Good Sensor Read to Temperatures. Modified the Pump Runtime grid layout so it's easier to read similar to the Temperatures which uses table style layout and the Pump Runtimes section uses CSS. Fixed the Circulation supply and circulation return temperature sensors so they are configured correctly now. 
+
+ESP32_Solar_Thermal_Controller_20260504232858 - Lead pump is shutting down during normal operation when the sun is out where there is a influx of cold water that comes back from the circulation loop when a call for heating or domestic hot water happens. Lowered the DEFAULT_PanelOffDifferential from 3 down to 1º and I will follow up tomorrow to see if it's improved or still happening. Discovered the CSS Table's used from Temperatures and Pump Runtimes are replacing many lines of code and introducing delays and occasionally heap corruption or wdt reboots. Rebuilt using PROGMEM to stream from flash memory at initial loading for the Pump Runtimes section.
+
+ESP32_Solar_Thermal_Controller_20260505232804 - Modified the Pump Runtime Iframe window yesterday and after 20 hours runtime today the memory usage increased to over 90% which is something I have not seen before. possible memory leak. Adjusted the Placeholder section to webpage is back to  a 3 x 3 grid. Webpage network connection has acted weird a couple time and not allowed me to connect without reflashing/rebooting ESP32. not sure what this indicates.
+
+ESP32_Solar_Thermal_Controller_20260506011356 - Cosmedic modifications to Temperatures and Pump Runtimes webpage sections. still seeing odd behavior when sometimes all of the outside sensors are immediately found on the first search and other times they are not. Also the Webpage client/ethernet disconnects have gotton worse and I can't even connect to the webpage unless I attempt to right as the controller is booting up. 
+ 
 
 Work on this in the future:
 in TemperatureLogging.cpp file there are two concerns. 
 1- using realloc, I strongly recommend keeping an eye on your "Heap (Internal RAM)" display on your First Webpage. If you see the "Min Free" value dropping steadily over 
 a 24-hour period, we may need to refactor this to use a fixed-size ring buffer (similar to what we did in TarGZ.cpp) to prevent long-term fragmentation.
 2- Long Mutex Holds: In flushCache(), you iterate through all 14 sensors, opening and closing files. While you do have a vTaskDelay(1) inside the inner loop, the outer loop holds the fileSystemMutex for a long time.
-
-
-Future implementation to do on next:
-broadcastMessageOverWebSocket() does a per-client send loop, which is good, but ws.cleanupClients() 
-plus iterating all clients on every single message can still be a little expensive under churn. 
-It is not wrong, just something to keep in mind if you are chasing latency spikes.
-
-
-   
-
-
+// Future implementation to do on next:
+// broadcastMessageOverWebSocket() does a per-client send loop, which is good, but ws.cleanupClients() 
+// plus iterating all clients on every single message can still be a little expensive under churn. 
+// It is not wrong, just something to keep in mind if you are chasing latency spikes.
 // Move checktimeandsync out of Logging.cpp
 // sprintf is used for formatting outputs and can cause a stack overflow from writing outside it's alloted memory buffer. replace this function with string which uses heap instead of stack memory. Never use sprintf.
 // future remove TasksetupPumpBroadcasting() task and call setupPumpBroadcasting(); as part of updateTemperatures() function.
@@ -412,13 +420,11 @@ It is not wrong, just something to keep in mind if you are chasing latency spike
 // potentially rename all pump logs to match pump function. 
 // Verify RTC failure will not block boot
 // resolve 07:00:47.898 -> E (20187561) w5500.mac: received frame was truncated
-
 // Ready to be added to Webpage. Add Serial Print toggle for Developement / Field Deployment along with categories, TarGZ.
-
 // other future user editable values i might add into the webpage such as DST, Time Zone, 
-IP Address Static/Dynamic, One Wire Buss search/Hex addresses/bit resolution/ for DS18B20 temperature sensors, 
-Rolling average num reading for PT1000 & DS18B20 temperature sensors, enable/disabling of Temperature or Pump Logging, 
-enabling/disabling pumps, Add toggle for Developement / Field Deployment along with categories for Serial Print, TarGZ
+// IP Address Static/Dynamic, One Wire Buss search/Hex addresses/bit resolution/ for DS18B20 temperature sensors, 
+// Rolling average num reading for PT1000 & DS18B20 temperature sensors, enable/disabling of Temperature or Pump Logging, 
+// enabling/disabling pumps, Add toggle for Developement / Field Deployment along with categories for Serial Print, TarGZ
 
 
 

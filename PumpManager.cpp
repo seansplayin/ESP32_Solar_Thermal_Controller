@@ -47,12 +47,27 @@ Ticker broadcastPumpTicker; // Ticker for periodic pump state broadcasting
 Ticker pumpOffTicker;       // Ticker to handle the 10-minute timeout
 
 // Pump Modes and States
-int pumpModes[10] = {PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO};
-int pumpStates[10] = {PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF};
+// Fixed 10-slot storage. numPumps in Config.h controls the active/displayed count.
+int pumpModes[10] = {
+    PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO,
+    PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO
+};
+
+int pumpStates[10] = {
+    PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF,
+    PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF
+};
 
 // Configure to style of relays used. (energized = on or energized = off)
-bool pumpOnStateHigh[10] = {false, false, false, false, false, false, false, false, false, false};
-bool pumpOffStateHigh[10] = {true, true, true, true, true, true, true, true, true, true};
+bool pumpOnStateHigh[10] = {
+    false, false, false, false, false,
+    false, false, false, false, false
+};
+
+bool pumpOffStateHigh[10] = {
+    true, true, true, true, true,
+    true, true, true, true, true
+};
 
 // External Variables
 extern int state_panel_lead;

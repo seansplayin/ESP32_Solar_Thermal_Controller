@@ -752,6 +752,7 @@ void checkTimeAndAct() {
     }
   }
 
+/*
   // turnOnAllPumpsFor10Minutes(); hourly at :40 (windowed + once-per-hour guard)
   if (CurrentTime.minute() == 40 && withinWindow(CurrentTime)) {
     int h = CurrentTime.hour();
@@ -760,6 +761,7 @@ void checkTimeAndAct() {
       scheduleJob(JOB_turnOnAllPumpsFor10Minutes);
     }
   }
+*/
 
   // Daily 3AM NTP sync (windowed + once-per-day guard)
   if (CurrentTime.hour() == 3 && CurrentTime.minute() == 0 && withinWindow(CurrentTime)) {

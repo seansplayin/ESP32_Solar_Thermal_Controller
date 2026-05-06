@@ -6,7 +6,7 @@
 #include "DiagLog.h"
 
 
-#define VERSION_INFO " -AsyncWebServer123_ESP_V5_IDE_2.3.6- "
+#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260506011356 - "
 
 extern AsyncWebServer server;
 
@@ -22,7 +22,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
   <style type="text/css">
     /* --- Layout stability --- */
     table {
-      width: 100%;
+      /* Width dynamically injected via JS to protect the C++ parser */
       table-layout: fixed;
       border-collapse: separate;
       border-spacing: 5px; /* mimic cellspacing */
@@ -119,7 +119,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
     body{
       font-family:'Lucida Sans Unicode', 'Lucida Grande', sans-serif, Helvetica;
-      font-size:14px;
+      font-size:15px;
       line-height:1.0;
       text-align:left;
       box-sizing: border-box;
@@ -282,6 +282,79 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       line-height: 1.0;
     }
 
+    #temperatureGridCell {
+      position: relative;
+    }
+
+    #temperatureGridCell .configContent {
+      padding-top: 0;
+      padding-bottom: 0;
+    }
+
+    #temperatureGridCell h3 {
+      margin: 1px 0 3px 0;
+      line-height: 1.30;
+    }
+
+    .temperatureGridWrap {
+      overflow-x: auto;
+      padding-bottom: 0;
+    }
+
+    #temperatureGrid {
+      table-layout: fixed;
+      border-collapse: separate;
+      /* Left/Right gap is the first number (8px), Top/Bottom gap is the second number (8px) */
+      border-spacing: 8px 8px;
+      font-size: 14px;
+      line-height: 1.25;
+      margin-top: 2px;
+    }
+
+    #temperatureGrid th,
+    #temperatureGrid td {
+      min-width: 0;
+      border: 1px solid #b8c7d9;
+      /* for padding Top/Bottom gap is the first number (1px), Left/Right gap is the second number (2px) */
+      padding: 1px 2px;
+      vertical-align: middle;
+      text-align: right;
+    }
+
+    #temperatureGrid th {
+      color: #459;
+      font-weight: bold;
+      text-align: center;
+      background: #eef4fb;
+      white-space: normal;
+    }
+
+    #temperatureGrid .temp-name {
+      text-align: left;
+      color: purple;
+      font-weight: bold;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #temperatureGrid .temp-sensor-name {
+      text-align: center;
+      color: purple;
+      font-weight: bold;
+      white-space: nowrap;
+    }
+
+    #temperatureGrid .temp-value {
+      white-space: nowrap;
+      color: blue;
+    }
+
+    #temperatureGrid .temp-age {
+      white-space: nowrap;
+      color: #000000;
+    }
+
     #collectorFreezeSensors, #lineFreezeSensors{
   display:inline;
   white-space: normal;
@@ -295,7 +368,6 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
    ========================================================== */
 .scaledFrame{
   position: relative;   /* CRITICAL: makes absolute iframe stay in this box */
-  width: 100%;
   overflow: hidden;
   background: white;
 }
@@ -353,10 +425,39 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 }
 
 #pumps {
-  margin-top: 8px;
-}
+    margin-top: 8px;
+  }
 
   </style>
+
+  <script>
+    // ----------------------------------------------------------------------
+    // THE BULLETPROOF % INJECTOR
+    // ----------------------------------------------------------------------
+    // The ESPAsyncWebServer template engine crashes or truncates HTML if it 
+    // processes literal percent signs incorrectly. 
+    // To protect the firmware, we inject all percentage-based CSS dynamically 
+    // using Javascript's fromCharCode(37). The ESP32 never sees a percent sign!
+    document.addEventListener('DOMContentLoaded', function() {
+      const p = String.fromCharCode(37);
+      const style = document.createElement('style');
+      style.innerHTML = `
+        table { width: 100${p}; }
+        .temperatureGridWrap { width: 100${p}; }
+        #temperatureGrid { width: 100${p}; }
+        .scaledFrame { width: 100${p}; }
+        #tempLogsIframe { width: 108.7${p} !important; }
+        
+        #temperatureGrid col:nth-child(1) { width: 22${p}; }
+        #temperatureGrid col:nth-child(2) { width: 12${p}; }
+        #temperatureGrid col:nth-child(3) { width: 14${p}; } /* Enlarged Sensor Name */
+        #temperatureGrid col:nth-child(4) { width: 12${p}; }
+        #temperatureGrid col:nth-child(5) { width: 12${p}; }
+        #temperatureGrid col:nth-child(6) { width: 14${p}; }
+        #temperatureGrid col:nth-child(7) { width: 14${p}; }
+      `;
+      document.head.appendChild(style);});
+  </script>
 </head>
 
 <body>
@@ -427,6 +528,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
           <div>Heap (Internal RAM): <span id="heapUsage" style="color:blue">--</span></div>
           <div>PSRAM: <span id="psramUsage" style="color:blue">--</span></div>
           <div>File System (Flash Storeage): <span id="fsUsage" style="color:blue">--</span></div>
+          <div>Last Webpage Update: <span id="lastWebpageUpdate" style="color:blue">--</span></div>
 
         </div>
 
@@ -438,31 +540,52 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
 
     <tr>
-      <td valign="top" id="configCell">
-      <div id="SectionHeader" class="configContent">      
-        <h3>System Temperatures</h3>
-        <h2>Outside Temperatures</h2>
+      <td valign="top" id="temperatureGridCell">
+        <div id="SectionHeader" class="configContent">
+          <h3>Temperatures</h3>
 
-        <p class="temp-item">Outside Ambient (DTemp3Average): <span id="outsideT">--</span></p>
-        <p class="temp-item">600 Gal Storage (DTemp2Average): <span id="storageT">--</span></p>
-        <p class="temp-item">Collector Manifold (PT1000Average): <span id="panelT">--</span></p>
-        <p class="temp-item">Collector Supply (DTemp1Average): <span id="CSupplyT">--</span></p>
-        <p class="temp-item">Collector Return (DTemp6Average): <span id="CreturnT">--</span></p>
-        <p class="temp-item">Circ Loop Supply (DTemp4Average): <span id="supplyT">--</span></p>
-        <p class="temp-item">Circ Loop Return (DTemp5Average): <span id="CircReturnT">--</span></p>
-
-        <br>
-        <h2>Inside Temperatures</h2>
-
-        <p class="temp-item">DHW Glycol Supply (DTemp7Average): <span id="DhwSupplyT">--</span></p>
-        <p class="temp-item">DHW Glycol Return (DTemp8Average): <span id="DhwReturnT">--</span></p>
-        <p class="temp-item">Furance Glycol Loop Supply (DTemp9Average): <span id="HeatingSupplyT">--</span></p>
-        <p class="temp-item">Furance Glycol Loop Return (DTemp10Average): <span id="HeatingReturnT">--</span></p>
-        <p class="temp-item">DHW Pot EXCH In (DTemp12Average): <span id="PotHeatXinletT">--</span></p>
-        <p class="temp-item">DHW Pot EXCH Out (DTemp13Average): <span id="PotHeatXoutletT">--</span></p>
-        <p class="temp-item">DHW Pot Inline heater Out (DTemp11Average): <span id="dhwT">--</span></p>
+          <div class="temperatureGridWrap">
+            <table id="temperatureGrid">
+              <colgroup>
+                <col><col><col><col><col><col><col>
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>System Temperature Name</th>
+                  <th>System Temp Value</th>
+                  <th>associated Sensor Name</th>
+                  <th>Associated Sensor Average</th>
+                  <th>Associated Sensor Raw</th>
+                  <th>Last Value Change</th>
+                  <th>Last Good Sensor Read</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td class="temp-name">Outside Ambient</td><td class="temp-value"><span id="outsideT">--</span></td><td class="temp-sensor-name">DTemp3</td><td class="temp-value"><span id="DTempAverage3">--</span></td><td class="temp-value"><span id="DTemp3">--</span></td><td class="temp-age" id="outsideLastUpdate">--</td><td class="temp-age" id="outsideLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">600 Gal Storage</td><td class="temp-value"><span id="storageT">--</span></td><td class="temp-sensor-name">DTemp2</td><td class="temp-value"><span id="DTempAverage2">--</span></td><td class="temp-value"><span id="DTemp2">--</span></td><td class="temp-age" id="storageLastUpdate">--</td><td class="temp-age" id="storageLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Collector Manifold</td><td class="temp-value"><span id="panelT">--</span></td><td class="temp-sensor-name">PT1000</td><td class="temp-value"><span id="pt1000Average">--</span></td><td class="temp-value"><span id="pt1000Current">--</span></td><td class="temp-age" id="panelLastUpdate">--</td><td class="temp-age" id="panelLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Collector Supply</td><td class="temp-value"><span id="CSupplyT">--</span></td><td class="temp-sensor-name">DTemp1</td><td class="temp-value"><span id="DTempAverage1">--</span></td><td class="temp-value"><span id="DTemp1">--</span></td><td class="temp-age" id="collectorSupplyLastUpdate">--</td><td class="temp-age" id="collectorSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Collector Return</td><td class="temp-value"><span id="CreturnT">--</span></td><td class="temp-sensor-name">DTemp6</td><td class="temp-value"><span id="DTempAverage6">--</span></td><td class="temp-value"><span id="DTemp6">--</span></td><td class="temp-age" id="collectorReturnLastUpdate">--</td><td class="temp-age" id="collectorReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Circ Loop Supply</td><td class="temp-value"><span id="supplyT">--</span></td><td class="temp-sensor-name">DTemp5</td><td class="temp-value"><span id="DTempAverage5">--</span></td><td class="temp-value"><span id="DTemp5">--</span></td><td class="temp-age" id="circSupplyLastUpdate">--</td><td class="temp-age" id="circSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Circ Loop Return</td><td class="temp-value"><span id="CircReturnT">--</span></td><td class="temp-sensor-name">DTemp4</td><td class="temp-value"><span id="DTempAverage4">--</span></td><td class="temp-value"><span id="DTemp4">--</span></td><td class="temp-age" id="circReturnLastUpdate">--</td><td class="temp-age" id="circReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Glycol Supply</td><td class="temp-value"><span id="DhwSupplyT">--</span></td><td class="temp-sensor-name">DTemp7</td><td class="temp-value"><span id="DTempAverage7">--</span></td><td class="temp-value"><span id="DTemp7">--</span></td><td class="temp-age" id="dhwSupplyLastUpdate">--</td><td class="temp-age" id="dhwSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Glycol Return</td><td class="temp-value"><span id="DhwReturnT">--</span></td><td class="temp-sensor-name">DTemp8</td><td class="temp-value"><span id="DTempAverage8">--</span></td><td class="temp-value"><span id="DTemp8">--</span></td><td class="temp-age" id="dhwReturnLastUpdate">--</td><td class="temp-age" id="dhwReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Furnace Glycol Supply</td><td class="temp-value"><span id="HeatingSupplyT">--</span></td><td class="temp-sensor-name">DTemp9</td><td class="temp-value"><span id="DTempAverage9">--</span></td><td class="temp-value"><span id="DTemp9">--</span></td><td class="temp-age" id="heatingSupplyLastUpdate">--</td><td class="temp-age" id="heatingSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Furnace Glycol Return</td><td class="temp-value"><span id="HeatingReturnT">--</span></td><td class="temp-sensor-name">DTemp10</td><td class="temp-value"><span id="DTempAverage10">--</span></td><td class="temp-value"><span id="DTemp10">--</span></td><td class="temp-age" id="heatingReturnLastUpdate">--</td><td class="temp-age" id="heatingReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Pot Exchange In</td><td class="temp-value"><span id="PotHeatXinletT">--</span></td><td class="temp-sensor-name">DTemp12</td><td class="temp-value"><span id="DTempAverage12">--</span></td><td class="temp-value"><span id="DTemp12">--</span></td><td class="temp-age" id="potHxInLastUpdate">--</td><td class="temp-age" id="potHxInLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Pot Exchange Out</td><td class="temp-value"><span id="PotHeatXoutletT">--</span></td><td class="temp-sensor-name">DTemp13</td><td class="temp-value"><span id="DTempAverage13">--</span></td><td class="temp-value"><span id="DTemp13">--</span></td><td class="temp-age" id="potHxOutLastUpdate">--</td><td class="temp-age" id="potHxOutLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Pot Inline Heater Out</td><td class="temp-value"><span id="dhwT">--</span></td><td class="temp-sensor-name">DTemp11</td><td class="temp-value"><span id="DTempAverage11">--</span></td><td class="temp-value"><span id="DTemp11">--</span></td><td class="temp-age" id="dhwInlineLastUpdate">--</td><td class="temp-age" id="dhwInlineLastGoodRead">--</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
-      </td>
+       </td>
+        
+        
+        
+       
+
+      
 
 
 
@@ -486,11 +609,11 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       </div>
       </div>
 
-  <div id="pumps">
-    <!-- Pump controls will be generated by JavaScript -->
-  </div>
+         <div id="pumps">
+         <!-- Pump controls will be generated by JavaScript -->
+         </div>
 
-</div>
+      </div>
 
       </td>
 
@@ -504,27 +627,18 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
 
     <tr>
-      <td valign="top" id="configCell">
-        <div id="SectionHeader">
-          <h3>Temperature Values</h3>
 
-          <p class="temp-item">pt1000Current: <span id="pt1000Current">--</span>  pt1000Average: <span id="pt1000Average">--</span></p>
-          <p class="temp-item">DTemp1: <span id="DTemp1">--</span>  DTempAverage1: <span id="DTempAverage1">--</span></p>
-          <p class="temp-item">DTemp2: <span id="DTemp2">--</span>  DTempAverage2: <span id="DTempAverage2">--</span></p>
-          <p class="temp-item">DTemp3: <span id="DTemp3">--</span>  DTempAverage3: <span id="DTempAverage3">--</span></p>
-          <p class="temp-item">DTemp4: <span id="DTemp4">--</span>  DTempAverage4: <span id="DTempAverage4">--</span></p>
-          <p class="temp-item">DTemp5: <span id="DTemp5">--</span>  DTempAverage5: <span id="DTempAverage5">--</span></p>
-          <p class="temp-item">DTemp6: <span id="DTemp6">--</span>  DTempAverage6: <span id="DTempAverage6">--</span></p>
-          <p class="temp-item">DTemp7: <span id="DTemp7">--</span>  DTempAverage7: <span id="DTempAverage7">--</span></p>
-          <p class="temp-item">DTemp8: <span id="DTemp8">--</span>  DTempAverage8: <span id="DTempAverage8">--</span></p>
-          <p class="temp-item">DTemp9: <span id="DTemp9">--</span>  DTempAverage9: <span id="DTempAverage9">--</span></p>
-          <p class="temp-item">DTemp10: <span id="DTemp10">--</span>  DTempAverage10: <span id="DTempAverage10">--</span></p>
-          <p class="temp-item">DTemp11: <span id="DTemp11">--</span>  DTempAverage11: <span id="DTempAverage11">--</span></p>
-          <p class="temp-item">DTemp12: <span id="DTemp12">--</span>  DTempAverage12: <span id="DTempAverage12">--</span></p>
-          <p class="temp-item">DTemp13: <span id="DTemp13">--</span>  DTempAverage13: <span id="DTempAverage13">--</span></p>
-        </div>
-      </td>
+     <td valign="top" id="configCell">
+            <div id="SectionHeader" class="configContent" style="margin-top: 15px;">
+             <h3>Placeholder Section</h3>
+             <h2>Future Stuff</h2>
+            <div id="emptySectionPlaceholder" style="min-height: 100px; border: 1px dashed #ccc; margin-top: 10px;">
+            </div>
+        
+          </div>
+        </td>
 
+        
       <td valign="top" id="configCell">
         <div id="SectionHeader" class="configContent">
           <h3>Auto Pump Configuration</h3>
@@ -632,8 +746,8 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
               <div class="sensor-item"><input type="checkbox" value="2"> Collector Supply Temperature (DTemp1)</div>
               <div class="sensor-item"><input type="checkbox" value="3"> 600 Gal Storage Tank Temperature (DTemp2)</div>
               <div class="sensor-item"><input type="checkbox" value="4"> Outside Ambient Temperature (DTemp3)</div>
-              <div class="sensor-item"><input type="checkbox" value="5"> Circ Loop Return Temperature (DTemp5)</div>
-              <div class="sensor-item"><input type="checkbox" value="6"> Circ Loop Supply Temperature (DTemp4)</div>
+              <div class="sensor-item"><input type="checkbox" value="5"> Circ Loop Return Temperature (DTemp4)</div>
+              <div class="sensor-item"><input type="checkbox" value="6"> Circ Loop Supply Temperature (DTemp5)</div>
               <div class="sensor-item"><input type="checkbox" value="7"> Collector Return Temperature (DTemp6)</div>
               <div class="sensor-item"><input type="checkbox" value="8"> DHW Glycol Supply Temperature (DTemp7)</div>
               <div class="sensor-item"><input type="checkbox" value="9"> DHW Glycol Return Temperature (DTemp8)</div>
@@ -700,7 +814,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       <td valign="top" bgcolor="white" align="center">
         <div class="scaledFrame" id="tempLogsContainer">
               <iframe src="/third-page?ts=%UNIXTIME%" id="tempLogsIframe" scrolling="no"
-      style="width:108.7%; border:0; transform:scale(0.92); transform-origin: top left;"></iframe>
+      style="border:0; transform:scale(0.92); transform-origin: top left;"></iframe>
 
         </div>
       </td>
@@ -800,6 +914,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
       ws.onmessage = function (event) {
         wsLastRxMs = Date.now();
+        markWebpageUpdated();
         handleWebSocketMessage(event.data);
       };
 
@@ -828,7 +943,8 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     // Start WS
     wsConnect();
 
-    const pumpStates = Array(11).fill(null);
+    const activePumpCount = %NUM_PUMPS%;
+    const pumpStates = Array(activePumpCount + 1).fill(null);
 
     // ---- Time config state (timezone + DST) ----
     let timeConfig = {
@@ -837,7 +953,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     };
 
     // ✅ ENFORCE 1–10 INDEXING (NO PUMP 0)
-    for (let i = 1; i <= 10; i++) {
+    for (let i = 1; i <= activePumpCount; i++) {
           pumpStates[i] = { state: '--', mode: 'Auto', name: 'Pump ' + i };
     }
 
@@ -939,11 +1055,18 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send('ping');
       }
-    }, 30000);
+    }, 15000);
 
    document.addEventListener('visibilitychange', function () {
       if (!document.hidden) {
         scheduleFreshClockAndUptime(150);
+        
+        // Visibility API Reconnect Resilience
+        // If the browser killed the WebSocket while the app was backgrounded, revive it instantly.
+        if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+            console.log("Tab focused, reviving dead WebSocket...");
+            wsConnect();
+        }
       }
     });
 
@@ -1016,8 +1139,8 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       "Collector Supply Temperature (DTemp1)",
       "600 Gal Storage Tank Temperature (DTemp2)",
       "Outside Ambient Temperature (DTemp3)",
-      "Circ Loop Return Temperature (DTemp5)",
-      "Circ Loop Supply Temperature (DTemp4)",
+      "Circ Loop Return Temperature (DTemp4)",
+      "Circ Loop Supply Temperature (DTemp5)",
       "Collector Return Temperature (DTemp6)",
       "DHW Glycol Supply Temperature (DTemp7)",
       "DHW Glycol Return Temperature (DTemp8)",
@@ -1047,22 +1170,137 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     });
 
     // ==========================================================
-    // ✅ MAIN MESSAGE DISPATCHER
+    // ✅ MAIN MESSAGE DISPATCHER (With DOM Throttling)
     // ==========================================================
-    function handleWebSocketMessage(data) {
-      console.log('Processing:', data);
+    let liveTempState = {};
+    let changedTempKeys = {};
+    let isTempDrawPending = false;
+    let lastWebpageUpdateMs = null;
 
-      // -------- TEMPERATURES --------
+    const temperatureRowDefinitions = [
+      { lastId: 'outsideLastUpdate',         goodId: 'outsideLastGoodRead',         keys: ['outsideT', 'DTempAverage3',  'DTemp3'],       readKeys: ['DTempGoodAge3'] },
+      { lastId: 'storageLastUpdate',         goodId: 'storageLastGoodRead',         keys: ['storageT', 'DTempAverage2',  'DTemp2'],       readKeys: ['DTempGoodAge2'] },
+      { lastId: 'panelLastUpdate',           goodId: 'panelLastGoodRead',           keys: ['panelT', 'pt1000Average',    'pt1000Current'], readKeys: ['pt1000GoodAge'] },
+      { lastId: 'collectorSupplyLastUpdate', goodId: 'collectorSupplyLastGoodRead', keys: ['CSupplyT', 'DTempAverage1',  'DTemp1'],       readKeys: ['DTempGoodAge1'] },
+      { lastId: 'collectorReturnLastUpdate', goodId: 'collectorReturnLastGoodRead', keys: ['CreturnT', 'DTempAverage6',  'DTemp6'],       readKeys: ['DTempGoodAge6'] },
+      { lastId: 'circSupplyLastUpdate',      goodId: 'circSupplyLastGoodRead',      keys: ['supplyT', 'DTempAverage5',   'DTemp5'],       readKeys: ['DTempGoodAge5'] },
+      { lastId: 'circReturnLastUpdate',      goodId: 'circReturnLastGoodRead',      keys: ['CircReturnT', 'DTempAverage4', 'DTemp4'],      readKeys: ['DTempGoodAge4'] },
+      { lastId: 'dhwSupplyLastUpdate',       goodId: 'dhwSupplyLastGoodRead',       keys: ['DhwSupplyT', 'DTempAverage7', 'DTemp7'],      readKeys: ['DTempGoodAge7'] },
+      { lastId: 'dhwReturnLastUpdate',       goodId: 'dhwReturnLastGoodRead',       keys: ['DhwReturnT', 'DTempAverage8', 'DTemp8'],      readKeys: ['DTempGoodAge8'] },
+      { lastId: 'heatingSupplyLastUpdate',   goodId: 'heatingSupplyLastGoodRead',   keys: ['HeatingSupplyT', 'DTempAverage9',  'DTemp9'],  readKeys: ['DTempGoodAge9'] },
+      { lastId: 'heatingReturnLastUpdate',   goodId: 'heatingReturnLastGoodRead',   keys: ['HeatingReturnT', 'DTempAverage10', 'DTemp10'], readKeys: ['DTempGoodAge10'] },
+      { lastId: 'potHxInLastUpdate',         goodId: 'potHxInLastGoodRead',         keys: ['PotHeatXinletT', 'DTempAverage12',  'DTemp12'], readKeys: ['DTempGoodAge12'] },
+      { lastId: 'potHxOutLastUpdate',        goodId: 'potHxOutLastGoodRead',        keys: ['PotHeatXoutletT', 'DTempAverage13', 'DTemp13'], readKeys: ['DTempGoodAge13'] },
+      { lastId: 'dhwInlineLastUpdate',       goodId: 'dhwInlineLastGoodRead',       keys: ['dhwT', 'DTempAverage11', 'DTemp11'],          readKeys: ['DTempGoodAge11'] }
+    ];
+
+    const tempKeyToLastUpdateId = {};
+    const sensorGoodAgeKeyToId = {};
+    const tempRowLastUpdateMs = {};
+    const tempRowLastGoodReadMs = {};
+
+    temperatureRowDefinitions.forEach(function (row) {
+      row.keys.forEach(function (key) {
+        tempKeyToLastUpdateId[key] = row.lastId;
+      });
+      row.readKeys.forEach(function (key) {
+        sensorGoodAgeKeyToId[key] = row.goodId;
+      });
+    });
+
+    function formatElapsedAge(ms) {
+      if (!ms) return '--';
+
+      var seconds = Math.max(0, Math.floor((performance.now() - ms) / 1000));
+      return seconds + 's';
+    }
+
+    function refreshElapsedUpdateCounters() {
+      var webpageEl = document.getElementById('lastWebpageUpdate');
+      if (webpageEl) webpageEl.textContent = formatElapsedAge(lastWebpageUpdateMs);
+
+      for (let lastId in tempRowLastUpdateMs) {
+        var rowEl = document.getElementById(lastId);
+        if (rowEl) rowEl.textContent = formatElapsedAge(tempRowLastUpdateMs[lastId]);
+      }
+
+      for (let goodId in tempRowLastGoodReadMs) {
+        var goodEl = document.getElementById(goodId);
+        if (goodEl) goodEl.textContent = formatElapsedAge(tempRowLastGoodReadMs[goodId]);
+      }
+    }
+
+    function markWebpageUpdated() {
+      lastWebpageUpdateMs = performance.now();
+      refreshElapsedUpdateCounters();
+    }
+
+    function markTemperatureRowUpdated(key) {
+      var lastId = tempKeyToLastUpdateId[key];
+      if (lastId) tempRowLastUpdateMs[lastId] = performance.now();
+    }
+
+    function markSensorGoodReadAge(key, value) {
+      var goodId = sensorGoodAgeKeyToId[key];
+      if (!goodId) return;
+
+      if (value === 'N/A') {
+        tempRowLastGoodReadMs[goodId] = null;
+        var goodEl = document.getElementById(goodId);
+        if (goodEl) goodEl.textContent = '--';
+        return;
+      }
+
+      var ageSeconds = parseInt(value, 10);
+      if (isNaN(ageSeconds) || ageSeconds < 0) return;
+
+      tempRowLastGoodReadMs[goodId] = performance.now() - (ageSeconds * 1000);
+    }
+
+    setInterval(refreshElapsedUpdateCounters, 1000);
+
+    function paintTemperatures() {
+      for (let key in changedTempKeys) {
+        var el = document.getElementById(key);
+        if (el) {
+          var v = liveTempState[key];
+          el.textContent = (v === "N/A") ? v : v + '°F';
+          markTemperatureRowUpdated(key);
+        }
+      }
+
+      changedTempKeys = {};
+      refreshElapsedUpdateCounters();
+      isTempDrawPending = false;
+    }
+
+    function handleWebSocketMessage(data) {
+      // Disabled console log to prevent browser console spam on high-frequency UI paints
+      // console.log('Processing:', data);
+
+      // -------- TEMPERATURES (THROTTLED) --------
       if (data.startsWith('Temperatures:')) {
         var tempData = data.substring('Temperatures:'.length).split(',');
         tempData.forEach(function (item) {
           var kv = item.split(':');
-          var el = document.getElementById(kv[0]);
-          if (el) {
-            var v = kv.slice(1).join(':').trim();
-            el.textContent = (v === "N/A") ? v : v + '°F';
+          if (kv.length >= 2) {
+            var key = kv[0].trim();
+            var value = kv.slice(1).join(':').trim();
+
+            if (sensorGoodAgeKeyToId[key]) {
+              markSensorGoodReadAge(key, value);
+            } else {
+              liveTempState[key] = value;
+              changedTempKeys[key] = true;
+            }
           }
         });
+
+        // Schedule a screen paint synced to the monitor's refresh rate
+        if (!isTempDrawPending) {
+          isTempDrawPending = true;
+          requestAnimationFrame(paintTemperatures);
+        }
       }
 
       // -------- CONFIG SAVE RESPONSE --------
@@ -1273,7 +1511,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
         try {
           var stats = JSON.parse(payload);
           var pct = parseFloat(stats.pctUsed);
-          var pctStr = isNaN(pct) ? '--' : pct.toFixed(1) + '%';
+          var pctStr = isNaN(pct) ? '--' : pct.toFixed(1) + String.fromCharCode(37);
           fsEl.textContent =
             stats.usedLabel + ' used of ' + stats.totalLabel + ' (' + pctStr + ')';
         } catch (e) {
@@ -1631,7 +1869,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       var pumpsContainer = document.getElementById('pumps');
       pumpsContainer.innerHTML = '';
 
-      for (let i = 1; i <= 10; i++) {
+      for (let i = 1; i <= activePumpCount; i++) {
         let pump = pumpStates[i] || { state: '--', mode: 'Auto', name: 'Pump ' + i };
 
         var pumpDiv = document.createElement('div');
@@ -1702,14 +1940,17 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     // ==========================================================
     // ✅ AUTO-SCALE IFRAMES TO FIT THEIR CONTENT (NO SCROLLBARS)
     // ==========================================================
-    function setupAutoScaledIframe(containerId, iframeId, maxScale) {
+    function setupAutoScaledIframe(containerId, iframeId, maxScale, initialDesignW, initialDesignH) {
       var container = document.getElementById(containerId);
       var iframe = document.getElementById(iframeId);
       if (!container || !iframe) return;
 
-      var designW = 1024;
-      var designH = 768;
+      var designW = initialDesignW || 1024;
+      var designH = initialDesignH || 768;
       var rafPending = false;
+
+      iframe.style.width  = designW + 'px';
+      iframe.style.height = designH + 'px';
 
       function measure() {
         try {
@@ -1735,9 +1976,9 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
             body ? body.clientHeight : 0
           );
 
-          if (w > 200 && h > 200) {
+          if (w > 200 && h > 50) {
             designW = Math.min(Math.max(w, 200), 6000);
-            designH = Math.min(Math.max(h, 200), 6000);
+            designH = Math.min(Math.max(h, 50), 6000);
           }
         } catch (e) {
           // If cross-origin ever happens, we just keep defaults
@@ -1809,8 +2050,8 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       setInterval(schedule, 2000);
     }
 
-    setupAutoScaledIframe('pumpRuntimesContainer', 'pumpRuntimesIframe', 2);
-    setupAutoScaledIframe('tempLogsContainer', 'tempLogsIframe', 2);
+    setupAutoScaledIframe('pumpRuntimesContainer', 'pumpRuntimesIframe', 2, 640, 220);
+    setupAutoScaledIframe('tempLogsContainer', 'tempLogsIframe', 2, 1024, 768);
 
   }); // end DOMContentLoaded
   </script>
@@ -1826,6 +2067,10 @@ String processor(const String& var) {
   if (var == "UNIXTIME") {
     return String(millis());
   }
+  if (var == "NUM_PUMPS") {
+    return String(numPumps);
+  }
+  
   return String();
 }
 

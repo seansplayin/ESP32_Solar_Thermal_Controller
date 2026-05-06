@@ -29,8 +29,8 @@ extern const int numPumps;
 #define PUMP_ON 1
 #define PUMP_OFF 0
 #define PUMP_AUTO 2
-extern int pumpModes[10];
-extern int pumpStates[10];
+//extern int pumpModes[10];
+//extern int pumpStates[10];
 extern const int pumpPins[10];
 void PrintPumpStates();
 extern String serialMessage;

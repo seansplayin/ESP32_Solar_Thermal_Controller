@@ -17,6 +17,7 @@ extern SensorMapping sensorMappings[NUM_SENSORS];
 // Global variables (unchanged API)
 extern float DTemp[NUM_SENSORS];
 extern float DTempAverage[NUM_SENSORS];
+extern uint32_t DTempLastGoodReadMs[NUM_SENSORS];
 
 // Bus objects (correct class)
 extern OneWire32 sensors1;

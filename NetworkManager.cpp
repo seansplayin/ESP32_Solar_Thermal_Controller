@@ -39,9 +39,9 @@ static volatile uint32_t s_lastLinkUpMs   = 0;
 static volatile uint32_t s_lastRecoverMs  = 0;
 static volatile uint32_t s_lastGotIpMs    = 0;
 
-static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000;
-static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000;
-static const uint32_t NET_RECOVER_WAIT_IP_MS  = 30000;  // A/B: give link/DHCP more time before hard restart
+static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000; //8000
+static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000; //30000
+static const uint32_t NET_RECOVER_WAIT_IP_MS  = 30000; //30000 A/B: give link/DHCP more time before hard restart
 
 static void requestNetworkRecovery();
 static void NetworkRecoveryTask(void* pvParameters);
@@ -172,6 +172,7 @@ static void NetworkRecoveryTask(void* pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(50));
 
       hardResetW5500();
+      gpio_uninstall_isr_service();
 
       vTaskDelay(pdMS_TO_TICKS(20));
 

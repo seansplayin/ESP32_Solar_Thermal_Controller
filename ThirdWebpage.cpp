@@ -393,12 +393,18 @@ function drawGraph(rawPoints) {
   const canvas = document.getElementById("graphCanvas");
   const ctx    = canvas.getContext("2d");
 
-  // Match drawing size to display size
+  // High-DPI (Retina) scaling
+  const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
-  canvas.width  = rect.width;
-  canvas.height = rect.height;
+  
+  // Set actual physical memory size
+  canvas.width  = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  
+  // Normalize coordinate system to use CSS pixels
+  ctx.scale(dpr, dpr);
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.clearRect(0, 0, rect.width, rect.height);
   graphState = null;  // reset previous hover state
 
   if (!rawPoints || !rawPoints.length) {
@@ -437,8 +443,9 @@ function drawGraph(rawPoints) {
   const marginTop    = 30;
   const marginBottom = 60;
 
-  const width  = canvas.width  - marginLeft - marginRight;
-  const height = canvas.height - marginTop  - marginBottom;
+  // CRITICAL: Use rect.width/height instead of canvas.width/height to match CSS pixels
+  const width  = rect.width  - marginLeft - marginRight;
+  const height = rect.height - marginTop  - marginBottom;
 
   function xFromMinutes(m) {
     return marginLeft + ((m - dayStartMinutes) / totalMinutes) * width;

@@ -493,20 +493,21 @@ void LittleFSformat()  {
 }
 
 void initializeFileSystem() {
-    // Attempt to mount LittleFS. If fail, provide instructions for manual formatting.
     LOG_CAT(DBG_FS, "[FS] Attempting to mount LittleFS file system.\n");
-    if (!LittleFS.begin()) {
-        LOG_ERR("[FS] Mounting LittleFS failed. If you wish to format the filesystem to LittleFS,\n");
-        LOG_ERR("[FS] uncomment the 'LittleFS.format()' line in the 'initializeFileSystem()' function\n");
-        LOG_ERR("[FS] in the FileSystemManager.cpp file and re-upload your sketch.\n");
-        g_fileSystemReady = false; // sets flag false on mount failure
-        return;
 
-        // Uncomment the next line to enable formatting LittleFS automatically. Use with caution.
-        // LittleFSformat(); // Enabling LittleFSformat(); will format the flash 
+    if (!LittleFS.begin()) {
+        LOG_ERR("[FS] Initial LittleFS mount failed. Formatting and retrying...\n");
+
+        LittleFSformat(); // Uncomment this line to format the File System
+
+        if (!LittleFS.begin()) {
+            LOG_ERR("[FS] LittleFS still failed to mount after formatting.\n");
+            g_fileSystemReady = false;
+            return;
+        }
     }
 
-        LOG_CAT(DBG_FS, "[FS] LittleFS mounted successfully.\n");
+    LOG_CAT(DBG_FS, "[FS] LittleFS mounted successfully.\n");
 
     // Ensure JSON config directory exists (shared by multiple config files)
     if (!LittleFS.exists(DIAG_SERIAL_CONFIG_DIR)) {

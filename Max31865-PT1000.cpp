@@ -1,5 +1,6 @@
 // Max31865-PT1000.cpp
 #include "Max31865-PT1000.h"
+#include <Arduino.h>
 #include <Adafruit_MAX31865.h>
 #include "Config.h"
 #include <esp_task_wdt.h>
@@ -23,6 +24,7 @@ Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS_PIN, &spiMAX);
 
 float pt1000Current = 0.0;
 float pt1000Average = 0.0;
+uint32_t pt1000LastGoodReadMs = 0;
 
 #define pt1000NumReadings 3
 float pt1000Values[pt1000NumReadings];
@@ -42,6 +44,7 @@ void initPT1000Sensor() {
 
     pt1000Current = 32.0f;
     pt1000Average = 32.0f;
+    pt1000LastGoodReadMs = 0;
 
     LOG_CAT(DBG_RTD, "[PT1000] MAX31865 init complete (4-wire). Defaults set to 32.0F\n");
 }
@@ -76,8 +79,9 @@ void updatePT1000Readings() {
         AlarmManager_clear(ALM_PT1000_FAULT, "PT1000 Online");
 
         float newF = thermo.temperature(RNOMINAL, RREF) * 1.8f + 32.0f;
+        bool validRead = !(newF <= -100.0f || isnan(newF));
 
-    if (newF <= -100.0f || isnan(newF)) {
+    if (!validRead) {
         // invalid, keep last average
         LOG_ERR("[PT1000] Invalid reading (%.2f). Keeping last average %.2f\n", newF, pt1000Average);
         newF = pt1000Average;
@@ -88,6 +92,10 @@ void updatePT1000Readings() {
     pt1000Current = newF;
     pt1000Index = (pt1000Index + 1) % pt1000NumReadings;
     pt1000Average = calculatePT1000Average(pt1000Values, pt1000NumReadings, pt1000Index);
+
+    if (validRead) {
+        pt1000LastGoodReadMs = millis();
+    }
 
     LOG_CAT(DBG_RTD, "[PT1000] Current=%.2fF Avg=%.2fF (idx=%d)\n", pt1000Current, pt1000Average, pt1000Index);
 }

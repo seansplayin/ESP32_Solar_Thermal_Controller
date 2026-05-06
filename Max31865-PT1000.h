@@ -2,9 +2,11 @@
 #ifndef MAX31865_PT1000_H
 #define MAX31865_PT1000_H
 #include "Config.h"
+#include <Arduino.h>
 void initPT1000Sensor();
 void updatePT1000Readings();
 // Declare the current and average temperature variables as extern
 extern float pt1000Current;
 extern float pt1000Average;
+extern uint32_t pt1000LastGoodReadMs;
 #endif

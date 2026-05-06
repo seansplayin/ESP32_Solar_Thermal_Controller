@@ -36,9 +36,9 @@ float getTempByIndex(int idx) {
     case 1: return pt1000Average;
     case 2: return DTempAverage[0];  // DTemp1Average
     case 3: return DTempAverage[1];  // DTemp2Average
-    case 4: return DTempAverage[2];
-    case 5: return DTempAverage[4];  // DTemp5Average (skip 3 for DTemp4)
-    case 6: return DTempAverage[3];  // DTemp4Average
+    case 4: return DTempAverage[2];  // DTemp3Average
+    case 5: return DTempAverage[3];  // DTemp4Average
+    case 6: return DTempAverage[4];  // DTemp5Average
     case 7: return DTempAverage[5];
     case 8: return DTempAverage[6];
     case 9: return DTempAverage[7];

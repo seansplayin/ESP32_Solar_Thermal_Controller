@@ -198,8 +198,8 @@ volatile bool needToUpdatePumpRuntimes = false;
 extern TaskHandle_t thUpdatePumpRuntimes;
 
 // Extern declarations for global variables
-extern int pumpStates[10];
-extern int pumpModes[10];
+//extern int pumpStates[10];
+//extern int pumpModes[10];
 extern float panelT;           
 extern float CSupplyT;         
 extern float storageT;         
@@ -248,6 +248,11 @@ static void giveFsMutex() {
 static String validateTemp(float v) {
   if (isnan(v)) return "N/A";
   return String(v, 1);
+}
+
+static String formatReadAgeSeconds(uint32_t lastGoodMs) {
+  if (lastGoodMs == 0) return "N/A";
+  return String((uint32_t)((millis() - lastGoodMs) / 1000UL));
 }
 
 static String wsBytesToString(const uint8_t* data, size_t len) {
@@ -656,7 +661,7 @@ void initWebSocket() {
 }
 
 void setAllPumpsMode(int mode) {
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < numPumps; i++) {
         pumpModes[i] = mode;
     }
 
@@ -1014,7 +1019,7 @@ void handleSetPumpMode(String message) {
         String mode = message.substring(secondColon + 1);
         mode.toLowerCase(); 
 
-        if (pumpIndex >= 0 && pumpIndex < 10) {
+        if (pumpIndex >= 0 && pumpIndex < numPumps) {
             int newMode = PUMP_AUTO; 
             if (mode == "on") {
                 newMode = PUMP_ON;
@@ -1089,7 +1094,7 @@ void sendPumpStatuses(AsyncWebSocketClient* client) {
         DynamicJsonDocument doc(2048);
         JsonArray pumps = doc.to<JsonArray>();
 
-        for (int i = 0; i < NUM_PUMPS; i++) {
+        for (int i = 0; i < numPumps; i++) {
             JsonObject pump = pumps.createNestedObject();
             pump["pumpIndex"] = i + 1;
             pump["name"] = pumpNames[i];
@@ -1141,11 +1146,13 @@ void sendTemperatures(AsyncWebSocketClient* client) {
     tempData += "PotHeatXoutletT:" + String(PotHeatXoutletT) + ",";
     tempData += "pt1000Current:" + String(pt1000Current) + ",";
     tempData += "pt1000Average:" + String(pt1000Average) + ",";
+    tempData += "pt1000GoodAge:" + formatReadAgeSeconds(pt1000LastGoodReadMs) + ",";
 
-    // DTemp1 to DTemp13 and their averages
+    // DTemp1 to DTemp13, their averages, and last-good-read ages
     for (int i = 0; i < NUM_SENSORS; i++) {
         tempData += "DTemp" + String(i + 1) + ":" + String(DTemp[i]) + ",";
         tempData += "DTempAverage" + String(i + 1) + ":" + String(DTempAverage[i]) + ",";
+        tempData += "DTempGoodAge" + String(i + 1) + ":" + formatReadAgeSeconds(DTempLastGoodReadMs[i]) + ",";
     }
 
     // Remove the trailing comma
@@ -1425,10 +1432,12 @@ void sendAllData(AsyncWebSocketClient* client) {
     tempData += ",PotHeatXoutletT:" + validateTemp(PotHeatXoutletT);
     tempData += ",pt1000Current:" + validateTemp(pt1000Current);
     tempData += ",pt1000Average:" + validateTemp(pt1000Average);
+    tempData += ",pt1000GoodAge:" + formatReadAgeSeconds(pt1000LastGoodReadMs);
 
     for (int i = 0; i < NUM_SENSORS; i++) {
       tempData += ",DTemp" + String(i + 1) + ":" + validateTemp(DTemp[i]);
       tempData += ",DTempAverage" + String(i + 1) + ":" + validateTemp(DTempAverage[i]);
+      tempData += ",DTempGoodAge" + String(i + 1) + ":" + formatReadAgeSeconds(DTempLastGoodReadMs[i]);
     }
 
     // IMPORTANT:
@@ -2141,18 +2150,44 @@ void setupLogDataRoute() {
 
 void refreshRuntimeCache() {
     DateTime currentTime = getCurrentTimeAtomic();
-    for (int i = 0; i < 10; i++) {
-        // YIELD: Do not allow the 70+ consecutive filesystem reads to 
-        // block the network stack. Yield between every pump's data set.
-        vTaskDelay(pdMS_TO_TICKS(5));
+
+    for (int i = 0; i < numPumps; i++) {
+        // This task is WDT-monitored in TaskManager.cpp.
+        // Reset between filesystem-heavy aggregation calls so the runtime refresh
+        // can safely process larger LittleFS log files without tripping WDT.
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(1));
 
         cachedRuntimes[i][0] = aggregateDailyLogsReport(i, currentTime);
+        esp_task_wdt_reset();
+
         cachedRuntimes[i][1] = aggregatePreviousDailyLogsReport(i, currentTime);
+        esp_task_wdt_reset();
+
         cachedRuntimes[i][2] = aggregateMonthlyLogsReport(i, currentTime);
+        esp_task_wdt_reset();
+
         cachedRuntimes[i][3] = aggregatePreviousMonthlyLogsReport(i, currentTime);
+        esp_task_wdt_reset();
+
         cachedRuntimes[i][4] = aggregateYearlyLogsReport(i, currentTime);
+        esp_task_wdt_reset();
+
         cachedRuntimes[i][5] = aggregatePreviousYearlyLogsReport(i, currentTime);
+        esp_task_wdt_reset();
+
         cachedRuntimes[i][6] = aggregateDecadeLogsReport(i, currentTime);
+        esp_task_wdt_reset();
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    // Clear inactive internal cache slots so pump 9/10 stale data cannot leak
+    // into a later JSON response if numPumps is reduced.
+    for (int i = numPumps; i < 10; i++) {
+        for (int j = 0; j < 7; j++) {
+            cachedRuntimes[i][j] = 0;
+        }
     }
 }
   
@@ -2160,22 +2195,34 @@ void refreshRuntimeCache() {
 
 
 
-    void updateAllRuntimes() {
+void updateAllRuntimes() {
+    // Capture the version that caused this build before doing the long filesystem work.
+    // If another page requests a newer version while this build is running, the task
+    // will process that next queued notification afterward.
+    uint32_t version = g_pumpRuntimeRequestedVersion;
+
     refreshRuntimeCache();  // Refresh cache before sending
 
-    uint32_t version = g_pumpRuntimeRequestedVersion;
+    esp_task_wdt_reset();
 
     // [ArduinoJson v7 Fix] 
     // 1. No size argument needed (it grows automatically).
     // 2. We use 'new' to keep the document object off the stack (prevents stack overflow).
     JsonDocument* doc = new JsonDocument();
 
+    if (!doc) {
+        LOG_ERR("[PumpRuntimes] Failed to allocate runtime JSON document.\n");
+        return;
+    }
+
     (*doc)["version"] = version;
     
     // v7 Syntax: use ["key"].to<JsonArray>() instead of createNestedArray("key")
     JsonArray data = (*doc)["data"].to<JsonArray>();
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < numPumps; i++) {
+        esp_task_wdt_reset();
+
         // v7 Syntax: use add<JsonObject>() instead of createNestedObject()
         JsonObject pumpData = data.add<JsonObject>();
         
@@ -2187,6 +2234,8 @@ void refreshRuntimeCache() {
         pumpData["year"]      = cachedRuntimes[i][4];
         pumpData["prevYear"]  = cachedRuntimes[i][5];
         pumpData["total"]     = cachedRuntimes[i][6];
+
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     String jsonString;
@@ -2194,6 +2243,8 @@ void refreshRuntimeCache() {
 
     // CRITICAL: Free the heap memory
     delete doc; 
+
+    esp_task_wdt_reset();
 
     // Store for HTTP fetch clients
     ensurePumpRuntimeJsonMutex();

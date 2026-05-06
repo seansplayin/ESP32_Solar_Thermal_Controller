@@ -12,7 +12,7 @@
 extern AsyncWebServer server;  // declared in WebServerManager.cpp
 
 // --- 1) Immutable HTML template with placeholders ---
-static const char *secondPageTemplate = R"rawliteral(
+static const char secondPageTemplate[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -22,38 +22,86 @@ static const char *secondPageTemplate = R"rawliteral(
   <style>
     html, body { margin: 0; padding: 0; }
 
-    body { 
-    font-family: Arial; 
-    text-align: center; 
+    body {
+      font-family:'Lucida Sans Unicode', 'Lucida Grande', sans-serif, Helvetica;
+      font-size:13px;
+      line-height:1.0;
+      text-align:center;
+      box-sizing: border-box;
+      background: white;
+      padding-bottom: 15px;
     }
 
-    #pumpGrid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 5px; max-width: 1000px; margin: auto; }
-    .grid-header { font-weight: bold; }
-    .header-with-date { white-space: nowrap; }
-    #buttonContainer { margin: 20px; }
-    #filesContainer { display: none; text-align: left; max-width: 400px; margin: auto; }
-  
-    h3.top-heading {
-    color:#459;
-    font-size:40px;
-    font-weight:bold;
-    text-align:center;
+    *, *:before, *:after { box-sizing: inherit; }
 
-    margin: 2px 0 6px 0;   /* ✅ pulls title up; adds a tiny gap below */
-    padding: 0;
-    line-height: 1.0;
+    .pumpRuntimeGridWrap {
+      overflow-x: auto;
+      padding-bottom: 0;
+    }
+
+    #pumpGrid {
+      table-layout: fixed;
+      border-collapse: separate;
+      /* for border-spacing Left/Right gap is the first number (4px), Top/Bottom gap is the second number (8px) */
+      border-spacing: 4px 6px;
+    }
+
+    #pumpGrid th, #pumpGrid td {
+      border: 1px solid #b8c7d9;
+      /* for padding Top/Bottom gap is the first number (1px), Left/Right gap is the second number (2px) */
+      padding: 1px 2px;
+      font-size: 12px;
+      vertical-align: middle;
+      color: #000000;
+    }
+
+    #pumpGrid th {
+      color: #459;
+      font-weight: bold;
+      text-align: center;
+      background: #eef4fb;
+      white-space: normal;
+    }
+
+    #pumpGrid .pump-name {
+      text-align: left;
+      color: purple;
+      font-weight: bold;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #pumpGrid .runtime-value {
+      color: blue;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .header-with-date { white-space: normal; }
+    #buttonContainer { margin: 4px 0 0 0; }
+    #filesContainer { display: none; text-align: left; max-width: 400px; margin: auto; }
+
+    h3.top-heading {
+      color:#459;
+      font-size:18px;
+      font-weight:bold;
+      text-align:center;
+      margin: 1px 0 3px 0;
+      padding: 0;
+      line-height: 1.0;
     }
 
     h3.top-heading a {
-    color: #459;
-    text-decoration: none;
+      color: #459;
+      text-decoration: none;
     }
 
     h3.top-heading a:hover {
-    text-decoration: underline;
+      text-decoration: underline;
     }
 
-#updateAllButton { margin-top: 0px; }
+    #updateAllButton { margin-top: 0px; }
 
     .blue-button {
       background-color: white;
@@ -63,15 +111,34 @@ static const char *secondPageTemplate = R"rawliteral(
       cursor: pointer;
       border: 1px solid blue;
       border-radius: 3px;
-      }
-    .blue-button:hover {
-     background-color: darkblue;
-     }
+    }
+    .blue-button:hover { background-color: darkblue; color:white; }
     .blue-button:focus {
-     outline: 2px solid rgba(0,0,255,0.6);
-     outline-offset: 2px;
-     }
+      outline: 2px solid rgba(0,0,255,0.6);
+      outline-offset: 2px;
+    }
   </style>
+
+  <script>
+    // Safely inject % CSS rules without crashing the ESPAsyncWebServer C++ parser
+    document.addEventListener('DOMContentLoaded', function() {
+      const p = String.fromCharCode(37);
+      const style = document.createElement('style');
+      style.innerHTML = `
+        .pumpRuntimeGridWrap { width: 100${p}; }
+        #pumpGrid { width: 100${p}; }
+        #pumpGrid col:nth-child(1) { width: 18${p}; }
+        #pumpGrid col:nth-child(2) { width: 11.7${p}; }
+        #pumpGrid col:nth-child(3) { width: 11.7${p}; }
+        #pumpGrid col:nth-child(4) { width: 11.7${p}; }
+        #pumpGrid col:nth-child(5) { width: 11.7${p}; }
+        #pumpGrid col:nth-child(6) { width: 11.7${p}; }
+        #pumpGrid col:nth-child(7) { width: 11.7${p}; }
+        #pumpGrid col:nth-child(8) { width: 11.8${p}; }
+      `;
+      document.head.appendChild(style);
+    });
+  </script>
 </head>
 <body>
   <h3 class="top-heading">
@@ -79,16 +146,27 @@ static const char *secondPageTemplate = R"rawliteral(
 </h3>
   <button id="updateAllButton" class="blue-button">Update All</button>
 
-  <div id="pumpGrid">
-    <div class="grid-header">Pump</div>
-    <div class="grid-header header-with-date">Today<br>(%CURRENT_DAY%)</div>
-    <div class="grid-header header-with-date">Yesterday<br>(%PREVIOUS_DAY%)</div>
-    <div class="grid-header header-with-date">This Month<br>(%CURRENT_MONTH%)</div>
-    <div class="grid-header header-with-date">Last Month<br>(%PREVIOUS_MONTH%)</div>
-    <div class="grid-header header-with-date">This Year<br>(%CURRENT_YEAR%)</div>
-    <div class="grid-header header-with-date">Last Year<br>(%PREVIOUS_YEAR%)</div>
-    <div class="grid-header">Total</div>
-    %PUMP_ROWS%
+  <div class="pumpRuntimeGridWrap">
+    <table id="pumpGrid">
+      <colgroup>
+        <col><col><col><col><col><col><col><col>
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Pump</th>
+          <th class="header-with-date">Today<br>(%CURRENT_DAY%)</th>
+          <th class="header-with-date">Yesterday<br>(%PREVIOUS_DAY%)</th>
+          <th class="header-with-date">This Month<br>(%CURRENT_MONTH%)</th>
+          <th class="header-with-date">Last Month<br>(%PREVIOUS_MONTH%)</th>
+          <th class="header-with-date">This Year<br>(%CURRENT_YEAR%)</th>
+          <th class="header-with-date">Last Year<br>(%PREVIOUS_YEAR%)</th>
+          <th>Total</th>
+        </tr>
+      </thead>
+      <tbody>
+        %PUMP_ROWS%
+      </tbody>
+    </table>
   </div>
 
   <div id="buttonContainer">
@@ -104,9 +182,10 @@ static const char *secondPageTemplate = R"rawliteral(
   <script>
     // Format seconds -> Hh Mm Ss
     function formatRuntime(rt) {
-      const h = Math.floor(rt/3600),
-            m = Math.floor((rt%3600)/60),
-            s = rt % 60;
+      const h = Math.floor(rt/3600);
+      const rem = rt - (h * 3600);
+      const m = Math.floor(rem/60);
+      const s = rem - (m * 60);
       return `${h}h ${m}m ${s}s`;
     }
 
@@ -118,17 +197,24 @@ static const char *secondPageTemplate = R"rawliteral(
       let isUpdating = false;
       const updateBtnDefaultText = updateBtn.textContent;
 
+      function setRuntimeCell(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = formatRuntime(value || 0);
+      }
+
       function applyRuntimes(obj) {
         if (!obj || !obj.data) return;
-        obj.data.forEach(p => {
 
-          document.getElementById(`pump${p.pumpIndex}-day`).textContent       = formatRuntime(p.day);
-          document.getElementById(`pump${p.pumpIndex}-prevDay`).textContent   = formatRuntime(p.prevDay);
-          document.getElementById(`pump${p.pumpIndex}-month`).textContent     = formatRuntime(p.month);
-          document.getElementById(`pump${p.pumpIndex}-prevMonth`).textContent = formatRuntime(p.prevMonth);
-          document.getElementById(`pump${p.pumpIndex}-year`).textContent      = formatRuntime(p.year);
-          document.getElementById(`pump${p.pumpIndex}-prevYear`).textContent  = formatRuntime(p.prevYear);
-          document.getElementById(`pump${p.pumpIndex}-total`).textContent     = formatRuntime(p.total);
+        obj.data.forEach(p => {
+          if (!p || !p.pumpIndex) return;
+
+          setRuntimeCell(`pump${p.pumpIndex}-day`,       p.day);
+          setRuntimeCell(`pump${p.pumpIndex}-prevDay`,   p.prevDay);
+          setRuntimeCell(`pump${p.pumpIndex}-month`,     p.month);
+          setRuntimeCell(`pump${p.pumpIndex}-prevMonth`, p.prevMonth);
+          setRuntimeCell(`pump${p.pumpIndex}-year`,      p.year);
+          setRuntimeCell(`pump${p.pumpIndex}-prevYear`,  p.prevYear);
+          setRuntimeCell(`pump${p.pumpIndex}-total`,     p.total);
         });
       }
 
@@ -139,7 +225,7 @@ static const char *secondPageTemplate = R"rawliteral(
       }
 
       async function updateAllRuntimesViaFetch() {
-        if (isUpdating) return;               // prevent stacking
+        if (isUpdating) return;               // prevent stacking within this page instance
         isUpdating = true;
         updateBtn.disabled = true;
 
@@ -156,18 +242,32 @@ static const char *secondPageTemplate = R"rawliteral(
         timerId = setInterval(updateButtonLabel, 500);  // refresh label twice/sec
 
         try {
+          // First, paint any previously-built runtime JSON so the grid does not sit blank.
+          try {
+            const existing = await fetchLatestJson();
+            if (existing && Number(existing.version || 0) > 0 && existing.data) {
+              applyRuntimes(existing);
+            }
+          } catch (e) {
+            console.log('No existing runtime JSON available yet:', e);
+          }
+
           // 1) request refresh (kicks background task)
           const r = await fetch(`/api/pump-runtimes?refresh=1&ts=${Date.now()}`, { cache: 'no-store' });
           if (!r.ok) throw new Error('Failed refresh request');
           const meta = await r.json();
-          const targetVersion = meta.requestedVersion;
+          const targetVersion = Number(meta.requestedVersion || 0);
 
-          // 2) poll until the built JSON version matches what we requested
-          const deadline = startMs + 15000; // 15s safety
+          // 2) Poll until the built JSON reaches at least the requested version.
+          // Runtime aggregation can take longer than 15s when LittleFS logs are large or FS is busy.
+          // Also, if two pages request updates, the server may build a newer version than this page requested.
+          const deadline = startMs + 60000; // 60s safety
 
           while (Date.now() < deadline) {
             const obj = await fetchLatestJson();
-            if (obj && obj.version === targetVersion) {
+            const builtVersion = Number((obj && obj.version) || 0);
+
+            if (obj && obj.data && builtVersion >= targetVersion) {
               applyRuntimes(obj);
               return;
             }
@@ -176,6 +276,15 @@ static const char *secondPageTemplate = R"rawliteral(
             const elapsed = Date.now() - startMs;
             const delayMs = (elapsed < 2000) ? 250 : (elapsed < 6000) ? 500 : 1000;
             await sleep(delayMs);
+          }
+
+          // Last chance: apply whatever latest runtime JSON exists, even if the requested refresh
+          // did not complete before the UI timeout.
+          const latest = await fetchLatestJson();
+          if (latest && latest.data && Number(latest.version || 0) > 0) {
+            applyRuntimes(latest);
+            console.log('Applied latest available runtimes after refresh timeout.');
+            return;
           }
 
           throw new Error('Timeout waiting for runtimes');
@@ -256,15 +365,17 @@ static const char *secondPageTemplate = R"rawliteral(
 // --- 2) Generate pump rows HTML once ---
 static String pumpRowsHtml = []() {
   String rows;
-  for (int i = 0; i < 10; ++i) {
-    rows += "<div class=\"grid-cell\">" + String(pumpNames[i]) + "</div>";
-    rows += "<div class=\"grid-cell\" id=\"pump" + String(i + 1) + "-day\">--</div>";
-    rows += "<div class=\"grid-cell\" id=\"pump" + String(i + 1) + "-prevDay\">--</div>";
-    rows += "<div class=\"grid-cell\" id=\"pump" + String(i + 1) + "-month\">--</div>";
-    rows += "<div class=\"grid-cell\" id=\"pump" + String(i + 1) + "-prevMonth\">--</div>";
-    rows += "<div class=\"grid-cell\" id=\"pump" + String(i + 1) + "-year\">--</div>";
-    rows += "<div class=\"grid-cell\" id=\"pump" + String(i + 1) + "-prevYear\">--</div>";
-    rows += "<div class=\"grid-cell\" id=\"pump" + String(i + 1) + "-total\">--</div>";
+  for (int i = 0; i < numPumps; ++i) {
+    rows += "<tr>";
+    rows += "<td class=\"pump-name\">" + String(pumpNames[i]) + "</td>";
+    rows += "<td class=\"runtime-value\" id=\"pump" + String(i + 1) + "-day\">--</td>";
+    rows += "<td class=\"runtime-value\" id=\"pump" + String(i + 1) + "-prevDay\">--</td>";
+    rows += "<td class=\"runtime-value\" id=\"pump" + String(i + 1) + "-month\">--</td>";
+    rows += "<td class=\"runtime-value\" id=\"pump" + String(i + 1) + "-prevMonth\">--</td>";
+    rows += "<td class=\"runtime-value\" id=\"pump" + String(i + 1) + "-year\">--</td>";
+    rows += "<td class=\"runtime-value\" id=\"pump" + String(i + 1) + "-prevYear\">--</td>";
+    rows += "<td class=\"runtime-value\" id=\"pump" + String(i + 1) + "-total\">--</td>";
+    rows += "</tr>";
   }
   return rows;
 }();
@@ -301,7 +412,7 @@ void readPumpLogFiles(
   unsigned long *totalRuntimeArray
   ) {
   // Initialize all arrays
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < numPumps; i++) {
     todayRuntimeArray[i] = 0;
     yesterdayRuntimeArray[i] = 0;
     thisMonthRuntimeArray[i] = 0;
@@ -318,7 +429,7 @@ void readPumpLogFiles(
   int lastMonthYear = currentMonth == 1 ? currentYear - 1 : currentYear;
   int lastYear = currentYear - 1;
 
-  for (int i = 1; i <= 10; i++) {
+  for (int i = 1; i <= numPumps; i++) {
     LOG_CAT(DBG_PUMPLOG, "[PumpRuntimes] Processing Pump %d\n", i);
 
 
@@ -402,14 +513,24 @@ void readPumpLogFiles(
       DateTime now = getCurrentTimeAtomic();
       String cd, cm, cy, pd, pm, py;
       getCurrentDateInfo(now, cd, cm, cy, pd, pm, py);
-      String page = secondPageTemplate;
-      page.replace("%PUMP_ROWS%", pumpRowsHtml);
-      page.replace("%CURRENT_DAY%", cd);
-      page.replace("%PREVIOUS_DAY%", pd);
-      page.replace("%CURRENT_MONTH%", cm);
-      page.replace("%PREVIOUS_MONTH%", pm);
-      page.replace("%CURRENT_YEAR%", cy);
-      page.replace("%PREVIOUS_YEAR%", py);
-      request->send_P(200, "text/html", page.c_str());
+
+      // We use AsyncWebServer's native template processor to avoid massive String reallocation
+      // The variables are captured by value so they safely persist during the async stream
+      auto processor = [cd, cm, cy, pd, pm, py](const String& var) -> String {
+        if (var == "PUMP_ROWS") return pumpRowsHtml;
+        if (var == "CURRENT_DAY") return cd;
+        if (var == "PREVIOUS_DAY") return pd;
+        if (var == "CURRENT_MONTH") return cm;
+        if (var == "PREVIOUS_MONTH") return pm;
+        if (var == "CURRENT_YEAR") return cy;
+        if (var == "PREVIOUS_YEAR") return py;
+        
+        return String();
+      };
+
+      // Stream directly from PROGMEM, replacing tags on the fly
+      request->send_P(200, "text/html; charset=UTF-8", secondPageTemplate, processor);
     });
   }
+
+
