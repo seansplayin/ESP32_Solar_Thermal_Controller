@@ -400,7 +400,61 @@ ESP32_Solar_Thermal_Controller_20260504232858 - Lead pump is shutting down durin
 ESP32_Solar_Thermal_Controller_20260505232804 - Modified the Pump Runtime Iframe window yesterday and after 20 hours runtime today the memory usage increased to over 90% which is something I have not seen before. possible memory leak. Adjusted the Placeholder section to webpage is back to  a 3 x 3 grid. Webpage network connection has acted weird a couple time and not allowed me to connect without reflashing/rebooting ESP32. not sure what this indicates.
 
 ESP32_Solar_Thermal_Controller_20260506011356 - Cosmedic modifications to Temperatures and Pump Runtimes webpage sections. still seeing odd behavior when sometimes all of the outside sensors are immediately found on the first search and other times they are not. Also the Webpage client/ethernet disconnects have gotton worse and I can't even connect to the webpage unless I attempt to right as the controller is booting up. 
- 
+
+ESP32_Solar_Thermal_Controller_20260506071324 - 600 second RTC retry if initial timesync fails no longer uses "while" and now uses a ticker with flagNtpRetry. 
+
+ESP32_Solar_Thermal_Controller_20260508085622 - Circ supply and return sensors were reversed. Lead pump off was referencing SupplyT, moved to CSupplyT and now stays on when cold water floods back to Tank from Circ loop. DEFAULT_Circ_Pump_Off moved from 2 ~> 4º. Core 0 panic is continuing to intermittently happen after flashing.   
+
+
+new crash on loading network adapter after flashing circ loop setpoint change :
+23:03:43.429 -> Guru Meditation Error: Core  0 panic'ed (Unhandled debug exception). 
+23:03:43.493 -> Debug exception reason: Stack canary watchpoint triggered (ipc0) 
+23:03:43.493 -> Core  0 register dump:
+23:03:43.493 -> PC      : 0x4037fb0e  PS      : 0x00060436  A0      : 0x4037821d  A1      : 0x3fcc09a0  
+23:03:43.493 -> A2      : 0x00060423  A3      : 0x00000000  A4      : 0x00060420  A5      : 0x00000000  
+23:03:43.525 -> A6      : 0x40375628  A7      : 0x00000000  A8      : 0x8203ca69  A9      : 0x3fcc0b40  
+23:03:43.525 -> A10     : 0x00000010  A11     : 0x0000000e  A12     : 0xffffffff  A13     : 0x00000000  
+23:03:43.525 -> A14     : 0x40375628  A15     : 0x00000000  SAR     : 0x0000001b  EXCCAUSE: 0x00000001  
+23:03:43.525 -> EXCVADDR: 0x00000000  LBEG    : 0x00000000  LEND    : 0x00000000  LCOUNT  : 0x00000000  
+23:03:43.558 -> 
+23:03:43.558 -> 
+23:03:43.558 -> Backtrace: 0x4037fb0b:0x3fcc09a0 0x4037821a:0x3fcc0a70 0x403841ed:0x3fcc0a90 0x4038438d:0x3fcc0ab0 0x403767d3:0x3fcc0ad0 0x403767ed:0x3fcc0b00 0x40376969:0x3fcc0b20 0x4203c715:0x3fcc0b40 0x4203ca66:0x3fcc0bc0 0x4203ca81:0x3fcc0bf0 0x42037199:0x3fcc0c20 0x40375e49:0x3fcc0c40 0x4037f755:0x3fcc0c70
+23:03:43.591 -> 
+23:03:43.591 -> 
+23:03:43.591 -> 
+23:03:43.591 -> 
+23:03:43.591 -> ELF file SHA256: 6e70fbc33
+23:03:43.591 -> 
+23:03:44.247 -> Rebooting...
+
+
+Middle of night crash.
+05:27:36.757 -> Guru Meditation Error: Core  1 panic'ed (Unhandled debug exception). 
+05:27:36.821 -> Debug exception reason: Stack canary watchpoint triggered (ipc1) 
+05:27:36.821 -> Core  1 register dump:
+05:27:36.821 -> PC      : 0x4037f85a  PS      : 0x00060036  A0      : 0x80380c43  A1      : 0x3fcc0fb0  
+05:27:36.821 -> A2      : 0x3fc9bc64  A3      : 0xffffffff  A4      : 0x803767d6  A5      : 0x00060023  
+05:27:36.821 -> A6      : 0x3fcce008  A7      : 0x0000abab  A8      : 0x00060023  A9      : 0x3fcc0fb0  
+05:27:36.853 -> A10     : 0x00060023  A11     : 0x00000003  A12     : 0x00060023  A13     : 0x3fcc1050  
+05:27:36.853 -> A14     : 0x3fcbfcf8  A15     : 0x00000008  SAR     : 0x0000001c  EXCCAUSE: 0x00000001  
+05:27:36.853 -> EXCVADDR: 0x00000000  LBEG    : 0x400570e8  LEND    : 0x400570f3  LCOUNT  : 0x00000000  
+05:27:36.853 -> 
+05:27:36.853 -> 
+05:27:36.853 -> Backtrace: 0x4037f857:0x3fcc0fb0 0x40380c40:0x3fcc0fe0 0x4037fba0:0x3fcc1010 0x4037fb96:0xa5a5a5a5 |<-CORRUPTED
+05:27:36.885 -> 
+05:27:36.885 -> 
+05:27:36.885 -> 
+05:27:36.885 -> 
+05:27:36.885 -> ELF file SHA256: 6e70fbc33
+
+
+- Replaced Template Processor so 14,000 character HTML code byte by byute does not have to slowly stream charactoers to webpage and now can be directly accessed through DMA. Should provide much quicker and more efficient Firstwebpage loading. 1000+ seconds went by without the ESP32 code realizing the netwopk connection had dropped. This Zombie Network Thread likely happneed because we switched to using Static IP Address and only referencing the network physical link up for dropout detection. Deleted customer interceptor code all together and natively muted the noisy w5500 and ETH drivers at the ESP-IDF core level due to processing requirements causing 300ms delays that would cause the network adapter to dropout.
+   
+
+
+
+
+
 
 Work on this in the future:
 in TemperatureLogging.cpp file there are two concerns. 

@@ -429,22 +429,28 @@ void PrintPumpStates() {
 }
 
 
+static volatile bool g_turnPumpsToAutoFlag = false;
+
+void flagPumpsBackToAuto() {
+    g_turnPumpsToAutoFlag = true;
+}
+
 // ***** Function to Turn All Pumps Back to "Auto" Mode After 10 Minutes *****
 void turnPumpsBackToAuto() {
-    for (int i = 0; i < 10; i++) {
-        setPumpMode(i, PUMP_AUTO); // Set each pump back to "Auto" mode
+    for (int i = 0; i < numPumps; i++) {
+        setPumpMode(i, PUMP_AUTO); // Set each active pump back to "Auto" mode
     }
-    LOG_CAT(DBG_PUMP, "[Pump] All pumps returned to Auto mode.\n");
+    LOG_CAT(DBG_PUMP, "[Pump] All active pumps returned to Auto mode.\n");
 }
 
 // ***** Function to Turn All Pumps On for 10 Minutes *****
 void turnOnAllPumpsFor10Minutes() {
-    for (int i = 0; i < 10; i++) {
-        setPumpMode(i, PUMP_ON); // Turn each pump on
+    for (int i = 0; i < numPumps; i++) {
+        setPumpMode(i, PUMP_ON); // Turn each active pump on
     }
-    LOG_CAT(DBG_PUMP, "[Pump] All pumps turned on for 10 minutes.\n");
-    // Set a timer to turn the pumps back to "Auto" mode after 10 minutes (600 seconds)
-    pumpOffTicker.once(600, turnPumpsBackToAuto);
+    LOG_CAT(DBG_PUMP, "[Pump] All active pumps turned on for 10 minutes.\n");
+    // Safely set a flag instead of calling mutex-heavy functions directly from the timer interrupt
+    pumpOffTicker.once(600, flagPumpsBackToAuto);
 }
 
 
@@ -637,14 +643,14 @@ void controlPanelLeadPump() {
                     LOG_CAT(DBG_PUMP,
                             "[Pump] Panel Lead ON (AUTO) panelT>=min && panelT>(supplyT+onDiff)\n");
                 }
-            } else if (panelT < (supplyT + g_config.panelOffDifferential) ||
+            } else if (panelT < (CSupplyT + g_config.panelOffDifferential)  ||
                        storageT >= g_config.storageHeatingLimit) {  // Turn OFF Pump
                 if (pumpStates[pumpIndex] == PUMP_ON &&
                     (currentMillis - lastChangeTime >= LEAD_RELAY_CHANGE_INTERVAL)) {
                     setPumpState(pumpIndex, PUMP_OFF);
                     lastChangeTime = currentMillis;
                     LOG_CAT(DBG_PUMP,
-                            "[Pump] Panel Lead OFF (AUTO) panelT<(supplyT+offDiff) || storageT>=limit\n");
+                            "[Pump] Panel Lead OFF (AUTO) panelT<(CSupplyT+offDiff) || storageT>=limit\n");
                 }
             }
      }
@@ -954,6 +960,12 @@ void controlRecirculationValve() {
 
 void PumpControl() {
   esp_task_wdt_reset();
+
+  // Check for the 10-minute timer flag safely outside the interrupt
+  if (g_turnPumpsToAutoFlag) {
+      g_turnPumpsToAutoFlag = false;
+      turnPumpsBackToAuto();
+  }
 
   // 1) Lock temperature first (consistent ordering)
   if (!xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {

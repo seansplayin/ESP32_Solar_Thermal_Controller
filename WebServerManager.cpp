@@ -69,8 +69,6 @@ static volatile uint32_t g_initAllNextMs   = 0;
 static constexpr uint32_t WS_INITALL_STEP_MS = 250UL;
 
 static bool hasWritableWSClient() {
-  ws.cleanupClients();
-
   for (auto &client : ws.getClients()) {
     if (client.status() != WS_CONNECTED) continue;
     if (client.queueIsFull()) continue;
@@ -104,8 +102,6 @@ static bool hasQueuedWsMessages() {
 
 static AsyncWebSocketClient* findWsClientById(uint32_t clientId) {
   if (clientId == 0) return nullptr;
-
-  ws.cleanupClients();
 
   for (auto &client : ws.getClients()) {
     if (client.id() == clientId && client.status() == WS_CONNECTED) {
@@ -1253,8 +1249,9 @@ void TaskWebSocketTransmitter(void* pvParameters) {
             } else {
                 // Clients are connected, but the AsyncTCP buffer is choked!
                 // This happens when Safari goes into "App Nap" and stops ACKing packets.
-                // We MUST forcefully clean up dead clients to prevent W5500 overflow.
-                ws.cleanupClients();
+                // CRITICAL FIX: We MUST NOT forcefully call ws.cleanupClients() here. 
+                // Deleting clients from a background FreeRTOS task while the LwIP thread 
+                // is active causes a Use-After-Free memory corruption and crashes the W5500.
             }
         }
 
@@ -1470,8 +1467,6 @@ void broadcastMessageOverWebSocket(const String& message, const String& messageT
     LOG_ERR("[Error] Attempted to send zero-length WebSocket message: %s\n", messageType.c_str());
     return;
   }
-
-  ws.cleanupClients();
 
   size_t sent = 0;
   size_t skipped = 0;

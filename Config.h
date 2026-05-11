@@ -203,11 +203,26 @@
    inline constexpr float DEFAULT_panelTminimum           = 125.0f;
    inline constexpr float DEFAULT_StorageHeatingLimit     = 130.0f;
    inline constexpr float DEFAULT_Circ_Pump_On            = 5.0f;  // 5.0f
-   inline constexpr float DEFAULT_Circ_Pump_Off           = 5.0f;  // 2.0f
+   inline constexpr float DEFAULT_Circ_Pump_Off           = 4.0f;  // 2.0f
    inline constexpr float DEFAULT_Heat_Tape_On            = 35.0f;
    inline constexpr float DEFAULT_Heat_Tape_Off           = 45.0f;
    inline constexpr float DEFAULT_Boiler_Circ_On          = 106.0f;
    inline constexpr float DEFAULT_Boiler_Circ_Off         = 110.0f;
+  // -----------------------------------------------------------------------
+
+    
+
+  // -----------------------------------------------------------------------
+   // ***** Pump Mode Change Rate Limiting Interval *****
+   // -----------------------------------------------------------------------
+   const unsigned long LEAD_RELAY_CHANGE_INTERVAL = 600000; // 10 minutes
+   const unsigned long LAG_RELAY_CHANGE_INTERVAL = 5000; // 5 second
+   const unsigned long HEAT_TAPE_RELAY_CHANGE_INTERVAL = 1000; // 1 second
+   const unsigned long CIRC_RELAY_CHANGE_INTERVAL = 1000; // 1 second
+   const unsigned long BOILER_RELAY_CHANGE_INTERVAL = 1000; // 1 second
+   const unsigned long RECIRC_RELAY_CHANGE_INTERVAL = 1000; // 1 second
+   const unsigned long DHW_RELAY_CHANGE_INTERVAL = 1000; // 1 second
+   const unsigned long HEATING_RELAY_CHANGE_INTERVAL = 1000; // 1 second
   // -----------------------------------------------------------------------
 
 
@@ -231,21 +246,6 @@
     // If adding/removing sensors reference indice above # from " static const char* SENSOR_NAMES[15 " above in comments next to each system Temp Sensor. Array begins at 1 for PT1000 and ends at 14 for potable heat x outlet. 
     constexpr uint8_t  DEFAULT_COLLECTOR_FREEZE_SENSORS[] = {2, 0}; // 0 is a termninator not a temperature sensor and must be present
     constexpr uint8_t  DEFAULT_LINE_FREEZE_SENSORS[]      = {3, 5, 6, 0};  // 0 is a termninator not a temperature sensor and must be present
-  // -----------------------------------------------------------------------
-
-    
-
-  // -----------------------------------------------------------------------
-   // ***** Pump Mode Change Rate Limiting Interval *****
-   // -----------------------------------------------------------------------
-   const unsigned long LEAD_RELAY_CHANGE_INTERVAL = 1000; // 1 second
-   const unsigned long LAG_RELAY_CHANGE_INTERVAL = 5000; // 5 second
-   const unsigned long HEAT_TAPE_RELAY_CHANGE_INTERVAL = 1000; // 1 second
-   const unsigned long CIRC_RELAY_CHANGE_INTERVAL = 1000; // 1 second
-   const unsigned long BOILER_RELAY_CHANGE_INTERVAL = 1000; // 1 second
-   const unsigned long RECIRC_RELAY_CHANGE_INTERVAL = 1000; // 1 second
-   const unsigned long DHW_RELAY_CHANGE_INTERVAL = 1000; // 1 second
-   const unsigned long HEATING_RELAY_CHANGE_INTERVAL = 1000; // 1 second
   // -----------------------------------------------------------------------
 
 

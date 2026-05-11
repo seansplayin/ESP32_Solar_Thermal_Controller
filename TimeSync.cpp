@@ -33,14 +33,22 @@ void checkAndSyncTime() {
     DateTime now = CurrentTime; // Assume CurrentTime is up to date
     static DateTime lastSyncDate;
 
+    // --- NEW: Handle the Ticker Retry Flag safely outside the hardware interrupt ---
+    if (isNtpSyncDue) {
+        isNtpSyncDue = false;
+        LOG_CAT(DBG_TIMESYNC, "[TimeSync] Ticker flag triggered, retrying NTP update now.\n");
+        tryNtpUpdate();
+        lastSyncDate = now;
+    }
+
     // 1) One-shot resync requested by web UI after TZ change
     if (g_ntpResyncRequested) {
         g_ntpResyncRequested = false;
-                LOG_CAT(DBG_TIMESYNC, "[TimeSync] TimeConfig changed, re-running initNTP()\n");
+        LOG_CAT(DBG_TIMESYNC, "[TimeSync] TimeConfig changed, re-running initNTP()\n");
         initNTP();
         lastSyncDate = now;  // Avoid a duplicate sync at the same moment
         return;              // We already synced this second
-
+    } // <-- FIX: Added the missing bracket so the 3AM sync works again!
 
     // 2) Daily 3AM maintenance sync (unchanged behavior)
     if (now.hour() == 3 && now.minute() == 0 &&
@@ -48,14 +56,12 @@ void checkAndSyncTime() {
          lastSyncDate.month() != now.month() ||
          lastSyncDate.year()  != now.year())) {
 
-                LOG_CAT(DBG_TIMESYNC, "3AM, calling initNTP to initiate NTP time sync\n");
+        LOG_CAT(DBG_TIMESYNC, "3AM, calling initNTP to initiate NTP time sync\n");
         initNTP();
         lastSyncDate = now;
-
-        
     }
 }
-}
+
 
 // this is called in setup to connect to the NTP server
 void initNTP() {
@@ -66,6 +72,11 @@ void initNTP() {
     tryNtpUpdate();
 }
 
+
+// Wrapper to safely trigger NTP retry from the main loop, avoiding I2C hardware timer crashes
+void flagNtpRetry() {
+    isNtpSyncDue = true;
+}
 
 void tryNtpUpdate() {
     // Use runtime-configured timezone rule from TimeConfig
@@ -110,7 +121,8 @@ void tryNtpUpdate() {
         }
 
         printCurrentRtcTime(); 
-        ntpRetryTicker.once(600, tryNtpUpdate); 
+        // Safely set a flag instead of calling I2C functions directly from the timer interrupt
+        ntpRetryTicker.once(600, flagNtpRetry); 
     }
 }
 

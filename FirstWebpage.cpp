@@ -6,7 +6,7 @@
 #include "DiagLog.h"
 
 
-#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260506011356 - "
+#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260508085622 - "
 
 extern AsyncWebServer server;
 
@@ -524,7 +524,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       <td valign="top" align="center" bgcolor="white" id="statusCell">
         <div class="statusRows">
           <div>Alarm state = <span id="alarmState" style="color:blue;">OK</span></div>
-          <div>Version = <span style="color:blue">%VERSION_INFO%</span></div>
+          <div>Version = <span id="sysVersion" style="color:blue">Loading...</span></div>
           <div>Heap (Internal RAM): <span id="heapUsage" style="color:blue">--</span></div>
           <div>PSRAM: <span id="psramUsage" style="color:blue">--</span></div>
           <div>File System (Flash Storeage): <span id="fsUsage" style="color:blue">--</span></div>
@@ -620,7 +620,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       <!-- ✅ Row 2, Col 3: Pump Runtimes -->
       <td valign="top" bgcolor="white" align="center">
         <div class="scaledFrame" id="pumpRuntimesContainer">
-          <iframe src="/second-page?ts=%UNIXTIME%" id="pumpRuntimesIframe" scrolling="no"></iframe>
+          <iframe id="pumpRuntimesIframe" scrolling="no"></iframe>
         </div>
       </td>
     </tr>
@@ -813,7 +813,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       <!-- ✅ Row 3, Col 3: Temperature Logs -->
       <td valign="top" bgcolor="white" align="center">
         <div class="scaledFrame" id="tempLogsContainer">
-              <iframe src="/third-page?ts=%UNIXTIME%" id="tempLogsIframe" scrolling="no"
+              <iframe id="tempLogsIframe" scrolling="no"
       style="border:0; transform:scale(0.92); transform-origin: top left;"></iframe>
 
         </div>
@@ -943,8 +943,20 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     // Start WS
     wsConnect();
 
-    const activePumpCount = %NUM_PUMPS%;
-    const pumpStates = Array(activePumpCount + 1).fill(null);
+    // Dynamically set iframes to avoid C++ template parsing lockups
+    document.getElementById('pumpRuntimesIframe').src = "/second-page?ts=" + Date.now();
+    document.getElementById('tempLogsIframe').src = "/third-page?ts=" + Date.now();
+    
+    // Fetch version text
+    fetch('/api/version')
+      .then(response => response.text())
+      .then(text => {
+        const el = document.getElementById('sysVersion');
+        if (el) el.textContent = text;
+      }).catch(err => console.log(err));
+
+    let activePumpCount = 10; // Will scale down dynamically based on JSON payload
+    let pumpStates = Array(15).fill(null);
 
     // ---- Time config state (timezone + DST) ----
     let timeConfig = {
@@ -953,7 +965,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     };
 
     // ✅ ENFORCE 1–10 INDEXING (NO PUMP 0)
-    for (let i = 1; i <= activePumpCount; i++) {
+    for (let i = 1; i <= 10; i++) {
           pumpStates[i] = { state: '--', mode: 'Auto', name: 'Pump ' + i };
     }
 
@@ -1852,6 +1864,10 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     // ✅ PUMP STATUS UI BUILDER
     // ==========================================================
     function updatePumpStatuses(pumpStatusData) {
+      if (pumpStatusData && pumpStatusData.length > 0) {
+          activePumpCount = pumpStatusData.length; // Dynamically scale UI to match backend numPumps
+      }
+      
       pumpStatusData.forEach(function (pump) {
         var pumpIndex = pump.pumpIndex;
         var pumpState = pump.state.toLowerCase().trim();
@@ -2060,22 +2076,16 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-String processor(const String& var) {
-  if (var == "VERSION_INFO") {
-    return VERSION_INFO;
-  }
-  if (var == "UNIXTIME") {
-    return String(millis());
-  }
-  if (var == "NUM_PUMPS") {
-    return String(numPumps);
-  }
-  
-  return String();
-}
-
 void setupFirstPageRoutes() {
+  // New lightweight endpoint for the Javascript to fetch the version
+  server.on("/api/version", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", VERSION_INFO);
+  });
+
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html; charset=UTF-8", firstPageHtml, processor);
+    // Sent directly from PROGMEM via high-speed DMA. ZERO CPU scanning!
+    request->send_P(200, "text/html; charset=UTF-8", firstPageHtml);
   });
 }
+
+

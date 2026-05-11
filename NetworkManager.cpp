@@ -24,6 +24,15 @@
 #define ETH_SPI_FREQ_MHZ 15
 #endif
 
+// --- Static IP Configuration ---
+const bool USE_STATIC_IP = true;          // Set to false to use dynamic DHCP
+
+IPAddress staticIP(10, 20, 90, 41);
+IPAddress staticGateway(10, 20, 90, 1);   // Update if your router is not .1
+IPAddress staticSubnet(255, 255, 255, 0);
+IPAddress staticDns1(8, 8, 8, 8);         // Primary DNS (Google)
+IPAddress staticDns2(8, 8, 4, 4);         // Secondary DNS
+
 // EXPLICITLY CLAIM FSPI TO LOCK W5500
 SPIClass spiW5500(FSPI);
 
@@ -46,60 +55,7 @@ static const uint32_t NET_RECOVER_WAIT_IP_MS  = 30000; //30000 A/B: give link/DH
 static void requestNetworkRecovery();
 static void NetworkRecoveryTask(void* pvParameters);
 
-// =========================================================================
-// --- Custom Rate-Limited Log Interceptor (Smart Cache) ---
-// =========================================================================
-static vprintf_like_t s_old_vprintf = nullptr;
 
-struct W5500LogCache {
-    size_t msgLen;
-    uint32_t lastPrintMs;
-};
-static W5500LogCache s_w5500Cache[4] = { {0,0}, {0,0}, {0,0}, {0,0} };
-
-int w5500_rate_limited_vprintf(const char *fmt, va_list ap) {
-    char buf[256];
-    
-    va_list ap_copy;
-    va_copy(ap_copy, ap);
-    vsnprintf(buf, sizeof(buf), fmt, ap_copy);
-    va_end(ap_copy);
-
-    const char* marker = strstr(buf, "w5500.mac");
-    if (marker != nullptr) {
-        uint32_t now = millis();
-        size_t currentLen = strlen(marker); 
-        
-        int foundIdx = -1;
-        int oldestIdx = 0;
-        uint32_t oldestTime = now;
-
-        for (int i = 0; i < 4; i++) {
-            if (s_w5500Cache[i].msgLen == currentLen) {
-                foundIdx = i;
-                break;
-            }
-            if (s_w5500Cache[i].lastPrintMs < oldestTime) {
-                oldestTime = s_w5500Cache[i].lastPrintMs;
-                oldestIdx = i;
-            }
-        }
-
-        if (foundIdx != -1) {
-            if (now - s_w5500Cache[foundIdx].lastPrintMs > 10000) {
-                s_w5500Cache[foundIdx].lastPrintMs = now;
-                return s_old_vprintf(fmt, ap); 
-            }
-            return 0; 
-        } else {
-            s_w5500Cache[oldestIdx].msgLen = currentLen;
-            s_w5500Cache[oldestIdx].lastPrintMs = now;
-            return s_old_vprintf(fmt, ap); 
-        }
-    }
-    return s_old_vprintf(fmt, ap);
-}
-// =========================================================================
 
 static void hardResetW5500() {
   pinMode(ETH_PHY_RST, OUTPUT);
@@ -177,6 +133,11 @@ static void NetworkRecoveryTask(void* pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(20));
 
       spiW5500.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_SS);
+
+      // Apply static IP configuration before starting Ethernet, if enabled
+      if (USE_STATIC_IP) {
+          ETH.config(staticIP, staticGateway, staticSubnet, staticDns1, staticDns2);
+      }
 
       bool ethStarted = ETH.begin(
         ETH_PHY_TYPE,
@@ -276,12 +237,12 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
 }
 
 void setupNetwork() {
-  esp_log_level_set("w5500.mac", ESP_LOG_ERROR);
-  esp_log_level_set("w5500", ESP_LOG_ERROR);
-
-  if (s_old_vprintf == nullptr) {
-    s_old_vprintf = esp_log_set_vprintf(w5500_rate_limited_vprintf);
-  }
+  // Natively mute the noisy W5500 and ETH drivers at the ESP-IDF core level 
+  // instead of using a stack-crushing custom vprintf interceptor.
+  esp_log_level_set("w5500.mac", ESP_LOG_NONE);
+  esp_log_level_set("w5500", ESP_LOG_NONE);
+  esp_log_level_set("esp_eth.netif.netif_glue", ESP_LOG_NONE);
+  esp_log_level_set("esp_eth", ESP_LOG_NONE);
 
   if (s_netRecoverTask == nullptr) {
     xTaskCreatePinnedToCore(
@@ -309,6 +270,11 @@ void setupNetwork() {
   Network.onEvent(onEvent);
 
   LOG_CAT(DBG_NET, "[Network] Attempting initial setup...\n");
+
+  // Apply static IP configuration before starting Ethernet, if enabled
+  if (USE_STATIC_IP) {
+      ETH.config(staticIP, staticGateway, staticSubnet, staticDns1, staticDns2);
+  }
 
   bool ethStarted = ETH.begin(
     ETH_PHY_TYPE,
