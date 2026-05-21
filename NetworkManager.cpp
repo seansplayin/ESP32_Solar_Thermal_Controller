@@ -21,11 +21,11 @@
 #define ETH_PHY_RST  W5500_RST
 
 #ifndef ETH_SPI_FREQ_MHZ
-#define ETH_SPI_FREQ_MHZ 15
+#define ETH_SPI_FREQ_MHZ 10 // at 15 mhz 92 network disconnects in 20 hours runtime.
 #endif
 
 // --- Static IP Configuration ---
-const bool USE_STATIC_IP = true;          // Set to false to use dynamic DHCP
+const bool USE_STATIC_IP = false;          // Set to false to use dynamic DHCP or true to use static
 
 IPAddress staticIP(10, 20, 90, 41);
 IPAddress staticGateway(10, 20, 90, 1);   // Update if your router is not .1
@@ -39,30 +39,90 @@ SPIClass spiW5500(FSPI);
 static volatile bool eth_connected = false;
 static volatile bool eth_link_up   = false;
 
+#include <NetworkClient.h>
+
+// --- Watchdog Configuration ---
+// Set to false if connecting directly to a PC without a router
+const bool ENABLE_NETWORK_WATCHDOG = true; 
+
 // ---------------- Network recovery state ----------------
 static TaskHandle_t s_netRecoverTask = nullptr;
 static volatile bool s_netRecoverPending = false;
 static volatile bool s_ethRestartInProgress = false;
+
+// Declare all state variables BEFORE the Watchdog tries to use them
 static volatile uint32_t s_lastLinkDownMs = 0;
 static volatile uint32_t s_lastLinkUpMs   = 0;
 static volatile uint32_t s_lastRecoverMs  = 0;
 static volatile uint32_t s_lastGotIpMs    = 0;
 
-static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000; //8000
-static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000; //30000
-static const uint32_t NET_RECOVER_WAIT_IP_MS  = 30000; //30000 A/B: give link/DHCP more time before hard restart
+static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000; // 8000. After Watchdog spots a crash wait this long to ensure the line is dead before executing the hard reset.
+static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000; // 30000. prevents the ESP32 from getting trapped in an infinite loop of restarting the W5500 if the hardware permanently dies.
+static const uint32_t NET_RECOVER_WAIT_IP_MS  = 30000; // 30000. maximum time the controller will wait for your router to hand out a DHCP address before giving up.
 
 static void requestNetworkRecovery();
 static void NetworkRecoveryTask(void* pvParameters);
 
+// ---------------- Active Socket Watchdog ----------------
+void TaskNetworkWatchdog(void *pvParameters) {
+    int failedAttempts = 0;
+    for(;;) {
+        // Ping every 15 seconds instead of 30
+        vTaskDelay(pdMS_TO_TICKS(15000)); 
+
+        if (!ENABLE_NETWORK_WATCHDOG) continue;
+
+        // Only test if the hardware link claims to be connected
+        if (eth_connected && ETH.localIP() != IPAddress(0,0,0,0) && !s_ethRestartInProgress) {
+            NetworkClient client;
+            client.setTimeout(3); 
+            
+            // Dynamically fetch the active Gateway IP (works for both Static and DHCP)
+            IPAddress activeGateway = ETH.gatewayIP();
+
+            // Attempt a lightweight TCP connection to the active Gateway on port 53 (DNS) or 80 (HTTP)
+            if (activeGateway != IPAddress(0,0,0,0) && 
+               (client.connect(activeGateway, 53) || client.connect(activeGateway, 80))) {
+                client.stop();
+                failedAttempts = 0; // Network is healthy
+            } else {
+                failedAttempts++;
+                LOG_ERR("[Watchdog] Gateway test to %s failed! Attempt %d/2\n", activeGateway.toString().c_str(), failedAttempts);
+
+                // Trigger recovery after 2 failures (30 seconds total)
+                if (failedAttempts >= 2) {
+                    LOG_ERR("[Watchdog] 2 consecutive failures. ZOMBIE network detected. Forcing recovery.\n");
+                    failedAttempts = 0;
+                    
+                    // CRITICAL FIX: Actively tear down the network state
+                    eth_connected = false;
+                    eth_link_up = false; // Force link down so recovery loop skips the IP wait period
+                    
+                    // Manually start the debounce timer
+                    s_lastLinkDownMs = millis(); 
+                    s_netRecoverPending = true; 
+                    
+                    // CRITICAL FIX: Wake up the sleeping FreeRTOS recovery task!
+                    requestNetworkRecovery();
+                }
+            }
+        } else {
+            failedAttempts = 0; 
+        }
+    }
+}
+
 
 
 static void hardResetW5500() {
-  pinMode(ETH_PHY_RST, OUTPUT);
-  digitalWrite(ETH_PHY_RST, LOW);
-  vTaskDelay(pdMS_TO_TICKS(100));
-  digitalWrite(ETH_PHY_RST, HIGH);
-  vTaskDelay(pdMS_TO_TICKS(250));
+  // --- THE HARDWARE RESET HAMMER ---
+  // Bypasses the ESP-IDF driver's ETH_PHY_RST macro to guarantee the exact 
+  // physical pin is triggered, using the global W5500_RST defined in Config.h
+  pinMode(W5500_RST, OUTPUT);
+  digitalWrite(W5500_RST, LOW);                // Pull reset pin LOW to kill the chip
+  vTaskDelay(pdMS_TO_TICKS(15));               // Hold it dead for 15ms
+  digitalWrite(W5500_RST, HIGH);               // Bring it back to life
+  vTaskDelay(pdMS_TO_TICKS(150));              // Give the chip 150ms to fully boot before talking to it over SPI
 }
 
 static void requestNetworkRecovery() {
@@ -128,7 +188,11 @@ static void NetworkRecoveryTask(void* pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(50));
 
       hardResetW5500();
-      gpio_uninstall_isr_service();
+      // gpio_uninstall_isr_service(); // unsafe, removed system interrupt and can cause inter-processor communication core (ipc0) crashes if executed at the wrong time.
+      // SURGICAL FIX: Remove ONLY the W5500's specific interrupt handler.
+      // This frees the stuck adapter without destroying the global ISR 
+      // allocator that the temperature sensors rely on.
+      gpio_isr_handler_remove((gpio_num_t)ETH_PHY_IRQ); // Safer than "gpio_uninstall_isr_service();" targeted specifically at W5500 Interrupt 
 
       vTaskDelay(pdMS_TO_TICKS(20));
 
@@ -268,6 +332,9 @@ void setupNetwork() {
   // REMOVED: Manual pinMode for W5500_INT. The esp_eth driver MUST own this pin.
 
   Network.onEvent(onEvent);
+  
+  // Spawn the Active Socket Watchdog 
+  xTaskCreate(TaskNetworkWatchdog, "NetWatchdog", 3072, NULL, 2, NULL);
 
   LOG_CAT(DBG_NET, "[Network] Attempting initial setup...\n");
 

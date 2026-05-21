@@ -42,7 +42,9 @@ bool deleteTemperatureLogsRecursive(const char* basePath);
 void enforceTemperatureLogDiskLimit();
 
 static void   deleteLogsForDateRecursive(const char *dirPath,
-                                         const String &targetDate);
+                                             const String &targetDate);
+                                             
+    static String formatBytes(size_t v); // Forward declaration for our zero-overhead cache
 
 
 // Extract first date from a filename/path.
@@ -403,14 +405,29 @@ void enforceTemperatureLogDiskLimit() {
         return;
     }
     float pctUsed = ((float)used / (float)total) * 100.0f;
-    if (pctUsed < FS_Cleaning_START_LIMIT) {
+
+        // --- ZERO-OVERHEAD WEBPAGE CACHE UPDATE (Part 1/2) ---
+        // A lambda function that uses the total/used values already pulled from memory
+        auto updateWebpageCache = [&]() {
+            size_t freeBytes = (total > used) ? (total - used) : 0;
+            g_cachedFsStatsJson = "{\"usedBytes\":" + String(used) +
+                         ",\"totalBytes\":" + String(total) +
+                         ",\"freeBytes\":" + String(freeBytes) +
+                         ",\"pctUsed\":" + String(pctUsed, 1) +
+                         ",\"usedLabel\":\"" + formatBytes(used) + "\"" +
+                         ",\"freeLabel\":\"" + formatBytes(freeBytes) + "\"" +
+                         ",\"totalLabel\":\"" + formatBytes(total) + "\"}";
+        };
+
+        if (pctUsed < FS_Cleaning_START_LIMIT) {
 #if FS_CLEANUP_DEBUG
-        LOG_CAT(DBG_FS, "[FS] Disk Usage at %.1f%% — below start limit (%.1f%%), no cleanup needed.\n",
-                      pctUsed, FS_Cleaning_START_LIMIT);
+            LOG_CAT(DBG_FS, "[FS] Disk Usage at %.1f%% — below start limit (%.1f%%), no cleanup needed.\n",
+                          pctUsed, FS_Cleaning_START_LIMIT);
 #endif
-        xSemaphoreGive(fileSystemMutex);
-        return;
-    }
+            updateWebpageCache(); // Instantly update the UI before exiting
+            xSemaphoreGive(fileSystemMutex);
+            return;
+        }
 
     LOG_CAT(DBG_FS, "[FS] ⚠ Disk at %.1f%% used (start limit %.1f%%) — beginning temperature log cleanup\n",
                   pctUsed, FS_Cleaning_START_LIMIT);
@@ -462,17 +479,21 @@ void enforceTemperatureLogDiskLimit() {
 
             break;
         }
-        if (pctUsed < FS_Cleaning_STOP_LIMIT) {
+       if (pctUsed < FS_Cleaning_STOP_LIMIT) {
 
-            LOG_CAT(DBG_FS, "[FS] ✅ Disk usage now %.1f%% (< %.1f%%); cleanup complete\n",
-                          pctUsed, FS_Cleaning_STOP_LIMIT);
+                LOG_CAT(DBG_FS, "[FS] ✅ Disk usage now %.1f%% (< %.1f%%); cleanup complete\n",
+                              pctUsed, FS_Cleaning_STOP_LIMIT);
 
-            break;
+                break;
+            }
+            vTaskDelay(1);
         }
-        vTaskDelay(1);
+        
+        // --- ZERO-OVERHEAD WEBPAGE CACHE UPDATE (Part 2/2) ---
+        updateWebpageCache(); // Update the UI with the new disk sizes after files were deleted
+        
+        xSemaphoreGive(fileSystemMutex);
     }
-    xSemaphoreGive(fileSystemMutex);
-}
 
 
 
@@ -519,7 +540,9 @@ void initializeFileSystem() {
     }
 
     g_fileSystemReady = true; // ✅ temp logger waits for this flag
-       
+    
+    // Grab a baseline read at boot so the webpage UI isn't blank for the first hour
+    updateFSStatsCache(); 
 }
 
 

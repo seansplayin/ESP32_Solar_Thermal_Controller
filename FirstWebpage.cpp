@@ -6,7 +6,7 @@
 #include "DiagLog.h"
 
 
-#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260508085622 - "
+#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260516110516  - "
 
 extern AsyncWebServer server;
 
@@ -215,10 +215,16 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
     #timeCell { position: relative; }
     #timeCell .timeContent { padding-bottom: 26px; }
-    #editTimeConfigBtn {
+    #timeConfigFooter {
       position: absolute;
       left: 4px;
+      right: 4px; /* Stretches the container to the right edge */
       bottom: 4px;
+      display: flex;
+      justify-content: space-between; /* Pushes the button Left, and text Right */
+      align-items: center;
+    }
+    #editTimeConfigBtn {
       margin: 0;
     }
 
@@ -287,13 +293,14 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     }
 
     #temperatureGridCell .configContent {
-      padding-top: 0;
       padding-bottom: 0;
     }
 
-    #temperatureGridCell h3 {
-      margin: 1px 0 3px 0;
-      line-height: 1.30;
+    /* Unify all Section Headers so they perfectly align across columns */
+    .configContent h3 {
+      margin: 1px 0 3px 0 !important;
+      padding: 0 !important;
+      line-height: 1.30 !important;
     }
 
     .temperatureGridWrap {
@@ -443,6 +450,9 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       const style = document.createElement('style');
       style.innerHTML = `
         table { width: 100${p}; }
+        .main-col-left   { width: 40${p}; }
+        .main-col-center { width: 20${p}; min-width: 200px !important; }
+        .main-col-right  { width: 40${p}; }
         .temperatureGridWrap { width: 100${p}; }
         #temperatureGrid { width: 100${p}; }
         .scaledFrame { width: 100${p}; }
@@ -463,7 +473,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 <body>
   <table border="10" cellpadding="4" cellspacing="5" bgcolor="white">
     <tr>
-      <td valign="top" align="left" bgcolor="white" id="timeCell">
+      <td valign="top" align="left" bgcolor="white" id="timeCell" class="main-col-left">
 
         <!-- View mode for time/date/uptime + timezone/DST -->
         <div id="timeInfoView" class="timeContent">
@@ -478,8 +488,14 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
             <div>Daylight Saving: <span id="dstEnabledDisplay" style="color:blue">--</span></div>
           </div>
 
-          <button id="editTimeConfigBtn" class="blue-button">Edit Time Config</button>
+          <div id="timeConfigFooter">
+            <button id="editTimeConfigBtn" class="blue-button">Edit Time Config</button>
+            <div style="font-size: 11px; font-weight: bold; color: purple; text-align: right; padding-right: 4px;">
+              Last Webpage Update: <span id="lastWebpageUpdate" style="color:blue">--</span>
+            </div>
+          </div>
         </div>
+            
 
         <!-- Edit mode panel for time configuration -->
         <div id="timeConfigEditor" style="display:none;">
@@ -515,20 +531,19 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
       </td>
 
-      <td valign="top" align="center" bgcolor="white">
+      <td valign="top" align="center" bgcolor="white" class="main-col-center">
         <div><h1>Solar Thermal</h1></div>
         <div><h1>System Controller</h1></div>
         <div><h6>Thermal Collection & Distribution with logging</h6></div>
       </td>
 
-      <td valign="top" align="center" bgcolor="white" id="statusCell">
+      <td valign="top" align="center" bgcolor="white" id="statusCell" class="main-col-right">
         <div class="statusRows">
           <div>Alarm state = <span id="alarmState" style="color:blue;">OK</span></div>
           <div>Version = <span id="sysVersion" style="color:blue">Loading...</span></div>
           <div>Heap (Internal RAM): <span id="heapUsage" style="color:blue">--</span></div>
           <div>PSRAM: <span id="psramUsage" style="color:blue">--</span></div>
           <div>File System (Flash Storeage): <span id="fsUsage" style="color:blue">--</span></div>
-          <div>Last Webpage Update: <span id="lastWebpageUpdate" style="color:blue">--</span></div>
 
         </div>
 
@@ -553,9 +568,9 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
                 <tr>
                   <th>System Temperature Name</th>
                   <th>System Temp Value</th>
-                  <th>associated Sensor Name</th>
-                  <th>Associated Sensor Average</th>
-                  <th>Associated Sensor Raw</th>
+                  <th>Associated Sensor Name</th>
+                  <th>Sensor Average</th>
+                  <th>Sensor Raw</th>
                   <th>Last Value Change</th>
                   <th>Last Good Sensor Read</th>
                 </tr>
@@ -629,10 +644,10 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     <tr>
 
      <td valign="top" id="configCell">
-            <div id="SectionHeader" class="configContent" style="margin-top: 15px;">
+            <div id="SectionHeader" class="configContent">
              <h3>Placeholder Section</h3>
              <h2>Future Stuff</h2>
-            <div id="emptySectionPlaceholder" style="min-height: 100px; border: 1px dashed #ccc; margin-top: 10px;">
+            <div id="emptySectionPlaceholder" style="min-height: 100px; border: 1px dashed #ccc; margin-top: 0px;">
             </div>
         
           </div>
@@ -829,11 +844,16 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
 
   window.addEventListener("message", (event) => {
-    if (!event.data || event.data.type !== "thirdPageHeight") return;
-    if (event.origin !== window.location.origin) return;
-    const iframe = document.getElementById("tempLogsIframe");
-    if (!iframe) return;
-    iframe.style.height = (event.data.height + 10) + "px";
+    if (!event.data || event.origin !== window.location.origin) return;
+    
+    if (event.data.type === "thirdPageHeight") {
+      const iframe = document.getElementById("tempLogsIframe");
+      if (iframe) iframe.style.height = (event.data.height + 10) + "px";
+    }
+    else if (event.data.type === "secondPageHeight") {
+      const iframe = document.getElementById("pumpRuntimesIframe");
+      if (iframe) iframe.style.height = (event.data.height + 10) + "px";
+    }
   });
 
 
@@ -1069,12 +1089,29 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       }
     }, 15000);
 
+   // --- WAKE LOCK API (Prevents Browser Sleep & TCP Choking) ---
+    let wakeLock = null;
+    const requestWakeLock = async () => {
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          console.log('Wake Lock active: Browser background throttling prevented.');
+        }
+      } catch (err) {
+        console.log('Wake Lock error: ', err.message);
+      }
+    };
+    
+    // Request immediately on page load
+    requestWakeLock();
+
    document.addEventListener('visibilitychange', function () {
       if (!document.hidden) {
+        // Re-request wake lock if tab was minimized and brought back
+        requestWakeLock();
         scheduleFreshClockAndUptime(150);
         
         // Visibility API Reconnect Resilience
-        // If the browser killed the WebSocket while the app was backgrounded, revive it instantly.
         if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
             console.log("Tab focused, reviving dead WebSocket...");
             wsConnect();
@@ -2066,7 +2103,8 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       setInterval(schedule, 2000);
     }
 
-    setupAutoScaledIframe('pumpRuntimesContainer', 'pumpRuntimesIframe', 2, 640, 220);
+    // Increased base width from 640 to 700 to force text onto a single line before scaling down
+    setupAutoScaledIframe('pumpRuntimesContainer', 'pumpRuntimesIframe', 2, 700, 220);
     setupAutoScaledIframe('tempLogsContainer', 'tempLogsIframe', 2, 1024, 768);
 
   }); // end DOMContentLoaded

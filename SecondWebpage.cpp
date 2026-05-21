@@ -50,7 +50,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       border: 1px solid #b8c7d9;
       /* for padding Top/Bottom gap is the first number (1px), Left/Right gap is the second number (2px) */
       padding: 1px 2px;
-      font-size: 12px;
+      font-size: 11.5px;
       vertical-align: middle;
       color: #000000;
     }
@@ -84,12 +84,12 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
 
     h3.top-heading {
       color:#459;
-      font-size:18px;
+      font-size:22px;
       font-weight:bold;
       text-align:center;
-      margin: 1px 0 3px 0;
+      margin: -1px 0 3px 0; // Margin sets vertacle spacing
       padding: 0;
-      line-height: 1.0;
+      line-height: 1.3;
     }
 
     h3.top-heading a {
@@ -101,7 +101,10 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       text-decoration: underline;
     }
 
-    #updateAllButton { margin-top: 0px; }
+    /* Remove default browser margin to free up horizontal space */
+    body { margin: 2px; }
+    #pageWrap { max-width: 1000px; margin: 0 auto; padding: 0; }
+    #updateAllButton { margin-top: 10px; padding: 4px 12px; } /* Added padding for better clickability */
 
     .blue-button {
       background-color: white;
@@ -127,20 +130,21 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       style.innerHTML = `
         .pumpRuntimeGridWrap { width: 100${p}; }
         #pumpGrid { width: 100${p}; }
-        #pumpGrid col:nth-child(1) { width: 18${p}; }
-        #pumpGrid col:nth-child(2) { width: 11.7${p}; }
-        #pumpGrid col:nth-child(3) { width: 11.7${p}; }
-        #pumpGrid col:nth-child(4) { width: 11.7${p}; }
-        #pumpGrid col:nth-child(5) { width: 11.7${p}; }
-        #pumpGrid col:nth-child(6) { width: 11.7${p}; }
-        #pumpGrid col:nth-child(7) { width: 11.7${p}; }
-        #pumpGrid col:nth-child(8) { width: 11.8${p}; }
+        #pumpGrid col:nth-child(1) { width: 13${p}; }   /* Shrunk from 18 to give dates more room */
+        #pumpGrid col:nth-child(2) { width: 12.4${p}; } /* Expanded */
+        #pumpGrid col:nth-child(3) { width: 12.4${p}; }
+        #pumpGrid col:nth-child(4) { width: 12.4${p}; }
+        #pumpGrid col:nth-child(5) { width: 12.4${p}; }
+        #pumpGrid col:nth-child(6) { width: 12.4${p}; }
+        #pumpGrid col:nth-child(7) { width: 12.4${p}; }
+        #pumpGrid col:nth-child(8) { width: 12.6${p}; }
       `;
       document.head.appendChild(style);
     });
   </script>
 </head>
 <body>
+  <div id="pageWrap">
   <h3 class="top-heading">
   <a id="pumpRuntimesLink" target="_blank">Pump Runtimes</a>
 </h3>
@@ -154,12 +158,12 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       <thead>
         <tr>
           <th>Pump</th>
-          <th class="header-with-date">Today<br>(%CURRENT_DAY%)</th>
-          <th class="header-with-date">Yesterday<br>(%PREVIOUS_DAY%)</th>
-          <th class="header-with-date">This Month<br>(%CURRENT_MONTH%)</th>
-          <th class="header-with-date">Last Month<br>(%PREVIOUS_MONTH%)</th>
-          <th class="header-with-date">This Year<br>(%CURRENT_YEAR%)</th>
-          <th class="header-with-date">Last Year<br>(%PREVIOUS_YEAR%)</th>
+          <th class="header-with-date">Today<br>%CURRENT_DAY%</th>
+          <th class="header-with-date">Yesterday<br>%PREVIOUS_DAY%</th>
+          <th class="header-with-date">This Month<br>%CURRENT_MONTH%</th>
+          <th class="header-with-date">Last Month<br>%PREVIOUS_MONTH%</th>
+          <th class="header-with-date">This Year<br>%CURRENT_YEAR%</th>
+          <th class="header-with-date">Last Year<br>%PREVIOUS_YEAR%</th>
           <th>Total</th>
         </tr>
       </thead>
@@ -175,11 +179,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
   </div>
   <div id="filesContainer"></div>
 
-
-
-
-
-  <script>
+  </div> <script>
     // Format seconds -> Hh Mm Ss
     function formatRuntime(rt) {
       const h = Math.floor(rt/3600);
@@ -189,7 +189,22 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       return `${h}h ${m}m ${s}s`;
     }
 
+            let lastPostedHeight = 0;
+            function postHeightToParent() {
+              if (window === window.parent) return; // not inside iframe
+              const wrap = document.getElementById('pageWrap');
+              if (!wrap) return;
+              const top = wrap.getBoundingClientRect().top;
+              const last = wrap.lastElementChild || wrap;
+              const bottom = last.getBoundingClientRect().bottom;
+              const h = Math.ceil(bottom - top);
+              if (Math.abs(h - lastPostedHeight) < 2) return;
+              lastPostedHeight = h;
+              window.parent.postMessage({ type: "secondPageHeight", height: h }, "*");
+            }
+
             document.addEventListener('DOMContentLoaded', ()=> {
+      setTimeout(postHeightToParent, 50);
 
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -216,6 +231,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
           setRuntimeCell(`pump${p.pumpIndex}-prevYear`,  p.prevYear);
           setRuntimeCell(`pump${p.pumpIndex}-total`,     p.total);
         });
+        setTimeout(postHeightToParent, 50);
       }
 
           async function fetchLatestJson() {
@@ -319,6 +335,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
                 } else {
                     container.style.display = 'none';
                     downloadButton.style.display = 'none'; // Hide download button when not listing files
+                    requestAnimationFrame(() => requestAnimationFrame(postHeightToParent));
                 }
             });
 
@@ -338,6 +355,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
                         list.appendChild(label);
                         list.appendChild(document.createElement('br'));
                     });
+                    setTimeout(postHeightToParent, 50);
                 });
             }
 
@@ -391,12 +409,24 @@ void getCurrentDateInfo(
   DateTime now,
   String &cd, String &cm, String &cy,
   String &pd, String &pm, String &py) {
+  
   cd = String(now.year()) + "-" + (now.month() < 10 ? "0" : "") + String(now.month()) + "-" + (now.day() < 10 ? "0" : "") + String(now.day());
   cm = String(now.year()) + "-" + (now.month() < 10 ? "0" : "") + String(now.month());
   cy = String(now.year());
+  
+  // Calculate Yesterday
   DateTime y = now - TimeSpan(1, 0, 0, 0);
   pd = String(y.year()) + "-" + (y.month() < 10 ? "0" : "") + String(y.month()) + "-" + (y.day() < 10 ? "0" : "") + String(y.day());
-  pm = String(y.year()) + "-" + (y.month() < 10 ? "0" : "") + String(y.month());
+  
+  // Calculate Previous Month correctly
+  int prevMonth = now.month() - 1;
+  int prevMonthYear = now.year();
+  if (prevMonth == 0) {
+    prevMonth = 12;
+    prevMonthYear--;
+  }
+  pm = String(prevMonthYear) + "-" + (prevMonth < 10 ? "0" : "") + String(prevMonth);
+  
   py = String(now.year() - 1);
 }
 

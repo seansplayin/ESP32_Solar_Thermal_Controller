@@ -74,7 +74,7 @@ static bool deletePathRecursiveUnlocked(const String &path) {
       ok = LittleFS.remove(childPath) && ok;
     }
 
-    // YIELD: Guaranteed 2ms gap between every file removal
+    // Safety valve: Guaranteed 2ms gap between every file removal
     vTaskDelay(pdMS_TO_TICKS(2)); 
     entry = dir.openNextFile();
   }
@@ -125,14 +125,14 @@ static const char *thirdPageHtml = R"rawliteral(
       margin: 8px 0;
       }
 
-    h3.top-heading{
+    h3.top-heading {
       color:#459;
-      font-size: 28px;     /* <<< adjust this to taste */
+      font-size: 35px;
       font-weight:bold;
       text-align:center;
-      margin: 2px 0 6px 0;
+      margin: 2px 0 3px 0; // Margin sets vertacle spacing
       padding: 0;
-      line-height: 1.0;
+      line-height: 1.30;
       white-space: nowrap;
       }
 
@@ -153,6 +153,7 @@ static const char *thirdPageHtml = R"rawliteral(
       align-items: center;
       gap: 10px;
       flex-wrap: wrap; /* allow wrap inside narrow iframe */
+      margin-top: 20px; /* Pushes the controls row down by 10px */
       }
 
           #sensorSelect { min-width: 220px; max-width: 100%; }
@@ -181,7 +182,7 @@ static const char *thirdPageHtml = R"rawliteral(
 
     #graphContainer {
       width: 100%;
-      height: 420px;
+      height: 630px; /* Increased by 50% to spread out Y-axis values */
       margin: 8px 0;
       position: relative;
       }
@@ -455,7 +456,8 @@ function drawGraph(rawPoints) {
            - ((v - minV) / (maxV - minV)) * height;
   }
 
-  ctx.font = "12px Arial";
+  // Reduced font size to 10px to prevent labels from overlapping
+  ctx.font = "10px Arial";
   ctx.strokeStyle = "black";
   ctx.fillStyle   = "black";
 
@@ -527,16 +529,17 @@ function drawGraph(rawPoints) {
   );
 
   // Hour marks 0..24
-  for (let h = 0; h <= 24; h++) {
-    const minutes = h * 60;
-    const x = xFromMinutes(minutes);
+      for (let h = 0; h <= 24; h++) {
+        const minutes = h * 60;
+        const x = xFromMinutes(minutes);
 
-    const label =
-      h === 0 || h === 24
-        ? "12:00AM"
-        : h === 12
-          ? "12:00PM"
-          : (h % 12 || 12) + ":00" + (h < 12 ? "AM" : "PM");
+        // Dropped the ":00" to save horizontal space and prevent overlap
+        const label =
+          h === 0 || h === 24
+            ? "12AM"
+            : h === 12
+              ? "12PM"
+              : (h % 12 || 12) + (h < 12 ? "AM" : "PM");
 
     // main tick
     ctx.beginPath();
@@ -689,6 +692,16 @@ function handleGraphMouseLeave() {
 
 document.addEventListener('DOMContentLoaded', async () => {
 
+  // --- NEW: Standalone Size Boost ---
+  // If the user views this page directly (not inside the FirstWebpage iframe),
+  // increase the width and height by 75% for a massive, clear graph.
+  if (window === window.parent) {
+    const wrap = document.getElementById('pageWrap');
+    const graph = document.getElementById('graphContainer');
+    if (wrap) wrap.style.maxWidth = '1750px';
+    if (graph) graph.style.height = '1100px';
+  }
+
   setTimeout(postHeightToParent, 50);
 
   await fetchSensors();
@@ -698,12 +711,22 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Set date input default to today
   const input = document.getElementById('daySelect');
-  const d = new Date();
-  const year  = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day   = String(d.getDate()).padStart(2, '0');
-  input.value = `${year}-${month}-${day}`;
-  input.max   = input.value;
+  
+  function updateDateBounds() {
+    const d = new Date();
+    const year  = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day   = String(d.getDate()).padStart(2, '0');
+    input.max = `${year}-${month}-${day}`;
+  }
+
+  // Initialize bounds on page load
+  updateDateBounds();
+  input.value = input.max;
+
+  // Silently shift the maximum allowed date forward whenever the user clicks/taps the box
+  input.addEventListener('click', updateDateBounds);
+  input.addEventListener('focus', updateDateBounds);
 
   document.getElementById('sensorSelect').addEventListener('change', checkAndLoadGraph);
   document.getElementById('daySelect').addEventListener('change', checkAndLoadGraph);
@@ -954,14 +977,14 @@ void setupThirdPageRoutes() {
       obj["time"] = time;
       obj["value"] = val;
       lineCount++;
-      if ((lineCount % 50) == 0) { // Yield more frequently (every 50 lines)
+      if ((lineCount % 25) == 0) { // Safety valve: Yield to prevent Watchdog panic
         vTaskDelay(pdMS_TO_TICKS(1));
       }
     }
     f.close();
     xSemaphoreGive(fileSystemMutex);
 
-    // YIELD before the heavy JSON string generation
+    // Safety valve before heavy JSON serialization
     vTaskDelay(pdMS_TO_TICKS(1)); 
 
     String out;
@@ -1000,7 +1023,7 @@ void setupThirdPageRoutes() {
 
     File entry = root.openNextFile();
     while (entry) {
-      vTaskDelay(pdMS_TO_TICKS(1));
+      vTaskDelay(pdMS_TO_TICKS(1)); // Safety valve: Yield on every file
       JsonObject obj = arr.createNestedObject();
 
       String full = String(entry.name());
@@ -1008,7 +1031,6 @@ void setupThirdPageRoutes() {
       obj["isDir"] = entry.isDirectory();
 
       entry.close();  // ✅ IMPORTANT: close each entry
-      vTaskDelay(1);  // keep system responsive
       entry = root.openNextFile();
     }
 

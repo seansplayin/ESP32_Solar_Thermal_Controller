@@ -199,7 +199,7 @@
    // -----------------------------------------------------------------------
    inline constexpr float DEFAULT_PanelOnDifferential     = 30.0f;
    inline constexpr float DEFAULT_PanelLowDifferential    = 15.0f;
-   inline constexpr float DEFAULT_PanelOffDifferential    = 1.0f;
+   inline constexpr float DEFAULT_PanelOffDifferential    = 5.0f;
    inline constexpr float DEFAULT_panelTminimum           = 125.0f;
    inline constexpr float DEFAULT_StorageHeatingLimit     = 130.0f;
    inline constexpr float DEFAULT_Circ_Pump_On            = 5.0f;  // 5.0f
