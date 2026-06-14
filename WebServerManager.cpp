@@ -9,6 +9,7 @@
 #include "SecondWebpage.h"
 #include "ThirdWebpage.h"
 #include <ArduinoJson.h> 
+#include <string.h>
 #include <RTClib.h>
 #include "uptime_formatter.h"
 #include "TemperatureControl.h" 
@@ -21,6 +22,8 @@
 #include "AlarmWebpage.h"
 #include "TarGZ.h"
 #include "DiagLog.h"
+#include "NetworkManager.h"
+#include "DS18B20.h"
 
 
 
@@ -44,6 +47,8 @@ SemaphoreHandle_t g_tempWsPayloadMutex = NULL;
 
 // Real outbound WS queue (broadcast + one-client)
 static SemaphoreHandle_t g_queuedWsMutex = NULL;
+
+
 
 struct QueuedWsMessage {
   uint32_t clientId;   // 0 = broadcast
@@ -391,9 +396,9 @@ void handleWebSocketEvent(AsyncWebSocket* server, AsyncWebSocketClient* client, 
                           void* arg, uint8_t* data, size_t len);
 void handleWebSocketMessage(void* arg, uint8_t* data, size_t len);
 void handleSetPumpMode(String message);
-void handleRequestLogData(String message);
 void sendPumpStatuses(AsyncWebSocketClient* client);
 void sendTemperatures(AsyncWebSocketClient* client);
+void sendTemperatureSourceMap(AsyncWebSocketClient* client);
 String getFormattedTime();
 String getFormattedDate();
 void sendDateTime(AsyncWebSocketClient* client);
@@ -422,7 +427,6 @@ unsigned long aggregateYearlyLogsReport(int pumpIndex, DateTime currentTime);
 unsigned long aggregatePreviousYearlyLogsReport(int pumpIndex, DateTime currentTime);
 unsigned long aggregateDecadeLogsReport(int pumpIndex, DateTime currentTime);
 void setupRoutes();
-void setupLogDataRoute();
 void updateAllRuntimes();
 void refreshRuntimeCache();
 
@@ -430,6 +434,17 @@ static void sendAlarmStateWs(uint32_t n);
 static void onAlarmStateChanged(uint32_t activeCount);
 static void startInitAllForClient(AsyncWebSocketClient* client);
 static bool processInitAllStep(uint32_t now);
+static void delayedControllerRebootTask(void* pvParameters);
+
+static void delayedControllerRebootTask(void* pvParameters) {
+  (void)pvParameters;
+
+  // Give the HTTP response time to leave the controller before restarting.
+  vTaskDelay(pdMS_TO_TICKS(750));
+  ESP.restart();
+
+  vTaskDelete(NULL);
+}
 
 static void startInitAllForClient(AsyncWebSocketClient* client) {
   if (!client) return;
@@ -510,6 +525,10 @@ static bool processInitAllStep(uint32_t now) {
       break;
 
     case 9:
+      sendTemperatureSourceMap(client);
+      break;
+
+    case 10:
       sendTemperatures(client);
       break;
 
@@ -525,7 +544,7 @@ static bool processInitAllStep(uint32_t now) {
           (unsigned)g_initAllStep,
           (unsigned)g_initAllClientId);
 
-  if (g_initAllStep >= 9) {
+  if (g_initAllStep >= 10) {
     g_initAllClientId = 0;
     g_initAllStep = 0;
     g_initAllNextMs = 0;
@@ -534,6 +553,8 @@ static bool processInitAllStep(uint32_t now) {
     g_initAllNextMs = now + WS_INITALL_STEP_MS;
   }
 
+  // FIX 2: Hard throttle to give AsyncTCP time to free memory between init steps
+  vTaskDelay(pdMS_TO_TICKS(50));
   return true;
 }
 
@@ -761,6 +782,7 @@ void handleWebSocketEvent(AsyncWebSocket* server,
 
   if (msg == "initTemperatures") {
     if (client) {
+      sendTemperatureSourceMap(client);
       sendTemperatures(client);
     }
     return;
@@ -830,9 +852,6 @@ void handleWebSocketMessage(void* arg, uint8_t* data, size_t len) {
 
         if (message == "ping") {
             return;
-        }       
-                else if (message.startsWith("requestLogData")) {
-            handleRequestLogData(message);
         } else if (message.startsWith("setPumpMode:")) {
             handleSetPumpMode(message);
         } else if (message.equals("setAllPumps:auto")) {
@@ -1033,35 +1052,6 @@ void handleSetPumpMode(String message) {
         }
     }
 }
-
-// Handle log data requests
-void handleRequestLogData(String message) {
-
-  // Serialize ALL WS log-data requests
-    if (!takeLogDataMutex(pdMS_TO_TICKS(5000))) {
-        LOG_ERR("[LogData] BUSY (WS) - mutex timeout\n");
-    queueWsBroadcast("{\"error\":\"BUSY\"}", "LogDataBusy");
-    return;
-
-  }
-
-  // Expected format: requestLogData:pumpIndex:timeframe
-  int firstColon  = message.indexOf(':');
-  int secondColon = message.lastIndexOf(':');
-
-  if (firstColon != -1 && secondColon != -1 && secondColon > firstColon) {
-    int pumpIndex  = message.substring(firstColon + 1, secondColon).toInt() - 1; // 0-based
-    String timeframe = message.substring(secondColon + 1);
-
-        String logData = prepareLogData(pumpIndex, timeframe);
-    queueWsBroadcast(logData, "LogData");
-  } else {
-    LOG_CAT(DBG_WEB, "[WS] Invalid requestLogData message format\n");
-
-  }
-  giveLogDataMutex();
-}
-
 
 // Send pump statuses to client
 // Send pump statuses to client (Optimized with Local Cache)
@@ -1401,6 +1391,66 @@ void TaskWebSocketTransmitter(void* pvParameters) {
 }
 
 
+static void appendTemperatureSourceMapItem(String& out,
+                                           bool& first,
+                                           const char* systemTemp) {
+  if (!systemTemp) return;
+
+  String sourceName = "Unassigned";
+  String avgKey = "";
+  String rawKey = "";
+  String goodKey = "";
+
+  int dsSlot = findDs18B20AssignmentBySystemTemp(systemTemp);
+  if (dsSlot >= 0 && dsSlot < DS18B20_ASSIGNMENT_COUNT) {
+    sourceName = "DTemp" + String(dsSlot + 1);
+    avgKey = "DTempAverage" + String(dsSlot + 1);
+    rawKey = "DTemp" + String(dsSlot + 1);
+    goodKey = "DTempGoodAge" + String(dsSlot + 1);
+  } else if (strcmp(systemTemp, "panelT") == 0) {
+    // Collector manifold defaults to PT1000 unless explicitly mapped to DS18B20.
+    sourceName = "PT1000";
+    avgKey = "pt1000Average";
+    rawKey = "pt1000Current";
+    goodKey = "pt1000GoodAge";
+  }
+
+  if (!first) out += ",";
+  first = false;
+
+  out += systemTemp;
+  out += "|";
+  out += sourceName;
+  out += "|";
+  out += avgKey;
+  out += "|";
+  out += rawKey;
+  out += "|";
+  out += goodKey;
+}
+
+void sendTemperatureSourceMap(AsyncWebSocketClient* client) {
+  String map = "TempSourceMap:";
+  bool first = true;
+
+  appendTemperatureSourceMapItem(map, first, "outsideT");
+  appendTemperatureSourceMapItem(map, first, "storageT");
+  appendTemperatureSourceMapItem(map, first, "panelT");
+  appendTemperatureSourceMapItem(map, first, "CSupplyT");
+  appendTemperatureSourceMapItem(map, first, "CreturnT");
+  appendTemperatureSourceMapItem(map, first, "supplyT");
+  appendTemperatureSourceMapItem(map, first, "CircReturnT");
+  appendTemperatureSourceMapItem(map, first, "DhwSupplyT");
+  appendTemperatureSourceMapItem(map, first, "DhwReturnT");
+  appendTemperatureSourceMapItem(map, first, "HeatingSupplyT");
+  appendTemperatureSourceMapItem(map, first, "HeatingReturnT");
+  appendTemperatureSourceMapItem(map, first, "PotHeatXinletT");
+  appendTemperatureSourceMapItem(map, first, "PotHeatXoutletT");
+  appendTemperatureSourceMapItem(map, first, "dhwT");
+
+  queueWsToClientOrBroadcast(client, map, "TempSourceMap");
+}
+
 void sendAllData(AsyncWebSocketClient* client) {
   if (client && client->status() != WS_CONNECTED) {
     LOG_CAT(DBG_WEB, "[WS] Client not connected, skipping sendAllData.\n");
@@ -1408,6 +1458,7 @@ void sendAllData(AsyncWebSocketClient* client) {
   }
 
   sendPumpStatuses(client);
+  sendTemperatureSourceMap(client);
 
   if (xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
     String tempData = "Temperatures:";
@@ -1485,7 +1536,9 @@ void broadcastMessageOverWebSocket(const String& message, const String& messageT
       continue;
     }
 
-    if (client.text(message)) {
+    bool success = client.text(message);
+
+    if (success) {
       sent++;
     } else {
       skipped++;
@@ -2068,6 +2121,682 @@ void setupRoutes() {
         }
     });
 
+        // -- DS18B20 assignment config page --
+    server.on("/ds18b20-config", HTTP_GET, [](AsyncWebServerRequest* request) {
+        const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>DS18B20 Sensor Assignments</title>
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 14px; margin: 8px; }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #999; padding: 4px; vertical-align: middle; }
+    th { background: #eef4fb; }
+    input, select, button { font-size: 13px; }
+    .rom { width: 175px; }
+    .romSelect { width: 230px; margin-left: 4px; }
+    .busSelect { width: 68px; }
+    .offset { width: 46px; }
+    .centerCell { text-align: center; }
+    .statusCell { min-width: 170px; font-size: 12px; }
+    .okText { color: #087a08; font-weight: bold; }
+    .warnText { color: #b00000; font-weight: bold; }
+    .dirtyRow { background: #fff8d8; }
+    .issueRow { background: #ffe0e0; }
+    .saveDirty { background: #ffd45c; border: 2px solid #9b6200; font-weight: bold; }
+    .msg { margin-top: 10px; font-weight: bold; min-height: 1.4em; }
+    .buttonRow { margin: 8px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .scanBox { margin-top: 10px; padding: 6px; border: 1px solid #aaa; background: #f9fbff; }
+    .scanBox h3 { margin: 0 0 6px 0; }
+    .muted { color: #555; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>DS18B20 Sensor Assignments</h2>
+  <p>Assign each configured DS18B20 ROM to a system temperature and one-wire bus. Saving changes writes ds18b20_config.json. Reboot after saving so the DS18B20 boot scan rebuilds the runtime map.</p>
+
+  <div class="buttonRow">
+    <button id="reloadBtn">Reload Config</button>
+    <button id="scanBtn">Search OneWire Buses</button>
+    <button id="resetBtn">Restore Defaults</button>
+    <button id="rebootBtn" style="font-weight:bold; color:#b00000;">Reboot Controller</button>
+  </div>
+
+  <table id="assignmentTable">
+    <thead>
+      <tr>
+        <th>Slot</th>
+        <th>DTemp</th>
+        <th>ROM Address</th>
+        <th>Found / Assigned ROM Selector</th>
+        <th>System Temperature</th>
+        <th>Bus</th>
+        <th>Enabled</th>
+        <th>Offset F</th>
+        <th>Status</th>
+        <th>Save</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <div id="scanBox" class="scanBox" style="display:none;">
+    <h3>OneWire Search Results</h3>
+    <div class="muted">New/unassigned ROMs can be selected from the dropdown in any row, or manually typed into the ROM Address field.</div>
+    <table id="scanTable" style="margin-top:6px;">
+      <thead><tr><th>Bus</th><th>ROM</th><th>Status</th><th>Assigned Slot</th><th>System Temp</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="msg" class="msg"></div>
+
+<script>
+let validSystemTemps = [];
+let currentAssignments = [];
+let scannedSensors = [];
+let dirtySlots = new Set();
+
+function setMsg(text) {
+  document.getElementById('msg').textContent = text;
+}
+
+function normalizeRom(rom) {
+  return String(rom || '').trim().toLowerCase();
+}
+
+function isZeroRom(rom) {
+  const r = normalizeRom(rom);
+  return !r || r === '0x0' || r === '0';
+}
+
+function getAssignment(slot) {
+  return currentAssignments.find(r => Number(r.slot) === Number(slot));
+}
+
+function getScannedSensorByRom(rom) {
+  const key = normalizeRom(rom);
+  return scannedSensors.find(s => normalizeRom(s.rom) === key);
+}
+
+function markDirty(slot, reason) {
+  dirtySlots.add(Number(slot));
+  renderAssignments();
+  setMsg('Slot ' + slot + ' row changed but not saved. Save changes before reboot.');
+}
+
+function clearDirty(slot) {
+  dirtySlots.delete(Number(slot));
+}
+
+function makeSystemTempSelect(row) {
+  const sel = document.createElement('select');
+  validSystemTemps.forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    if (name === row.systemTemp) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => {
+    row.systemTemp = sel.value;
+    markDirty(row.slot);
+  };
+  return sel;
+}
+
+function findDuplicateRomSlot(row) {
+  const rom = normalizeRom(row.rom);
+  if (isZeroRom(rom) || !row.enabled) return -1;
+  const dup = currentAssignments.find(other =>
+    Number(other.slot) !== Number(row.slot) &&
+    other.enabled &&
+    normalizeRom(other.rom) === rom
+  );
+  return dup ? Number(dup.slot) : -1;
+}
+
+function findDuplicateSystemTempSlot(row) {
+  if (!row.enabled || !row.systemTemp) return -1;
+  const dup = currentAssignments.find(other =>
+    Number(other.slot) !== Number(row.slot) &&
+    other.enabled &&
+    other.systemTemp === row.systemTemp
+  );
+  return dup ? Number(dup.slot) : -1;
+}
+
+function getRowIssues(row) {
+  const issues = [];
+  if (!row.enabled) return issues;
+
+  const dupRomSlot = findDuplicateRomSlot(row);
+  if (dupRomSlot >= 0) issues.push('Duplicate ROM with slot ' + dupRomSlot);
+
+  const dupTempSlot = findDuplicateSystemTempSlot(row);
+  if (dupTempSlot >= 0) issues.push('Duplicate system temp with slot ' + dupTempSlot);
+
+  if (!isZeroRom(row.rom)) {
+    if (row.observedBus && Number(row.observedBus) !== Number(row.bus)) {
+      issues.push('ROM found on Bus ' + row.observedBus + ', configured Bus ' + row.bus);
+    } else if (row.present === false) {
+      issues.push('Configured ROM not found');
+    }
+  }
+
+  return issues;
+}
+
+function buildRomChoices(currentRom) {
+  const choices = [];
+  const seen = {};
+  const current = normalizeRom(currentRom);
+
+  function addChoice(rom, bus, label, assignedSlot) {
+    const key = normalizeRom(rom);
+    if (!key || key === '0x0' || key === '0' || seen[key]) return;
+    seen[key] = true;
+    choices.push({ rom: rom, bus: bus, label: label, assignedSlot: assignedSlot });
+  }
+
+  currentAssignments.forEach(row => {
+    if (!row.rom) return;
+    addChoice(row.rom, row.bus,
+      'Assigned: Slot ' + row.slot + ' / DTemp' + row.dtemp + ' / ' + row.systemTemp + ' / Bus ' + row.bus + ' / ' + row.rom,
+      row.slot);
+  });
+
+  scannedSensors.forEach(s => {
+    const status = s.assigned ? ('Assigned: Slot ' + s.slot + ' / DTemp' + s.dtemp + ' / ' + s.systemTemp)
+                              : 'NEW UNASSIGNED';
+    addChoice(s.rom, s.bus, status + ' / Found Bus ' + s.bus + ' / ' + s.rom,
+      s.assigned ? s.slot : -1);
+  });
+
+  if (current && !seen[current]) {
+    choices.unshift({ rom: currentRom, bus: 0, label: 'Current row value / ' + currentRom, assignedSlot: -1 });
+  }
+
+  return choices;
+}
+
+function swapRomAndBus(slotA, slotB) {
+  const a = getAssignment(slotA);
+  const b = getAssignment(slotB);
+  if (!a || !b) return;
+
+  const oldRom = a.rom;
+  const oldBus = a.bus;
+  a.rom = b.rom;
+  a.bus = b.bus;
+  b.rom = oldRom;
+  b.bus = oldBus;
+
+  dirtySlots.add(Number(slotA));
+  dirtySlots.add(Number(slotB));
+  renderAssignments();
+  setMsg('Swapped ROM and Bus between slot ' + slotA + ' and slot ' + slotB + '. Save both changed rows before reboot.');
+}
+
+function makeRomSelect(row) {
+  const sel = document.createElement('select');
+  sel.className = 'romSelect';
+
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Select ROM...';
+  sel.appendChild(placeholder);
+
+  buildRomChoices(row.rom || '').forEach(choice => {
+    const opt = document.createElement('option');
+    opt.value = choice.rom;
+    opt.textContent = choice.label;
+    opt.dataset.bus = String(choice.bus || 0);
+    opt.dataset.assignedSlot = String(choice.assignedSlot ?? -1);
+    if (normalizeRom(choice.rom) === normalizeRom(row.rom)) opt.selected = true;
+    sel.appendChild(opt);
+  });
+
+  sel.onchange = () => {
+    if (!sel.value) return;
+
+    const selected = sel.options[sel.selectedIndex];
+    const assignedSlot = Number(selected.dataset.assignedSlot || -1);
+    const selectedBus = Number(selected.dataset.bus || 0);
+
+    if (assignedSlot >= 0 && assignedSlot !== Number(row.slot)) {
+      if (confirm('This ROM is already assigned to slot ' + assignedSlot + '.\n\nSwap ROM and Bus between slot ' + row.slot + ' and slot ' + assignedSlot + '?')) {
+        swapRomAndBus(row.slot, assignedSlot);
+        return;
+      }
+    }
+
+    row.rom = sel.value;
+    if (selectedBus === 1 || selectedBus === 2) row.bus = selectedBus;
+    markDirty(row.slot);
+  };
+
+  return sel;
+}
+
+function renderScanResults() {
+  const box = document.getElementById('scanBox');
+  const tbody = document.querySelector('#scanTable tbody');
+  tbody.innerHTML = '';
+
+  if (!scannedSensors.length) {
+    box.style.display = 'none';
+    return;
+  }
+
+  box.style.display = 'block';
+
+  scannedSensors.forEach(s => {
+    const tr = document.createElement('tr');
+    [s.bus, s.rom, s.assigned ? 'Assigned' : 'NEW / unassigned',
+     s.assigned ? ('Slot ' + s.slot + ' / DTemp' + s.dtemp) : '--',
+     s.assigned ? s.systemTemp : '--'].forEach(text => {
+      const td = document.createElement('td');
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+}
+
+async function scanOneWire() {
+  setMsg('Searching OneWire buses...');
+  const res = await fetch('/api/ds18b20-scan', { cache: 'no-store' });
+  const out = await res.json();
+
+  if (!out.ok) {
+    setMsg('OneWire search failed: ' + (out.error || 'unknown error'));
+    return;
+  }
+
+  scannedSensors = out.sensors || [];
+  renderScanResults();
+  setMsg('OneWire search complete. Found ' + scannedSensors.length + ' valid DS18B20 ROMs. New/unassigned sensors are available in each ROM selector.');
+  renderAssignments();
+}
+
+function updateRowField(row, field, value) {
+  row[field] = value;
+  markDirty(row.slot);
+}
+
+function renderAssignments() {
+  const tbody = document.querySelector('#assignmentTable tbody');
+  tbody.innerHTML = '';
+
+  let firstIssue = '';
+
+  currentAssignments.forEach(row => {
+    const issues = getRowIssues(row);
+    const isDirty = dirtySlots.has(Number(row.slot));
+    const tr = document.createElement('tr');
+    if (issues.length) tr.className = 'issueRow';
+    if (isDirty) tr.className = (tr.className ? tr.className + ' ' : '') + 'dirtyRow';
+
+    const slotTd = document.createElement('td');
+    slotTd.textContent = row.slot;
+    tr.appendChild(slotTd);
+
+    const dtempTd = document.createElement('td');
+    dtempTd.textContent = 'DTemp' + row.dtemp;
+    tr.appendChild(dtempTd);
+
+    const romInput = document.createElement('input');
+    romInput.className = 'rom';
+    romInput.value = row.rom || '';
+    romInput.onchange = () => updateRowField(row, 'rom', romInput.value.trim());
+    const romTd = document.createElement('td');
+    romTd.appendChild(romInput);
+    tr.appendChild(romTd);
+
+    const romSelectTd = document.createElement('td');
+    romSelectTd.appendChild(makeRomSelect(row));
+    tr.appendChild(romSelectTd);
+
+    const sysSel = makeSystemTempSelect(row);
+    const sysTd = document.createElement('td');
+    sysTd.appendChild(sysSel);
+    tr.appendChild(sysTd);
+
+    const busSel = document.createElement('select');
+    busSel.className = 'busSelect';
+    [1, 2].forEach(bus => {
+      const opt = document.createElement('option');
+      opt.value = String(bus);
+      opt.textContent = 'Bus ' + bus;
+      if (Number(row.bus) === bus) opt.selected = true;
+      busSel.appendChild(opt);
+    });
+    busSel.onchange = () => updateRowField(row, 'bus', Number(busSel.value));
+    const busTd = document.createElement('td');
+    busTd.appendChild(busSel);
+    tr.appendChild(busTd);
+
+    const enabledInput = document.createElement('input');
+    enabledInput.type = 'checkbox';
+    enabledInput.checked = !!row.enabled;
+    enabledInput.onchange = () => updateRowField(row, 'enabled', enabledInput.checked);
+    const enabledTd = document.createElement('td');
+    enabledTd.className = 'centerCell';
+    enabledTd.appendChild(enabledInput);
+    tr.appendChild(enabledTd);
+
+    const offsetInput = document.createElement('input');
+    offsetInput.type = 'number';
+    offsetInput.step = '0.1';
+    offsetInput.className = 'offset';
+    offsetInput.value = row.offsetF || 0;
+    offsetInput.onchange = () => updateRowField(row, 'offsetF', offsetInput.value || '0');
+    const offsetTd = document.createElement('td');
+    offsetTd.appendChild(offsetInput);
+    tr.appendChild(offsetTd);
+
+    const statusTd = document.createElement('td');
+    statusTd.className = 'statusCell';
+    if (isDirty) {
+      statusTd.innerHTML = '<span class="warnText">Changed / not saved</span>';
+    } else if (issues.length) {
+      statusTd.innerHTML = '<span class="warnText">' + issues.join('<br>') + '</span>';
+      if (!firstIssue) firstIssue = 'Slot ' + row.slot + ': ' + issues.join('; ');
+    } else if (!row.enabled) {
+      statusTd.textContent = 'Disabled';
+    } else {
+      statusTd.innerHTML = '<span class="okText">OK</span>';
+    }
+    tr.appendChild(statusTd);
+
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Save Row';
+    if (isDirty) saveBtn.className = 'saveDirty';
+    saveBtn.onclick = async () => {
+      const ok = await saveRow(row);
+      if (ok) {
+        clearDirty(row.slot);
+        setMsg('Slot ' + row.slot + ' changes saved. Reboot required for runtime remap.');
+        await loadConfig(false, true);
+      }
+    };
+    const saveTd = document.createElement('td');
+    saveTd.appendChild(saveBtn);
+    tr.appendChild(saveTd);
+
+    tbody.appendChild(tr);
+  });
+
+  if (!dirtySlots.size && firstIssue) {
+    setMsg(firstIssue);
+  }
+
+  renderScanResults();
+}
+
+async function saveRow(row) {
+  const params = new URLSearchParams();
+  params.set('slot', row.slot);
+  params.set('rom', String(row.rom || '').trim());
+  params.set('systemTemp', row.systemTemp || '');
+  params.set('bus', row.bus);
+  params.set('enabled', row.enabled ? '1' : '0');
+  params.set('offsetF', row.offsetF || '0');
+
+  const r = await fetch('/api/ds18b20-set?' + params.toString(), { cache: 'no-store' });
+  const out = await r.json();
+  if (!out.ok) {
+    setMsg('Save failed for slot ' + row.slot + ': ' + (out.error || 'unknown error'));
+    return false;
+  }
+  return true;
+}
+
+async function saveDirtyRows() {
+  const slots = Array.from(dirtySlots).sort((a, b) => a - b);
+  for (const slot of slots) {
+    const row = getAssignment(slot);
+    if (!row) continue;
+    const ok = await saveRow(row);
+    if (!ok) return false;
+    clearDirty(slot);
+  }
+  await loadConfig(false, true);
+  setMsg('Saved changed rows: ' + slots.join(', ') + '. Reboot required.');
+  return true;
+}
+
+async function loadConfig(showMsg, preserveDirty) {
+  if (showMsg !== false) setMsg('Loading...');
+  const res = await fetch('/api/ds18b20-config', { cache: 'no-store' });
+  const cfg = await res.json();
+  validSystemTemps = cfg.validSystemTemps || [];
+  currentAssignments = cfg.assignments || [];
+  if (!preserveDirty) dirtySlots.clear();
+  renderAssignments();
+  if (showMsg !== false) setMsg('Loaded ' + currentAssignments.length + ' assignments.');
+}
+
+document.getElementById('reloadBtn').onclick = () => loadConfig(true);
+document.getElementById('scanBtn').onclick = scanOneWire;
+
+document.getElementById('resetBtn').onclick = async () => {
+  if (!confirm('Restore DS18B20 assignments to compiled defaults?')) return;
+  const r = await fetch('/api/ds18b20-reset', { cache: 'no-store' });
+  const out = await r.json();
+  if (out.ok) {
+    dirtySlots.clear();
+    setMsg('Defaults restored. Reboot required.');
+    loadConfig(false);
+  } else {
+    setMsg('Reset failed: ' + (out.error || 'unknown error'));
+  }
+};
+
+document.getElementById('rebootBtn').onclick = async () => {
+  if (dirtySlots.size) {
+    const saveFirst = confirm('Changes not saved.\n\nClick OK to save changed rows before reboot.\nClick Cancel to reboot without saving those unsaved changes.');
+    if (saveFirst) {
+      const saved = await saveDirtyRows();
+      if (!saved) return;
+    }
+  }
+
+  if (!confirm('Reboot the ESP32 controller now? Pump/control operation will stop during the reboot.')) return;
+  setMsg('Reboot command sent. The page will disconnect while the controller restarts.');
+
+  try {
+    const r = await fetch('/api/reboot-controller', { method: 'POST', cache: 'no-store' });
+    const out = await r.json();
+    if (!out.ok) setMsg('Reboot request failed: ' + (out.error || 'unknown error'));
+  } catch (e) {
+    // The reboot can interrupt the HTTP response on some browsers. That is expected.
+  }
+};
+
+loadConfig(true);
+</script>
+</body>
+</html>
+)rawliteral";
+        request->send(200, "text/html; charset=UTF-8", html);
+    });
+
+        // -- DS18B20 assignment config API --
+    server.on("/api/ds18b20-config", HTTP_GET, [](AsyncWebServerRequest* request) {
+        DynamicJsonDocument doc(3072);
+        doc["version"] = g_ds18b20Config.version;
+        doc["path"] = DS18B20_CONFIG_PATH;
+
+        JsonArray valid = doc.createNestedArray("validSystemTemps");
+        valid.add("panelT");
+        valid.add("CSupplyT");
+        valid.add("storageT");
+        valid.add("outsideT");
+        valid.add("CircReturnT");
+        valid.add("supplyT");
+        valid.add("CreturnT");
+        valid.add("DhwSupplyT");
+        valid.add("DhwReturnT");
+        valid.add("HeatingSupplyT");
+        valid.add("HeatingReturnT");
+        valid.add("dhwT");
+        valid.add("PotHeatXinletT");
+        valid.add("PotHeatXoutletT");
+
+        JsonArray assignments = doc.createNestedArray("assignments");
+        for (uint8_t i = 0; i < DS18B20_ASSIGNMENT_COUNT; i++) {
+            const Ds18B20SensorAssignment& a = g_ds18b20Config.assignments[i];
+
+            bool present = false;
+            uint8_t observedBus = 0;
+            uint32_t lastGoodMs = 0;
+            getDS18B20SlotStatus(i, &present, &observedBus, &lastGoodMs);
+
+            int duplicateRomSlot = -1;
+            int duplicateSystemTempSlot = -1;
+            for (uint8_t j = 0; j < DS18B20_ASSIGNMENT_COUNT; j++) {
+                if (j == i) continue;
+                const Ds18B20SensorAssignment& other = g_ds18b20Config.assignments[j];
+
+                if (a.enabled && other.enabled && a.rom != 0ULL && a.rom == other.rom) {
+                    duplicateRomSlot = j;
+                }
+
+                if (a.enabled && other.enabled && strcmp(a.systemTemp, other.systemTemp) == 0) {
+                    duplicateSystemTempSlot = j;
+                }
+            }
+
+            JsonObject row = assignments.createNestedObject();
+            row["slot"] = i;
+            row["dtemp"] = i + 1;
+            row["rom"] = ds18b20RomToString(a.rom);
+            row["systemTemp"] = a.systemTemp;
+            row["bus"] = a.bus;
+            row["enabled"] = a.enabled;
+            row["offsetF"] = a.offsetF;
+            row["present"] = present;
+            row["observedBus"] = observedBus;
+            row["wrongBus"] = (a.enabled && observedBus != 0 && observedBus != a.bus);
+            row["lastGoodMs"] = lastGoodMs;
+            row["duplicateRom"] = (duplicateRomSlot >= 0);
+            row["duplicateRomSlot"] = duplicateRomSlot;
+            row["duplicateSystemTemp"] = (duplicateSystemTempSlot >= 0);
+            row["duplicateSystemTempSlot"] = duplicateSystemTempSlot;
+        }
+
+        String json;
+        serializeJson(doc, json);
+        AsyncWebServerResponse* resp = request->beginResponse(200, "application/json; charset=UTF-8", json);
+        resp->addHeader("Cache-Control", "no-store");
+        request->send(resp);
+    });
+
+    server.on("/api/ds18b20-scan", HTTP_GET, [](AsyncWebServerRequest* request) {
+        String json = buildDS18B20ScanJson();
+        AsyncWebServerResponse* resp = request->beginResponse(200, "application/json; charset=UTF-8", json);
+        resp->addHeader("Cache-Control", "no-store");
+        request->send(resp);
+    });
+
+    server.on("/api/ds18b20-set", HTTP_GET, [](AsyncWebServerRequest* request) {
+        if (!request->hasParam("slot") || !request->hasParam("rom") ||
+            !request->hasParam("systemTemp") || !request->hasParam("bus")) {
+            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Missing slot, rom, systemTemp, or bus\"}");
+            return;
+        }
+
+        int slot = request->getParam("slot")->value().toInt();
+        if (slot < 0 || slot >= DS18B20_ASSIGNMENT_COUNT) {
+            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid slot\"}");
+            return;
+        }
+
+        uint64_t rom = 0ULL;
+        String romText = request->getParam("rom")->value();
+        if (!parseDs18b20RomString(romText.c_str(), rom)) {
+            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid DS18B20 ROM\"}");
+            return;
+        }
+
+        String systemTemp = request->getParam("systemTemp")->value();
+        systemTemp.trim();
+        if (!isValidSystemTempName(systemTemp.c_str())) {
+            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid systemTemp\"}");
+            return;
+        }
+
+        int bus = request->getParam("bus")->value().toInt();
+        if (bus != 1 && bus != 2) {
+            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid bus\"}");
+            return;
+        }
+
+        bool enabled = true;
+        if (request->hasParam("enabled")) {
+            String enabledStr = request->getParam("enabled")->value();
+            enabledStr.toLowerCase();
+            enabled = (enabledStr == "1" || enabledStr == "true" || enabledStr == "yes" || enabledStr == "on");
+        }
+
+        float offsetF = 0.0f;
+        if (request->hasParam("offsetF")) {
+            offsetF = request->getParam("offsetF")->value().toFloat();
+        }
+
+        g_ds18b20Config.assignments[slot].rom = rom;
+        strncpy(g_ds18b20Config.assignments[slot].systemTemp,
+                systemTemp.c_str(),
+                sizeof(g_ds18b20Config.assignments[slot].systemTemp) - 1);
+        g_ds18b20Config.assignments[slot].systemTemp[sizeof(g_ds18b20Config.assignments[slot].systemTemp) - 1] = '\0';
+        g_ds18b20Config.assignments[slot].bus = (uint8_t)bus;
+        g_ds18b20Config.assignments[slot].enabled = enabled;
+        g_ds18b20Config.assignments[slot].offsetF = offsetF;
+
+        bool ok = saveDs18B20ConfigToFS();
+        if (!ok) {
+            request->send(500, "application/json", "{\"ok\":false,\"error\":\"Failed to save ds18b20_config.json\"}");
+            return;
+        }
+
+        request->send(200, "application/json", "{\"ok\":true,\"rebootRequired\":true}");
+    });
+
+    server.on("/api/ds18b20-reset", HTTP_GET, [](AsyncWebServerRequest* request) {
+        bool ok = resetDs18B20ConfigToDefaults();
+        if (!ok) {
+            request->send(500, "application/json", "{\"ok\":false,\"error\":\"Failed to reset DS18B20 config\"}");
+            return;
+        }
+        request->send(200, "application/json", "{\"ok\":true,\"rebootRequired\":true}");
+    });
+
+
+    server.on("/api/reboot-controller", HTTP_POST, [](AsyncWebServerRequest* request) {
+        request->send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+
+        xTaskCreate(
+          delayedControllerRebootTask,
+          "DelayedReboot",
+          2048,
+          nullptr,
+          1,
+          nullptr
+        );
+    });
+
+        // -- Network diagnostics route --
+    server.on("/api/network-diagnostics", HTTP_GET, [](AsyncWebServerRequest* request) {
+        String json = getNetworkDiagnosticsJson();
+        AsyncWebServerResponse* resp = request->beginResponse(200, "application/json; charset=UTF-8", json);
+        resp->addHeader("Cache-Control", "no-store");
+        request->send(resp);
+    });
+
         // -- FS stats route --
     server.on("/fs-stats", HTTP_GET, [](AsyncWebServerRequest* request) {
         String json = getFSStatsString(); // function from FileSystemManager.cpp
@@ -2075,68 +2804,6 @@ void setupRoutes() {
     });
 
     setupAlarmRoutes();
-    
-    // Setup log data route
-    setupLogDataRoute();
-}
-
-// Setup log data route
-void setupLogDataRoute() {
-  server.on("/get-log-data", HTTP_GET, [](AsyncWebServerRequest* request) {
-
-    // Serialize ALL HTTP log-data requests too
-    if (!takeLogDataMutex(pdMS_TO_TICKS(5000))) {
-      request->send(503, "application/json", "{\"error\":\"BUSY\"}");
-      return;
-    }
-
-    // Always release mutex before exiting this handler
-    if (!(request->hasParam("pumpIndex") && request->hasParam("timeframe"))) {
-      request->send(400, "application/json", "{\"error\":\"Missing parameters\"}");
-      giveLogDataMutex();
-      return;
-    }
-
-    String pumpIndexParam = request->getParam("pumpIndex")->value();
-    String timeframe      = request->getParam("timeframe")->value();
-    int pumpIndex         = pumpIndexParam.toInt() - 1;  // 0-based
-
-    unsigned long runtime = 0;
-    DateTime currentTime  = getCurrentTimeAtomic();
-
-    if (timeframe == "day") {
-      runtime = aggregateDailyLogsReport(pumpIndex, currentTime);
-    } else if (timeframe == "prevDay" || timeframe == "yesterday") {
-      runtime = aggregatePreviousDailyLogsReport(pumpIndex, currentTime);
-    } else if (timeframe == "month") {
-      runtime = aggregateMonthlyLogsReport(pumpIndex, currentTime);
-    } else if (timeframe == "prevMonth" || timeframe == "lastMonth") {
-      runtime = aggregatePreviousMonthlyLogsReport(pumpIndex, currentTime);
-    } else if (timeframe == "year") {
-      runtime = aggregateYearlyLogsReport(pumpIndex, currentTime);
-    } else if (timeframe == "prevYear" || timeframe == "lastYear") {
-      runtime = aggregatePreviousYearlyLogsReport(pumpIndex, currentTime);
-    } else if (timeframe == "total" || timeframe == "decade") {
-      runtime = aggregateDecadeLogsReport(pumpIndex, currentTime);
-    } else {
-      request->send(400, "application/json", "{\"error\":\"Invalid timeframe\"}");
-      giveLogDataMutex();
-      return;
-    }
-
-    DynamicJsonDocument doc(256);
-    doc["runtime"] = runtime;
-
-    String response;
-    serializeJson(doc, response);
-
-    AsyncWebServerResponse* resp =
-      request->beginResponse(200, "application/json; charset=UTF-8", response);
-    resp->addHeader("Cache-Control", "no-store");
-    request->send(resp);
-
-    giveLogDataMutex();
-  });
 }
 
 

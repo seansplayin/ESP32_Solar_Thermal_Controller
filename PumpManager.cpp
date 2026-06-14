@@ -635,22 +635,22 @@ void controlPanelLeadPump() {
         }
     } else {  // Auto Mode
         if (panelT >= g_config.panelTminimumValue &&
-                (panelT > (supplyT + g_config.panelOnDifferential))) {  // Turn ON Pump
+                (panelT > (storageT + g_config.panelOnDifferential))) {  // Turn ON Pump
                 if (pumpStates[pumpIndex] == PUMP_OFF &&
                     (currentMillis - lastChangeTime >= LEAD_RELAY_CHANGE_INTERVAL)) {
                     setPumpState(pumpIndex, PUMP_ON);
                     lastChangeTime = currentMillis;
                     LOG_CAT(DBG_PUMP,
-                            "[Pump] Panel Lead ON (AUTO) panelT>=min && panelT>(supplyT+onDiff)\n");
+                            "[Pump] Panel Lead ON (AUTO) panelT>=min && panelT>(storageT+onDiff)\n");
                 }
-            } else if (panelT < (CSupplyT + g_config.panelOffDifferential)  ||
+            } else if ((panelT < (storageT - g_config.panelOffDifferential) && (CSupplyT >= CreturnT)) ||
                        storageT >= g_config.storageHeatingLimit) {  // Turn OFF Pump
                 if (pumpStates[pumpIndex] == PUMP_ON &&
                     (currentMillis - lastChangeTime >= LEAD_RELAY_CHANGE_INTERVAL)) {
                     setPumpState(pumpIndex, PUMP_OFF);
                     lastChangeTime = currentMillis;
                     LOG_CAT(DBG_PUMP,
-                            "[Pump] Panel Lead OFF (AUTO) panelT<(CSupplyT+offDiff) || storageT>=limit\n");
+                            "[Pump] Panel Lead OFF (AUTO) panelT < (storageT - g_config.panelOffDifferential) && (CSupplyT >= CreturnT)) || storageT>=limit\n");
                 }
             }
      }

@@ -453,11 +453,44 @@ ESP32_Solar_Thermal_Controller_20260516110516 - W5500 experienced a hard physica
 
 Library Update : ESPAsyncWebServer version 3.10.3 ->3.11.0. AsyncTCP 3.4.9->3.4.10
 
-- 
+ESP32_Solar_Thermal_Controller_20260521071137 - Experimented with SPI frequency of W5500, 10 mhz has less dropouts vs 15 mhz but it's somewhat minimal. 25 mhz and expecially 35 mhz did have more. Moved to 5 mhz. Removed many old unused routes from WebServerManager.cpp and updated functions updateHeapStatsCache() and updatePsramStatsCache() inside MemoryStats.cpp and called by checkTimeAndAct(); in Logging.cpp so separate functions responsible for writing the values as well as reading the values do not conflick. 
+
+ESP32_Solar_Thermal_Controller_20260523070325 - modified network debounce to no longer attempt software teardown of Network Stack and now Execute Hardware Hammer. After 20 hours of runtime the system crashed when executing this Hardware Hammer network adapter reset. 06:46:05.396 -> [DS18B20] Sensor 2 recovered. Here is the crash log from serial monitor (06:46:05.495 -> [DS18B20] Sensor 6 recovered. 06:46:06.747 -> [Network] Debounced recovery: Hardware Hammer + Safe Software Rebuild. 06:46:06.747 -> [Network] Ethernet Disconnected. 06:46:06.747 -> [Network] Ethernet Stopped. 06:46:06.747 -> CORRUPT HEAP: Bad tail at 0x3fcd9b7d. Expected 0xbaad5678 got 0xbbad5678. 06:46:06.747 ->. 06:46:06.812 -> assert failed: multi_heap_free multi_heap_poisoning.c:279 (head != NULL). 06:46:06.812 ->. 06:46:06.812 ->. 06:46:06.812 -> Backtrace: 0x4037e899:0x3fccfc20 0x4037e861:0x3fccfc40 0x4038571a:0x3fccfc60 0x40384337:0x3fccfda0 0x4037669b:0x3fccfdc0 0x403857b9:0x3fccfde0 0x42063d0f:0x3fccfe00 0x420dd6db:0x3fccfe20 0x4204cb1c:0x3fccfe40 0x42063a4d:0x3fccfe60 0x42063a75:0x3fccfe80 0x4206475f:0x3fccfec0 0x4202d69d:0x3fccfee0 0x4202b5e4:0x3fccff00 0x4202b697:0x3fccff20 0x4203483f:0x3fccff40 0x42032e21:0x3fccff60 0x4200dd29:0x3fccffa0 0x4037f755:0x3fcd0010. 06:46:06.845 ->. 06:46:06.845 ->. 06:46:06.845 ->. 06:46:06.845 ->. 06:46:06.845 -> ELF file SHA256: 94e193468. 06:46:06.845 -> . 06:46:07.438 -> Rebooting.... 06:46:07.438 -> ���ESP-ROM:esp32s3-20210327. 06:46:07.438 -> Build:Mar 27 2021. 06:46:07.438 -> rst:0xc (RTC_SW_CPU_RST),boot:0x3b (SPI_FAST_FLASH_BOOT). 06:46:07.438 -> Saved PC:0x4037b0aa. 06:46:07.438 -> SPIWP:0xee. 06:46:07.438 -> mode:DIO, clock div:1. 06:46:07.438 -> load:0x3fce2820,len:0x116c. 06:46:07.469 -> load:0x403c8700,len:0xc2c. 06:46:07.469 -> load:0x403cb700,len:0x3108.)
+
+ESP32_Solar_Thermal_Controller_20260524072124 - Network Dbounce crashed system, see Serial Monitor log in previous line. modified "static const uint32_t NET_DOWN_DEBOUNCE_MS    = 12000; // Increased from 8000". and "static const uint32_t NET_RECOVER_COOLDOWN_MS = 45000; // Increased from 30000" and also lowered "s_netRecoverTask == nullptr" from priority 3 to 1. 
+
+ESP32_Solar_Thermal_Controller_20260525080619 - Inplemented: frontend Ifram queue via javascript so pumpRuntimesIframe and tempLogsIframe loading is no longer parallel. Reverted to Network Debounce recovery from ESP32_Solar_Thermal_Controller_20260521071137 and put recovery task priority back to 3.  
+
+ESP32_Solar_Thermal_Controller_20260526063806 - switched back to test bench. only 10 network disconnects in 22 hours runtime.
+
+ESP32_Solar_Thermal_Controller_20260528070954 - Phase 1 added ability to map temperature sensors to system temperature variables via webpage. provided by chatgpt download. Verified sensors are properly mapping and controlling pump operations. Webpage values for average& raw not following mapped sensor to new location.
+
+ESP32_Solar_Thermal_Controller_20260528080700 - Phase 2 temperature sensor mapping to system temperature variables via webpage. updated Temperature dashboard grid bia WebSocket message (TempSourceMap:...), added reboot button to webpage provided by chatgpt download. Verified both pump operations as well as Temperature Dashboard and now properly mapping.
+
+ESP32_Solar_Thermal_Controller_20260529091957 - 22 hours uptime with no network disconnects while computer was on with dashboard updating continuously but not in use. at hour 22 I began using the computer for other internet usage and over the next 2 hours 8 network disconnect events occurred. Very odd.
+
+ESP32_Solar_Thermal_Controller_20260531085609 - 20 hours uptime with no netwoprk disconnects which computer on with dashboard updating continuously but not in use. New DS18B20 sensor assignments page with bus search with user modifiable fields for sensors. problematic edge cases indentified swapping sensors between bus 1 and 2 as well as when one sensor is assigned to multiple system variables () CSupplyT ). Increased width of center column on FirstWebpage and small column width changes to the Temperatures section.
+ 
+ESP32_Solar_Thermal_Controller_20260613094449 - small changes to DS18B20 page, cosmedic save changes, reassigning System Temperatures accross OneWire Buses is now successful. After 92 hours runtime (Ethernet Disconnected: 23, Ethernet Lost IP: 1, Debounced recoveries: 12, Recovery successful: 12, Gateway test failures: 6, Zombie detections: 2, WebSocket disconnects: 10). then a second run of 53 hours runtime resulted in (Ethernet Disconnected: 35, Debounced recoveries: 18, Recovery successful: 18, Ethernet Lost IP: 1, Gateway test failures: 6, Zombie detections: 2, WebSocket disconnects: 15, DS18B20 runtime error/recovered pairs: 4).  
+
+ESP32_Solar_Thermal_Controller_20260614092600 - Modified file system options under Pump Runtimes/Temperature Logs webpage sections and moved Flash Memory Browser to the Unused Webpage Dashboard section. Resolved directory deletion failure when not empty. Resolved intermittent Temperature Logs download failure and tgz compressor now ignores connection status. This comes with a small caviat that if a network disconnect occurs the compressor will continue to run until the operation is complete even though there is no client to receive the data. 
 
 
 
 Work on this in the future:
+
+General Hardening to implement after Zombie Network Connection is resolved. 
+
+Remove vTaskDelay() and heavy file parsing from Async HTTP callbacks in ThirdWebpage.cpp.
+Stop holding fileSystemMutex for entire streamed /fs/view and /fs/download responses.
+Disable or worker-queue the old /get-log-data route if it is still reachable.
+Protect global cached String stats or convert them to fixed buffers.
+Shorten the temperature mutex hold time so hardware sensor reads happen outside the shared-state lock.
+
+
+
+
+
 in TemperatureLogging.cpp file there are two concerns. 
 1- using realloc, I strongly recommend keeping an eye on your "Heap (Internal RAM)" display on your First Webpage. If you see the "Min Free" value dropping steadily over 
 a 24-hour period, we may need to refactor this to use a fixed-size ring buffer (similar to what we did in TarGZ.cpp) to prevent long-term fragmentation.

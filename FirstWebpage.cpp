@@ -6,7 +6,7 @@
 #include "DiagLog.h"
 
 
-#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260516110516  - "
+#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260614092600 - "
 
 extern AsyncWebServer server;
 
@@ -303,9 +303,29 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       line-height: 1.30 !important;
     }
 
+    .temperatureGridToolbar {
+      margin: 2px 0 6px 0;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
     .temperatureGridWrap {
       overflow-x: auto;
       padding-bottom: 0;
+    }
+
+    #ds18InlineConfigView {
+      display: none;
+      margin-top: 4px;
+    }
+
+    #ds18InlineConfigIframe {
+      display: block;
+      height: 520px;
+      border: 1px solid #999;
+      background: white;
     }
 
     #temperatureGrid {
@@ -362,6 +382,18 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       color: #000000;
     }
 
+    #temperatureSectionTitleLink,
+    #temperatureSectionTitleLink:visited {
+      color: #459;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    #temperatureSectionTitleLink:hover,
+    #temperatureSectionTitleLink:focus {
+      text-decoration: underline;
+    }
+
     #collectorFreezeSensors, #lineFreezeSensors{
   display:inline;
   white-space: normal;
@@ -396,6 +428,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 /* JS will set the height dynamically */
 #pumpRuntimesContainer { height: auto; min-height: 200px; }
 #tempLogsContainer     { height: auto; min-height: 200px; }
+#flashBrowserContainer { height: auto; min-height: 160px; }
 
 
 /* ✅ Call status (left) + Set All Pumps (right) in 2 compact rows */
@@ -450,9 +483,9 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       const style = document.createElement('style');
       style.innerHTML = `
         table { width: 100${p}; }
-        .main-col-left   { width: 40${p}; }
-        .main-col-center { width: 20${p}; min-width: 200px !important; }
-        .main-col-right  { width: 40${p}; }
+        .main-col-left   { width: 37${p}; }
+        .main-col-center { width: 26${p}; min-width: 200px !important; }
+        .main-col-right  { width: 37${p}; }
         .temperatureGridWrap { width: 100${p}; }
         #temperatureGrid { width: 100${p}; }
         .scaledFrame { width: 100${p}; }
@@ -460,11 +493,11 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
         
         #temperatureGrid col:nth-child(1) { width: 22${p}; }
         #temperatureGrid col:nth-child(2) { width: 12${p}; }
-        #temperatureGrid col:nth-child(3) { width: 14${p}; } /* Enlarged Sensor Name */
-        #temperatureGrid col:nth-child(4) { width: 12${p}; }
+        #temperatureGrid col:nth-child(3) { width: 17${p}; } /* Enlarged Sensor Name */
+        #temperatureGrid col:nth-child(4) { width: 13${p}; }
         #temperatureGrid col:nth-child(5) { width: 12${p}; }
-        #temperatureGrid col:nth-child(6) { width: 14${p}; }
-        #temperatureGrid col:nth-child(7) { width: 14${p}; }
+        #temperatureGrid col:nth-child(6) { width: 12${p}; }
+        #temperatureGrid col:nth-child(7) { width: 12${p}; }
       `;
       document.head.appendChild(style);});
   </script>
@@ -557,9 +590,14 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     <tr>
       <td valign="top" id="temperatureGridCell">
         <div id="SectionHeader" class="configContent">
-          <h3>Temperatures</h3>
+          <h3><a id="temperatureSectionTitleLink" href="/ds18b20-config" target="_blank" title="Open the full DS18B20 Sensor Assignments page">Temperatures</a></h3>
 
-          <div class="temperatureGridWrap">
+          <div class="temperatureGridToolbar">
+            <button id="editDs18AssignmentsBtn" class="blue-button" type="button">Edit DS18B20 Assignments</button>
+            <button id="showTemperatureTableBtn" class="blue-button" type="button" style="display:none;">Show Temperatures</button>
+          </div>
+
+          <div class="temperatureGridWrap" id="temperatureTableView">
             <table id="temperatureGrid">
               <colgroup>
                 <col><col><col><col><col><col><col>
@@ -576,22 +614,26 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
                 </tr>
               </thead>
               <tbody>
-                <tr><td class="temp-name">Outside Ambient</td><td class="temp-value"><span id="outsideT">--</span></td><td class="temp-sensor-name">DTemp3</td><td class="temp-value"><span id="DTempAverage3">--</span></td><td class="temp-value"><span id="DTemp3">--</span></td><td class="temp-age" id="outsideLastUpdate">--</td><td class="temp-age" id="outsideLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">600 Gal Storage</td><td class="temp-value"><span id="storageT">--</span></td><td class="temp-sensor-name">DTemp2</td><td class="temp-value"><span id="DTempAverage2">--</span></td><td class="temp-value"><span id="DTemp2">--</span></td><td class="temp-age" id="storageLastUpdate">--</td><td class="temp-age" id="storageLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">Collector Manifold</td><td class="temp-value"><span id="panelT">--</span></td><td class="temp-sensor-name">PT1000</td><td class="temp-value"><span id="pt1000Average">--</span></td><td class="temp-value"><span id="pt1000Current">--</span></td><td class="temp-age" id="panelLastUpdate">--</td><td class="temp-age" id="panelLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">Collector Supply</td><td class="temp-value"><span id="CSupplyT">--</span></td><td class="temp-sensor-name">DTemp1</td><td class="temp-value"><span id="DTempAverage1">--</span></td><td class="temp-value"><span id="DTemp1">--</span></td><td class="temp-age" id="collectorSupplyLastUpdate">--</td><td class="temp-age" id="collectorSupplyLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">Collector Return</td><td class="temp-value"><span id="CreturnT">--</span></td><td class="temp-sensor-name">DTemp6</td><td class="temp-value"><span id="DTempAverage6">--</span></td><td class="temp-value"><span id="DTemp6">--</span></td><td class="temp-age" id="collectorReturnLastUpdate">--</td><td class="temp-age" id="collectorReturnLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">Circ Loop Supply</td><td class="temp-value"><span id="supplyT">--</span></td><td class="temp-sensor-name">DTemp5</td><td class="temp-value"><span id="DTempAverage5">--</span></td><td class="temp-value"><span id="DTemp5">--</span></td><td class="temp-age" id="circSupplyLastUpdate">--</td><td class="temp-age" id="circSupplyLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">Circ Loop Return</td><td class="temp-value"><span id="CircReturnT">--</span></td><td class="temp-sensor-name">DTemp4</td><td class="temp-value"><span id="DTempAverage4">--</span></td><td class="temp-value"><span id="DTemp4">--</span></td><td class="temp-age" id="circReturnLastUpdate">--</td><td class="temp-age" id="circReturnLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">DHW Glycol Supply</td><td class="temp-value"><span id="DhwSupplyT">--</span></td><td class="temp-sensor-name">DTemp7</td><td class="temp-value"><span id="DTempAverage7">--</span></td><td class="temp-value"><span id="DTemp7">--</span></td><td class="temp-age" id="dhwSupplyLastUpdate">--</td><td class="temp-age" id="dhwSupplyLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">DHW Glycol Return</td><td class="temp-value"><span id="DhwReturnT">--</span></td><td class="temp-sensor-name">DTemp8</td><td class="temp-value"><span id="DTempAverage8">--</span></td><td class="temp-value"><span id="DTemp8">--</span></td><td class="temp-age" id="dhwReturnLastUpdate">--</td><td class="temp-age" id="dhwReturnLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">Furnace Glycol Supply</td><td class="temp-value"><span id="HeatingSupplyT">--</span></td><td class="temp-sensor-name">DTemp9</td><td class="temp-value"><span id="DTempAverage9">--</span></td><td class="temp-value"><span id="DTemp9">--</span></td><td class="temp-age" id="heatingSupplyLastUpdate">--</td><td class="temp-age" id="heatingSupplyLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">Furnace Glycol Return</td><td class="temp-value"><span id="HeatingReturnT">--</span></td><td class="temp-sensor-name">DTemp10</td><td class="temp-value"><span id="DTempAverage10">--</span></td><td class="temp-value"><span id="DTemp10">--</span></td><td class="temp-age" id="heatingReturnLastUpdate">--</td><td class="temp-age" id="heatingReturnLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">DHW Pot Exchange In</td><td class="temp-value"><span id="PotHeatXinletT">--</span></td><td class="temp-sensor-name">DTemp12</td><td class="temp-value"><span id="DTempAverage12">--</span></td><td class="temp-value"><span id="DTemp12">--</span></td><td class="temp-age" id="potHxInLastUpdate">--</td><td class="temp-age" id="potHxInLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">DHW Pot Exchange Out</td><td class="temp-value"><span id="PotHeatXoutletT">--</span></td><td class="temp-sensor-name">DTemp13</td><td class="temp-value"><span id="DTempAverage13">--</span></td><td class="temp-value"><span id="DTemp13">--</span></td><td class="temp-age" id="potHxOutLastUpdate">--</td><td class="temp-age" id="potHxOutLastGoodRead">--</td></tr>
-                <tr><td class="temp-name">DHW Pot Inline Heater Out</td><td class="temp-value"><span id="dhwT">--</span></td><td class="temp-sensor-name">DTemp11</td><td class="temp-value"><span id="DTempAverage11">--</span></td><td class="temp-value"><span id="DTemp11">--</span></td><td class="temp-age" id="dhwInlineLastUpdate">--</td><td class="temp-age" id="dhwInlineLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Outside Ambient</td><td class="temp-value"><span id="outsideT">--</span></td><td class="temp-sensor-name"><span id="outsideTSourceName">--</span></td><td class="temp-value"><span id="outsideTSensorAverage">--</span></td><td class="temp-value"><span id="outsideTSensorRaw">--</span></td><td class="temp-age" id="outsideLastUpdate">--</td><td class="temp-age" id="outsideLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">600 Gal Storage</td><td class="temp-value"><span id="storageT">--</span></td><td class="temp-sensor-name"><span id="storageTSourceName">--</span></td><td class="temp-value"><span id="storageTSensorAverage">--</span></td><td class="temp-value"><span id="storageTSensorRaw">--</span></td><td class="temp-age" id="storageLastUpdate">--</td><td class="temp-age" id="storageLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Collector Manifold</td><td class="temp-value"><span id="panelT">--</span></td><td class="temp-sensor-name"><span id="panelTSourceName">--</span></td><td class="temp-value"><span id="panelTSensorAverage">--</span></td><td class="temp-value"><span id="panelTSensorRaw">--</span></td><td class="temp-age" id="panelLastUpdate">--</td><td class="temp-age" id="panelLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Collector Supply</td><td class="temp-value"><span id="CSupplyT">--</span></td><td class="temp-sensor-name"><span id="CSupplyTSourceName">--</span></td><td class="temp-value"><span id="CSupplyTSensorAverage">--</span></td><td class="temp-value"><span id="CSupplyTSensorRaw">--</span></td><td class="temp-age" id="collectorSupplyLastUpdate">--</td><td class="temp-age" id="collectorSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Collector Return</td><td class="temp-value"><span id="CreturnT">--</span></td><td class="temp-sensor-name"><span id="CreturnTSourceName">--</span></td><td class="temp-value"><span id="CreturnTSensorAverage">--</span></td><td class="temp-value"><span id="CreturnTSensorRaw">--</span></td><td class="temp-age" id="collectorReturnLastUpdate">--</td><td class="temp-age" id="collectorReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Circ Loop Supply</td><td class="temp-value"><span id="supplyT">--</span></td><td class="temp-sensor-name"><span id="supplyTSourceName">--</span></td><td class="temp-value"><span id="supplyTSensorAverage">--</span></td><td class="temp-value"><span id="supplyTSensorRaw">--</span></td><td class="temp-age" id="circSupplyLastUpdate">--</td><td class="temp-age" id="circSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Circ Loop Return</td><td class="temp-value"><span id="CircReturnT">--</span></td><td class="temp-sensor-name"><span id="CircReturnTSourceName">--</span></td><td class="temp-value"><span id="CircReturnTSensorAverage">--</span></td><td class="temp-value"><span id="CircReturnTSensorRaw">--</span></td><td class="temp-age" id="circReturnLastUpdate">--</td><td class="temp-age" id="circReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Glycol Supply</td><td class="temp-value"><span id="DhwSupplyT">--</span></td><td class="temp-sensor-name"><span id="DhwSupplyTSourceName">--</span></td><td class="temp-value"><span id="DhwSupplyTSensorAverage">--</span></td><td class="temp-value"><span id="DhwSupplyTSensorRaw">--</span></td><td class="temp-age" id="dhwSupplyLastUpdate">--</td><td class="temp-age" id="dhwSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Glycol Return</td><td class="temp-value"><span id="DhwReturnT">--</span></td><td class="temp-sensor-name"><span id="DhwReturnTSourceName">--</span></td><td class="temp-value"><span id="DhwReturnTSensorAverage">--</span></td><td class="temp-value"><span id="DhwReturnTSensorRaw">--</span></td><td class="temp-age" id="dhwReturnLastUpdate">--</td><td class="temp-age" id="dhwReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Furnace Glycol Supply</td><td class="temp-value"><span id="HeatingSupplyT">--</span></td><td class="temp-sensor-name"><span id="HeatingSupplyTSourceName">--</span></td><td class="temp-value"><span id="HeatingSupplyTSensorAverage">--</span></td><td class="temp-value"><span id="HeatingSupplyTSensorRaw">--</span></td><td class="temp-age" id="heatingSupplyLastUpdate">--</td><td class="temp-age" id="heatingSupplyLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">Furnace Glycol Return</td><td class="temp-value"><span id="HeatingReturnT">--</span></td><td class="temp-sensor-name"><span id="HeatingReturnTSourceName">--</span></td><td class="temp-value"><span id="HeatingReturnTSensorAverage">--</span></td><td class="temp-value"><span id="HeatingReturnTSensorRaw">--</span></td><td class="temp-age" id="heatingReturnLastUpdate">--</td><td class="temp-age" id="heatingReturnLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Pot Exchange In</td><td class="temp-value"><span id="PotHeatXinletT">--</span></td><td class="temp-sensor-name"><span id="PotHeatXinletTSourceName">--</span></td><td class="temp-value"><span id="PotHeatXinletTSensorAverage">--</span></td><td class="temp-value"><span id="PotHeatXinletTSensorRaw">--</span></td><td class="temp-age" id="potHxInLastUpdate">--</td><td class="temp-age" id="potHxInLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Pot Exchange Out</td><td class="temp-value"><span id="PotHeatXoutletT">--</span></td><td class="temp-sensor-name"><span id="PotHeatXoutletTSourceName">--</span></td><td class="temp-value"><span id="PotHeatXoutletTSensorAverage">--</span></td><td class="temp-value"><span id="PotHeatXoutletTSensorRaw">--</span></td><td class="temp-age" id="potHxOutLastUpdate">--</td><td class="temp-age" id="potHxOutLastGoodRead">--</td></tr>
+                <tr><td class="temp-name">DHW Pot Inline Heater Out</td><td class="temp-value"><span id="dhwT">--</span></td><td class="temp-sensor-name"><span id="dhwTSourceName">--</span></td><td class="temp-value"><span id="dhwTSensorAverage">--</span></td><td class="temp-value"><span id="dhwTSensorRaw">--</span></td><td class="temp-age" id="dhwInlineLastUpdate">--</td><td class="temp-age" id="dhwInlineLastGoodRead">--</td></tr>
               </tbody>
             </table>
+          </div>
+
+          <div id="ds18InlineConfigView">
+            <iframe id="ds18InlineConfigIframe" title="DS18B20 Sensor Assignments"></iframe>
           </div>
         </div>
        </td>
@@ -643,15 +685,11 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
 
     <tr>
 
-     <td valign="top" id="configCell">
-            <div id="SectionHeader" class="configContent">
-             <h3>Placeholder Section</h3>
-             <h2>Future Stuff</h2>
-            <div id="emptySectionPlaceholder" style="min-height: 100px; border: 1px dashed #ccc; margin-top: 0px;">
-            </div>
-        
-          </div>
-        </td>
+     <td valign="top" bgcolor="white" align="center">
+        <div class="scaledFrame" id="flashBrowserContainer">
+          <iframe id="flashBrowserIframe" scrolling="no"></iframe>
+        </div>
+      </td>
 
         
       <td valign="top" id="configCell">
@@ -854,6 +892,10 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       const iframe = document.getElementById("pumpRuntimesIframe");
       if (iframe) iframe.style.height = (event.data.height + 10) + "px";
     }
+    else if (event.data.type === "fsBrowserHeight") {
+      const iframe = document.getElementById("flashBrowserIframe");
+      if (iframe) iframe.style.height = (event.data.height + 10) + "px";
+    }
   });
 
 
@@ -963,9 +1005,54 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     // Start WS
     wsConnect();
 
-    // Dynamically set iframes to avoid C++ template parsing lockups
-    document.getElementById('pumpRuntimesIframe').src = "/second-page?ts=" + Date.now();
-    document.getElementById('tempLogsIframe').src = "/third-page?ts=" + Date.now();
+    // TRUE SERIALIZATION: We no longer load IFrames on boot.
+    // They will be safely triggered inside the WebSocket handler below.
+    var iframesLoaded = false;
+
+    function iframeLooksBlank(iframe) {
+      try {
+        if (!iframe || !iframe.contentDocument || !iframe.contentDocument.body) return false;
+        return iframe.contentDocument.body.innerText.trim().length < 8;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function startDashboardIframesSerialized() {
+      if (iframesLoaded) return;
+      iframesLoaded = true;
+
+      setTimeout(function() {
+        var pumpIframe = document.getElementById('pumpRuntimesIframe');
+        var tempIframe = document.getElementById('tempLogsIframe');
+        var flashIframe = document.getElementById('flashBrowserIframe');
+        if (!pumpIframe || !tempIframe) return;
+
+        // Listen for each IFrame to finish, then load the next one.
+        // This keeps the initial dashboard load serialized instead of hammering LittleFS.
+        pumpIframe.addEventListener('load', function() {
+          if (iframeLooksBlank(pumpIframe)) {
+            pumpIframe.src = "/second-page?retry=1&ts=" + Date.now();
+          }
+
+          if (!tempIframe.src || tempIframe.src === window.location.href) {
+            tempIframe.addEventListener('load', function() {
+              if (flashIframe && (!flashIframe.src || flashIframe.src === window.location.href)) {
+                flashIframe.src = "/fs-browser?start=/&title=Flash%20Memory%20Browser&postType=fsBrowserHeight&ts=" + Date.now();
+              }
+            }, { once: true });
+            tempIframe.src = "/third-page?ts=" + Date.now();
+          }
+        }, { once: true });
+
+        // Kick off the first IFrame.
+        pumpIframe.src = "/second-page?ts=" + Date.now();
+      }, 500); // Give the ESP32 a half-second breather before hitting it with HTTP
+    }
+
+    // Failsafe: if the WS initAll message sequence ever stalls, still bring up
+    // the dashboard frames instead of leaving the Pump Runtime section blank.
+    setTimeout(startDashboardIframesSerialized, 8000);
     
     // Fetch version text
     fetch('/api/version')
@@ -1226,36 +1313,85 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     let isTempDrawPending = false;
     let lastWebpageUpdateMs = null;
 
-    const temperatureRowDefinitions = [
-      { lastId: 'outsideLastUpdate',         goodId: 'outsideLastGoodRead',         keys: ['outsideT', 'DTempAverage3',  'DTemp3'],       readKeys: ['DTempGoodAge3'] },
-      { lastId: 'storageLastUpdate',         goodId: 'storageLastGoodRead',         keys: ['storageT', 'DTempAverage2',  'DTemp2'],       readKeys: ['DTempGoodAge2'] },
-      { lastId: 'panelLastUpdate',           goodId: 'panelLastGoodRead',           keys: ['panelT', 'pt1000Average',    'pt1000Current'], readKeys: ['pt1000GoodAge'] },
-      { lastId: 'collectorSupplyLastUpdate', goodId: 'collectorSupplyLastGoodRead', keys: ['CSupplyT', 'DTempAverage1',  'DTemp1'],       readKeys: ['DTempGoodAge1'] },
-      { lastId: 'collectorReturnLastUpdate', goodId: 'collectorReturnLastGoodRead', keys: ['CreturnT', 'DTempAverage6',  'DTemp6'],       readKeys: ['DTempGoodAge6'] },
-      { lastId: 'circSupplyLastUpdate',      goodId: 'circSupplyLastGoodRead',      keys: ['supplyT', 'DTempAverage5',   'DTemp5'],       readKeys: ['DTempGoodAge5'] },
-      { lastId: 'circReturnLastUpdate',      goodId: 'circReturnLastGoodRead',      keys: ['CircReturnT', 'DTempAverage4', 'DTemp4'],      readKeys: ['DTempGoodAge4'] },
-      { lastId: 'dhwSupplyLastUpdate',       goodId: 'dhwSupplyLastGoodRead',       keys: ['DhwSupplyT', 'DTempAverage7', 'DTemp7'],      readKeys: ['DTempGoodAge7'] },
-      { lastId: 'dhwReturnLastUpdate',       goodId: 'dhwReturnLastGoodRead',       keys: ['DhwReturnT', 'DTempAverage8', 'DTemp8'],      readKeys: ['DTempGoodAge8'] },
-      { lastId: 'heatingSupplyLastUpdate',   goodId: 'heatingSupplyLastGoodRead',   keys: ['HeatingSupplyT', 'DTempAverage9',  'DTemp9'],  readKeys: ['DTempGoodAge9'] },
-      { lastId: 'heatingReturnLastUpdate',   goodId: 'heatingReturnLastGoodRead',   keys: ['HeatingReturnT', 'DTempAverage10', 'DTemp10'], readKeys: ['DTempGoodAge10'] },
-      { lastId: 'potHxInLastUpdate',         goodId: 'potHxInLastGoodRead',         keys: ['PotHeatXinletT', 'DTempAverage12',  'DTemp12'], readKeys: ['DTempGoodAge12'] },
-      { lastId: 'potHxOutLastUpdate',        goodId: 'potHxOutLastGoodRead',        keys: ['PotHeatXoutletT', 'DTempAverage13', 'DTemp13'], readKeys: ['DTempGoodAge13'] },
-      { lastId: 'dhwInlineLastUpdate',       goodId: 'dhwInlineLastGoodRead',       keys: ['dhwT', 'DTempAverage11', 'DTemp11'],          readKeys: ['DTempGoodAge11'] }
-    ];
+    const systemTemperatureRows = {
+      outsideT:        { lastId: 'outsideLastUpdate',         goodId: 'outsideLastGoodRead',         sourceId: 'outsideTSourceName',        avgId: 'outsideTSensorAverage',        rawId: 'outsideTSensorRaw' },
+      storageT:        { lastId: 'storageLastUpdate',         goodId: 'storageLastGoodRead',         sourceId: 'storageTSourceName',        avgId: 'storageTSensorAverage',        rawId: 'storageTSensorRaw' },
+      panelT:          { lastId: 'panelLastUpdate',           goodId: 'panelLastGoodRead',           sourceId: 'panelTSourceName',          avgId: 'panelTSensorAverage',          rawId: 'panelTSensorRaw' },
+      CSupplyT:        { lastId: 'collectorSupplyLastUpdate', goodId: 'collectorSupplyLastGoodRead', sourceId: 'CSupplyTSourceName',        avgId: 'CSupplyTSensorAverage',        rawId: 'CSupplyTSensorRaw' },
+      CreturnT:        { lastId: 'collectorReturnLastUpdate', goodId: 'collectorReturnLastGoodRead', sourceId: 'CreturnTSourceName',        avgId: 'CreturnTSensorAverage',        rawId: 'CreturnTSensorRaw' },
+      supplyT:         { lastId: 'circSupplyLastUpdate',      goodId: 'circSupplyLastGoodRead',      sourceId: 'supplyTSourceName',         avgId: 'supplyTSensorAverage',         rawId: 'supplyTSensorRaw' },
+      CircReturnT:     { lastId: 'circReturnLastUpdate',      goodId: 'circReturnLastGoodRead',      sourceId: 'CircReturnTSourceName',     avgId: 'CircReturnTSensorAverage',     rawId: 'CircReturnTSensorRaw' },
+      DhwSupplyT:      { lastId: 'dhwSupplyLastUpdate',       goodId: 'dhwSupplyLastGoodRead',       sourceId: 'DhwSupplyTSourceName',      avgId: 'DhwSupplyTSensorAverage',      rawId: 'DhwSupplyTSensorRaw' },
+      DhwReturnT:      { lastId: 'dhwReturnLastUpdate',       goodId: 'dhwReturnLastGoodRead',       sourceId: 'DhwReturnTSourceName',      avgId: 'DhwReturnTSensorAverage',      rawId: 'DhwReturnTSensorRaw' },
+      HeatingSupplyT:  { lastId: 'heatingSupplyLastUpdate',   goodId: 'heatingSupplyLastGoodRead',   sourceId: 'HeatingSupplyTSourceName',  avgId: 'HeatingSupplyTSensorAverage',  rawId: 'HeatingSupplyTSensorRaw' },
+      HeatingReturnT:  { lastId: 'heatingReturnLastUpdate',   goodId: 'heatingReturnLastGoodRead',   sourceId: 'HeatingReturnTSourceName',  avgId: 'HeatingReturnTSensorAverage',  rawId: 'HeatingReturnTSensorRaw' },
+      PotHeatXinletT:  { lastId: 'potHxInLastUpdate',         goodId: 'potHxInLastGoodRead',         sourceId: 'PotHeatXinletTSourceName',  avgId: 'PotHeatXinletTSensorAverage',  rawId: 'PotHeatXinletTSensorRaw' },
+      PotHeatXoutletT: { lastId: 'potHxOutLastUpdate',        goodId: 'potHxOutLastGoodRead',        sourceId: 'PotHeatXoutletTSourceName', avgId: 'PotHeatXoutletTSensorAverage', rawId: 'PotHeatXoutletTSensorRaw' },
+      dhwT:            { lastId: 'dhwInlineLastUpdate',       goodId: 'dhwInlineLastGoodRead',       sourceId: 'dhwTSourceName',            avgId: 'dhwTSensorAverage',            rawId: 'dhwTSensorRaw' }
+    };
 
+    const defaultSystemTempSourceBindings = {
+      outsideT:        { sourceName: 'DTemp3',  avgKey: 'DTempAverage3',  rawKey: 'DTemp3',       goodKey: 'DTempGoodAge3' },
+      storageT:        { sourceName: 'DTemp2',  avgKey: 'DTempAverage2',  rawKey: 'DTemp2',       goodKey: 'DTempGoodAge2' },
+      panelT:          { sourceName: 'PT1000',  avgKey: 'pt1000Average',  rawKey: 'pt1000Current', goodKey: 'pt1000GoodAge' },
+      CSupplyT:        { sourceName: 'DTemp1',  avgKey: 'DTempAverage1',  rawKey: 'DTemp1',       goodKey: 'DTempGoodAge1' },
+      CreturnT:        { sourceName: 'DTemp6',  avgKey: 'DTempAverage6',  rawKey: 'DTemp6',       goodKey: 'DTempGoodAge6' },
+      supplyT:         { sourceName: 'DTemp5',  avgKey: 'DTempAverage5',  rawKey: 'DTemp5',       goodKey: 'DTempGoodAge5' },
+      CircReturnT:     { sourceName: 'DTemp4',  avgKey: 'DTempAverage4',  rawKey: 'DTemp4',       goodKey: 'DTempGoodAge4' },
+      DhwSupplyT:      { sourceName: 'DTemp7',  avgKey: 'DTempAverage7',  rawKey: 'DTemp7',       goodKey: 'DTempGoodAge7' },
+      DhwReturnT:      { sourceName: 'DTemp8',  avgKey: 'DTempAverage8',  rawKey: 'DTemp8',       goodKey: 'DTempGoodAge8' },
+      HeatingSupplyT:  { sourceName: 'DTemp9',  avgKey: 'DTempAverage9',  rawKey: 'DTemp9',       goodKey: 'DTempGoodAge9' },
+      HeatingReturnT:  { sourceName: 'DTemp10', avgKey: 'DTempAverage10', rawKey: 'DTemp10',      goodKey: 'DTempGoodAge10' },
+      PotHeatXinletT:  { sourceName: 'DTemp12', avgKey: 'DTempAverage12', rawKey: 'DTemp12',      goodKey: 'DTempGoodAge12' },
+      PotHeatXoutletT: { sourceName: 'DTemp13', avgKey: 'DTempAverage13', rawKey: 'DTemp13',      goodKey: 'DTempGoodAge13' },
+      dhwT:            { sourceName: 'DTemp11', avgKey: 'DTempAverage11', rawKey: 'DTemp11',      goodKey: 'DTempGoodAge11' }
+    };
+
+    let systemTempSourceBindings = {};
     const tempKeyToLastUpdateId = {};
-    const sensorGoodAgeKeyToId = {};
+    const sensorGoodAgeKeyToIds = {};
     const tempRowLastUpdateMs = {};
     const tempRowLastGoodReadMs = {};
 
-    temperatureRowDefinitions.forEach(function (row) {
-      row.keys.forEach(function (key) {
-        tempKeyToLastUpdateId[key] = row.lastId;
+    function cloneBinding(binding) {
+      return {
+        sourceName: binding.sourceName || '--',
+        avgKey: binding.avgKey || '',
+        rawKey: binding.rawKey || '',
+        goodKey: binding.goodKey || ''
+      };
+    }
+
+    function getSystemTempBinding(systemTemp) {
+      return systemTempSourceBindings[systemTemp] || defaultSystemTempSourceBindings[systemTemp] || null;
+    }
+
+    function addSensorGoodAgeBinding(goodKey, goodId) {
+      if (!goodKey || !goodId) return;
+      if (!sensorGoodAgeKeyToIds[goodKey]) sensorGoodAgeKeyToIds[goodKey] = [];
+      if (sensorGoodAgeKeyToIds[goodKey].indexOf(goodId) < 0) sensorGoodAgeKeyToIds[goodKey].push(goodId);
+    }
+
+    function rebuildTemperatureSourceBindings() {
+      Object.keys(tempKeyToLastUpdateId).forEach(function (k) { delete tempKeyToLastUpdateId[k]; });
+      Object.keys(sensorGoodAgeKeyToIds).forEach(function (k) { delete sensorGoodAgeKeyToIds[k]; });
+
+      Object.keys(systemTemperatureRows).forEach(function (systemTemp) {
+        var row = systemTemperatureRows[systemTemp];
+        var binding = getSystemTempBinding(systemTemp);
+        if (!row || !binding) return;
+
+        tempKeyToLastUpdateId[systemTemp] = row.lastId;
+        if (binding.avgKey) tempKeyToLastUpdateId[binding.avgKey] = row.lastId;
+        if (binding.rawKey) tempKeyToLastUpdateId[binding.rawKey] = row.lastId;
+        addSensorGoodAgeBinding(binding.goodKey, row.goodId);
       });
-      row.readKeys.forEach(function (key) {
-        sensorGoodAgeKeyToId[key] = row.goodId;
-      });
+    }
+
+    Object.keys(defaultSystemTempSourceBindings).forEach(function (systemTemp) {
+      systemTempSourceBindings[systemTemp] = cloneBinding(defaultSystemTempSourceBindings[systemTemp]);
     });
+    rebuildTemperatureSourceBindings();
 
     function formatElapsedAge(ms) {
       if (!ms) return '--';
@@ -1290,23 +1426,75 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     }
 
     function markSensorGoodReadAge(key, value) {
-      var goodId = sensorGoodAgeKeyToId[key];
-      if (!goodId) return;
+      var goodIds = sensorGoodAgeKeyToIds[key];
+      if (!goodIds || goodIds.length === 0) return;
 
       if (value === 'N/A') {
-        tempRowLastGoodReadMs[goodId] = null;
-        var goodEl = document.getElementById(goodId);
-        if (goodEl) goodEl.textContent = '--';
+        goodIds.forEach(function (goodId) {
+          tempRowLastGoodReadMs[goodId] = null;
+          var goodEl = document.getElementById(goodId);
+          if (goodEl) goodEl.textContent = '--';
+        });
         return;
       }
 
       var ageSeconds = parseInt(value, 10);
       if (isNaN(ageSeconds) || ageSeconds < 0) return;
 
-      tempRowLastGoodReadMs[goodId] = performance.now() - (ageSeconds * 1000);
+      goodIds.forEach(function (goodId) {
+        tempRowLastGoodReadMs[goodId] = performance.now() - (ageSeconds * 1000);
+      });
     }
 
     setInterval(refreshElapsedUpdateCounters, 1000);
+
+    function formatTempCellValue(value) {
+      if (value === undefined || value === null || value === '') return '--';
+      return (value === 'N/A') ? value : value + '°F';
+    }
+
+    function setMappedCellText(id, text) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = text;
+    }
+
+    function refreshMappedSensorCells() {
+      Object.keys(systemTemperatureRows).forEach(function (systemTemp) {
+        var row = systemTemperatureRows[systemTemp];
+        var binding = getSystemTempBinding(systemTemp);
+        if (!row || !binding) return;
+
+        setMappedCellText(row.sourceId, binding.sourceName || '--');
+        setMappedCellText(row.avgId, binding.avgKey ? formatTempCellValue(liveTempState[binding.avgKey]) : '--');
+        setMappedCellText(row.rawId, binding.rawKey ? formatTempCellValue(liveTempState[binding.rawKey]) : '--');
+      });
+    }
+
+    function applyTemperatureSourceMap(payload) {
+      Object.keys(defaultSystemTempSourceBindings).forEach(function (systemTemp) {
+        systemTempSourceBindings[systemTemp] = cloneBinding(defaultSystemTempSourceBindings[systemTemp]);
+      });
+
+      payload.split(',').forEach(function (item) {
+        var parts = item.split('|');
+        if (parts.length < 5) return;
+
+        var systemTemp = parts[0].trim();
+        if (!systemTemperatureRows[systemTemp]) return;
+
+        systemTempSourceBindings[systemTemp] = {
+          sourceName: parts[1].trim() || '--',
+          avgKey: parts[2].trim(),
+          rawKey: parts[3].trim(),
+          goodKey: parts[4].trim()
+        };
+      });
+
+      rebuildTemperatureSourceBindings();
+      refreshMappedSensorCells();
+    }
+
+    refreshMappedSensorCells();
 
     function paintTemperatures() {
       for (let key in changedTempKeys) {
@@ -1318,6 +1506,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
         }
       }
 
+      refreshMappedSensorCells();
       changedTempKeys = {};
       refreshElapsedUpdateCounters();
       isTempDrawPending = false;
@@ -1327,8 +1516,13 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       // Disabled console log to prevent browser console spam on high-frequency UI paints
       // console.log('Processing:', data);
 
+      // -------- TEMPERATURE SOURCE MAP --------
+      if (data.startsWith('TempSourceMap:')) {
+        applyTemperatureSourceMap(data.substring('TempSourceMap:'.length));
+      }
+
       // -------- TEMPERATURES (THROTTLED) --------
-      if (data.startsWith('Temperatures:')) {
+      else if (data.startsWith('Temperatures:')) {
         var tempData = data.substring('Temperatures:'.length).split(',');
         tempData.forEach(function (item) {
           var kv = item.split(':');
@@ -1336,7 +1530,8 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
             var key = kv[0].trim();
             var value = kv.slice(1).join(':').trim();
 
-            if (sensorGoodAgeKeyToId[key]) {
+            if (sensorGoodAgeKeyToIds[key]) {
+              liveTempState[key] = value;
               markSensorGoodReadAge(key, value);
             } else {
               liveTempState[key] = value;
@@ -1350,6 +1545,10 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
           isTempDrawPending = true;
           requestAnimationFrame(paintTemperatures);
         }
+
+        // TRUE SERIALIZATION FIX: Start loading the heavy HTTP IFrames ONLY
+        // after the WS initAll sequence has delivered the temperature payload.
+        startDashboardIframesSerialized();
       }
 
       // -------- CONFIG SAVE RESPONSE --------
@@ -1990,6 +2189,34 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
       });
     }
 
+    const editDs18Btn = document.getElementById('editDs18AssignmentsBtn');
+    const showTempsBtn = document.getElementById('showTemperatureTableBtn');
+    const tempTableView = document.getElementById('temperatureTableView');
+    const ds18InlineView = document.getElementById('ds18InlineConfigView');
+    const ds18InlineIframe = document.getElementById('ds18InlineConfigIframe');
+
+    function showDs18AssignmentEditor() {
+      if (!tempTableView || !ds18InlineView || !ds18InlineIframe) return;
+      tempTableView.style.display = 'none';
+      ds18InlineView.style.display = 'block';
+      if (editDs18Btn) editDs18Btn.style.display = 'none';
+      if (showTempsBtn) showTempsBtn.style.display = 'inline-block';
+      ds18InlineIframe.style.width = '100' + String.fromCharCode(37);
+      if (!ds18InlineIframe.src) {
+        ds18InlineIframe.src = '/ds18b20-config?embedded=1&ts=' + Date.now();
+      }
+    }
+
+    function showTemperatureTable() {
+      if (!tempTableView || !ds18InlineView) return;
+      ds18InlineView.style.display = 'none';
+      tempTableView.style.display = 'block';
+      if (showTempsBtn) showTempsBtn.style.display = 'none';
+      if (editDs18Btn) editDs18Btn.style.display = 'inline-block';
+    }
+
+    if (editDs18Btn) editDs18Btn.addEventListener('click', showDs18AssignmentEditor);
+    if (showTempsBtn) showTempsBtn.addEventListener('click', showTemperatureTable);
     // ==========================================================
     // ✅ AUTO-SCALE IFRAMES TO FIT THEIR CONTENT (NO SCROLLBARS)
     // ==========================================================
@@ -2106,6 +2333,7 @@ const char firstPageHtml[] PROGMEM = R"rawliteral(
     // Increased base width from 640 to 700 to force text onto a single line before scaling down
     setupAutoScaledIframe('pumpRuntimesContainer', 'pumpRuntimesIframe', 2, 700, 220);
     setupAutoScaledIframe('tempLogsContainer', 'tempLogsIframe', 2, 1024, 768);
+    setupAutoScaledIframe('flashBrowserContainer', 'flashBrowserIframe', 2, 900, 260);
 
   }); // end DOMContentLoaded
   </script>

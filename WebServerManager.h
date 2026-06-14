@@ -37,7 +37,6 @@ extern SemaphoreHandle_t g_tempWsPayloadMutex;
 void queueWsBroadcast(const String& message, const String& messageType);
 void TaskWebSocketTransmitter(void* pvParameters);
 
-void setupLogDataRoute();
 void updateAllRuntimes();
 String prepareLogData(int pumpIndex, String timeframe);
 unsigned long aggregateDailyLogsReport(int pumpIndex, DateTime currentTime);

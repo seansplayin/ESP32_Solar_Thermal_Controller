@@ -21,7 +21,7 @@
 #define ETH_PHY_RST  W5500_RST
 
 #ifndef ETH_SPI_FREQ_MHZ
-#define ETH_SPI_FREQ_MHZ 10 // at 15 mhz 92 network disconnects in 20 hours runtime.
+#define ETH_SPI_FREQ_MHZ 10 // at 15 mhz 92 network disconnects in 20 hours runtime. at 10 mhz 47 disconnects in 24 hours.
 #endif
 
 // --- Static IP Configuration ---
@@ -56,6 +56,67 @@ static volatile uint32_t s_lastLinkUpMs   = 0;
 static volatile uint32_t s_lastRecoverMs  = 0;
 static volatile uint32_t s_lastGotIpMs    = 0;
 
+static portMUX_TYPE s_netDiagMux = portMUX_INITIALIZER_UNLOCKED;
+static NetworkDiagnosticsSnapshot s_netDiag = {};
+
+static void recordNetworkEvent(const char* eventText) {
+  uint32_t nowMs = millis();
+  portENTER_CRITICAL(&s_netDiagMux);
+  s_netDiag.lastEventMs = nowMs;
+  strncpy(s_netDiag.lastEvent, eventText ? eventText : "", sizeof(s_netDiag.lastEvent) - 1);
+  s_netDiag.lastEvent[sizeof(s_netDiag.lastEvent) - 1] = '\0';
+  portEXIT_CRITICAL(&s_netDiagMux);
+}
+
+static void recordNetworkIp(const IPAddress& ip) {
+  String ipText = ip.toString();
+  portENTER_CRITICAL(&s_netDiagMux);
+  strncpy(s_netDiag.lastIp, ipText.c_str(), sizeof(s_netDiag.lastIp) - 1);
+  s_netDiag.lastIp[sizeof(s_netDiag.lastIp) - 1] = '\0';
+  portEXIT_CRITICAL(&s_netDiagMux);
+}
+
+static void incrementNetworkCounter(uint32_t* counter) {
+  portENTER_CRITICAL(&s_netDiagMux);
+  (*counter)++;
+  portEXIT_CRITICAL(&s_netDiagMux);
+}
+
+void getNetworkDiagnosticsSnapshot(NetworkDiagnosticsSnapshot* out) {
+  if (!out) return;
+  portENTER_CRITICAL(&s_netDiagMux);
+  *out = s_netDiag;
+  portEXIT_CRITICAL(&s_netDiagMux);
+}
+
+String getNetworkDiagnosticsJson() {
+  NetworkDiagnosticsSnapshot snap;
+  getNetworkDiagnosticsSnapshot(&snap);
+
+  String json = "{";
+  json += "\"ethStartCount\":" + String(snap.ethStartCount);
+  json += ",\"ethConnectedCount\":" + String(snap.ethConnectedCount);
+  json += ",\"ethGotIpCount\":" + String(snap.ethGotIpCount);
+  json += ",\"ethLostIpCount\":" + String(snap.ethLostIpCount);
+  json += ",\"ethDisconnectedCount\":" + String(snap.ethDisconnectedCount);
+  json += ",\"ethStoppedCount\":" + String(snap.ethStoppedCount);
+  json += ",\"gatewayFailCount\":" + String(snap.gatewayFailCount);
+  json += ",\"zombieDetectedCount\":" + String(snap.zombieDetectedCount);
+  json += ",\"recoveryRequestedCount\":" + String(snap.recoveryRequestedCount);
+  json += ",\"recoveryStartedCount\":" + String(snap.recoveryStartedCount);
+  json += ",\"recoverySuccessCount\":" + String(snap.recoverySuccessCount);
+  json += ",\"recoveryFailedCount\":" + String(snap.recoveryFailedCount);
+  json += ",\"lastEventMs\":" + String(snap.lastEventMs);
+  json += ",\"lastEvent\":\"";
+  json += snap.lastEvent;
+  json += "\"";
+  json += ",\"lastIp\":\"";
+  json += snap.lastIp;
+  json += "\"";
+  json += "}";
+  return json;
+}
+
 static const uint32_t NET_DOWN_DEBOUNCE_MS    = 8000; // 8000. After Watchdog spots a crash wait this long to ensure the line is dead before executing the hard reset.
 static const uint32_t NET_RECOVER_COOLDOWN_MS = 30000; // 30000. prevents the ESP32 from getting trapped in an infinite loop of restarting the W5500 if the hardware permanently dies.
 static const uint32_t NET_RECOVER_WAIT_IP_MS  = 30000; // 30000. maximum time the controller will wait for your router to hand out a DHCP address before giving up.
@@ -87,11 +148,21 @@ void TaskNetworkWatchdog(void *pvParameters) {
                 failedAttempts = 0; // Network is healthy
             } else {
                 failedAttempts++;
+                incrementNetworkCounter(&s_netDiag.gatewayFailCount);
+                recordNetworkEvent("Gateway test failed");
                 LOG_ERR("[Watchdog] Gateway test to %s failed! Attempt %d/2\n", activeGateway.toString().c_str(), failedAttempts);
+                AlarmManager_event(ALM_NETWORK_FAULT, ALM_INFO,
+                                   "Gateway test failed: %s attempt %d/2",
+                                   activeGateway.toString().c_str(),
+                                   failedAttempts);
 
                 // Trigger recovery after 2 failures (30 seconds total)
                 if (failedAttempts >= 2) {
+                    incrementNetworkCounter(&s_netDiag.zombieDetectedCount);
+                    recordNetworkEvent("ZOMBIE network detected");
                     LOG_ERR("[Watchdog] 2 consecutive failures. ZOMBIE network detected. Forcing recovery.\n");
+                    AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN,
+                                       "ZOMBIE network detected after gateway failures");
                     failedAttempts = 0;
                     
                     // CRITICAL FIX: Actively tear down the network state
@@ -131,6 +202,8 @@ static void requestNetworkRecovery() {
   }
 
   s_netRecoverPending = true;
+  incrementNetworkCounter(&s_netDiag.recoveryRequestedCount);
+  recordNetworkEvent("Network recovery requested");
 
   if (s_netRecoverTask != nullptr) {
     xTaskNotifyGive(s_netRecoverTask);
@@ -177,7 +250,11 @@ static void NetworkRecoveryTask(void* pvParameters) {
       s_lastRecoverMs = now;
       s_ethRestartInProgress = true;
 
+      incrementNetworkCounter(&s_netDiag.recoveryStartedCount);
+      recordNetworkEvent("Debounced recovery started");
       LOG_ERR("[Network] Debounced recovery: restarting W5500 / ETH stack\n");
+      AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN,
+                         "Debounced recovery: restarting W5500 / ETH stack");
       eth_link_up = false;
       eth_connected = false;
 
@@ -215,6 +292,8 @@ static void NetworkRecoveryTask(void* pvParameters) {
 
       if (!ethStarted) {
         s_ethRestartInProgress = false;
+        incrementNetworkCounter(&s_netDiag.recoveryFailedCount);
+        recordNetworkEvent("Recovery ETH.begin failed");
         LOG_ERR("[Network] Recovery ETH.begin failed\n");
         AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet recovery ETH.begin failed");
         break;
@@ -226,9 +305,17 @@ static void NetworkRecoveryTask(void* pvParameters) {
       }
 
       if (eth_connected && ETH.localIP() != IPAddress(0, 0, 0, 0)) {
+        incrementNetworkCounter(&s_netDiag.recoverySuccessCount);
+        recordNetworkEvent("Recovery successful");
+        recordNetworkIp(ETH.localIP());
         LOG_CAT(DBG_NET, "[Network] Recovery successful. IP: %s\n",
                 ETH.localIP().toString().c_str());
+        AlarmManager_event(ALM_NETWORK_FAULT, ALM_INFO,
+                           "Ethernet recovery successful: %s",
+                           ETH.localIP().toString().c_str());
       } else {
+        incrementNetworkCounter(&s_netDiag.recoveryFailedCount);
+        recordNetworkEvent("Recovery timed out waiting for IP");
         LOG_ERR("[Network] Recovery timed out waiting for IP\n");
         AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet recovery timed out waiting for IP");
       }
@@ -244,17 +331,24 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
+      incrementNetworkCounter(&s_netDiag.ethStartCount);
+      recordNetworkEvent("Ethernet Started");
       LOG_CAT(DBG_NET, "[Network] Ethernet Started\n");
       ETH.setHostname("esp32s3-solar");
       break;
 
         case ARDUINO_EVENT_ETH_CONNECTED:
+      incrementNetworkCounter(&s_netDiag.ethConnectedCount);
+      recordNetworkEvent("Ethernet Connected");
       LOG_CAT(DBG_NET, "[Network] Ethernet Connected\n");
       eth_link_up = true;
       s_lastLinkUpMs = millis();
       break;
 
     case ARDUINO_EVENT_ETH_GOT_IP:
+      incrementNetworkCounter(&s_netDiag.ethGotIpCount);
+      recordNetworkEvent("Ethernet Got IP");
+      recordNetworkIp(ETH.localIP());
       LOG_CAT(DBG_NET, "[Network] Ethernet Got IP: %s\n", ETH.localIP().toString().c_str());
       eth_link_up = true;
       eth_connected = true;
@@ -264,7 +358,10 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
       break;
 
     case ARDUINO_EVENT_ETH_LOST_IP:
+      incrementNetworkCounter(&s_netDiag.ethLostIpCount);
+      recordNetworkEvent("Ethernet Lost IP");
       LOG_ERR("[Network] Ethernet Lost IP\n");
+      AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet Lost IP");
       // IMPORTANT:
       // Keep link_up true here. LOST_IP is not the same as PHY/link-down.
       // Start a grace period for DHCP/IP recovery before allowing a hard restart.
@@ -276,7 +373,10 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
       break;
 
     case ARDUINO_EVENT_ETH_DISCONNECTED:
+      incrementNetworkCounter(&s_netDiag.ethDisconnectedCount);
+      recordNetworkEvent("Ethernet Disconnected");
       LOG_ERR("[Network] Ethernet Disconnected\n");
+      AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet Disconnected");
       eth_link_up = false;
       eth_connected = false;
       s_lastLinkDownMs = millis();
@@ -286,7 +386,10 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
       break;
 
     case ARDUINO_EVENT_ETH_STOP:
+      incrementNetworkCounter(&s_netDiag.ethStoppedCount);
+      recordNetworkEvent("Ethernet Stopped");
       LOG_ERR("[Network] Ethernet Stopped\n");
+      AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet Stopped");
       eth_link_up = false;
       eth_connected = false;
       s_lastLinkDownMs = millis();

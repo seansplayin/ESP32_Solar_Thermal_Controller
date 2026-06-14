@@ -1,5 +1,6 @@
 // MemoryStats.h
 #pragma once
+
 #include <Arduino.h>
 
 // Live reads
@@ -7,9 +8,6 @@ String getHeapInternalString();
 String getPsramString();
 
 // Cached strings for UI / websocket use
-extern String g_cachedHeapStatsString;
-extern String g_cachedPsramStatsString;
-
 void updateHeapStatsCache();
 void updatePsramStatsCache();
 

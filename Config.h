@@ -68,7 +68,46 @@
      #ifndef TIME_CONFIG_PATH
      #define TIME_CONFIG_PATH        "/Json_Config_Files/time_config.json"
      #endif
+     #ifndef DS18B20_CONFIG_PATH
+     #define DS18B20_CONFIG_PATH     "/Json_Config_Files/ds18b20_config.json"
+     #endif
  // -----------------------------------------------------------------------
+
+
+
+  // -----------------------------------------------------------------------
+   // DS18B20 Runtime Assignment Config
+   // -----------------------------------------------------------------------
+   constexpr uint8_t DS18B20_ASSIGNMENT_COUNT = 13;
+   constexpr uint8_t DS18B20_SYSTEM_TEMP_NAME_LEN = 24;
+
+   struct Ds18B20SensorAssignment {
+     uint64_t rom;
+     char     systemTemp[DS18B20_SYSTEM_TEMP_NAME_LEN];
+     uint8_t  bus;       // 1 = ONE_WIRE_BUS_1, 2 = ONE_WIRE_BUS_2
+     bool     enabled;
+     float    offsetF;
+   };
+
+   struct Ds18B20Config {
+     uint8_t version;
+     Ds18B20SensorAssignment assignments[DS18B20_ASSIGNMENT_COUNT];
+   };
+
+   extern Ds18B20Config g_ds18b20Config;
+
+   void initDs18B20ConfigDefaults();
+   bool loadDs18B20ConfigFromFS();
+   bool saveDs18B20ConfigToFS();
+   bool resetDs18B20ConfigToDefaults();
+
+   bool isValidSystemTempName(const char* systemTemp);
+   int  findDs18B20AssignmentByRom(uint64_t rom);
+   int  findDs18B20AssignmentBySystemTemp(const char* systemTemp);
+   String ds18b20RomToString(uint64_t rom);
+   bool parseDs18b20RomString(const char* text, uint64_t& romOut);
+   void applyConfiguredSystemTemperatureAssignments();
+  // -----------------------------------------------------------------------
 
 
 
@@ -199,7 +238,7 @@
    // -----------------------------------------------------------------------
    inline constexpr float DEFAULT_PanelOnDifferential     = 30.0f;
    inline constexpr float DEFAULT_PanelLowDifferential    = 15.0f;
-   inline constexpr float DEFAULT_PanelOffDifferential    = 5.0f;
+   inline constexpr float DEFAULT_PanelOffDifferential    = 2.0f;
    inline constexpr float DEFAULT_panelTminimum           = 125.0f;
    inline constexpr float DEFAULT_StorageHeatingLimit     = 130.0f;
    inline constexpr float DEFAULT_Circ_Pump_On            = 5.0f;  // 5.0f
@@ -215,7 +254,7 @@
   // -----------------------------------------------------------------------
    // ***** Pump Mode Change Rate Limiting Interval *****
    // -----------------------------------------------------------------------
-   const unsigned long LEAD_RELAY_CHANGE_INTERVAL = 600000; // 10 minutes
+   const unsigned long LEAD_RELAY_CHANGE_INTERVAL = 300000; // 5 minutes
    const unsigned long LAG_RELAY_CHANGE_INTERVAL = 5000; // 5 second
    const unsigned long HEAT_TAPE_RELAY_CHANGE_INTERVAL = 1000; // 1 second
    const unsigned long CIRC_RELAY_CHANGE_INTERVAL = 1000; // 1 second

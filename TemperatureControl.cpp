@@ -53,24 +53,9 @@ float prev_dhwT = NAN;
 float prev_PotHeatXinletT = NAN;
 float prev_PotHeatXoutletT = NAN;
 
-// Function to update temperature readings. Associate system temperature to a specific temperature sensor
+// Function to update temperature readings. Associate system temperatures to their configured sources.
 void updateTemperatureReadings() {
-    
-
-    panelT          = pt1000Average;      // PT1000
-    CSupplyT        = DTempAverage[0];    // DTemp1
-    storageT        = DTempAverage[1];    // DTemp2
-    outsideT        = DTempAverage[2];    // DTemp3
-    supplyT         = DTempAverage[4];    // DTemp5
-    CircReturnT     = DTempAverage[3];    // DTemp4
-    CreturnT        = DTempAverage[5];    // DTemp6
-    DhwSupplyT      = DTempAverage[6];    // DTemp7
-    DhwReturnT      = DTempAverage[7];    // DTemp8
-    HeatingSupplyT  = DTempAverage[8];    // DTemp9
-    HeatingReturnT  = DTempAverage[9];    // DTemp10
-    dhwT            = DTempAverage[10];   // DTemp11
-    PotHeatXinletT  = DTempAverage[11];   // DTemp12
-    PotHeatXoutletT = DTempAverage[12];   // DTemp13
+    applyConfiguredSystemTemperatureAssignments();
 }
 
 

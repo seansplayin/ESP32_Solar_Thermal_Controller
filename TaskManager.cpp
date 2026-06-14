@@ -294,6 +294,17 @@ void TaskLoadSystemConfigFromFS(void *pvParameters) {
     LOG_CAT(DBG_CONFIG, "[Config] No diag serial config at %s; using Config.h defaults.\n", DIAG_SERIAL_CONFIG_PATH);
   }
 
+  // DS18B20 assignment config is created with defaults if missing so the
+  // webpage/API has a real file to edit later.
+  if (loadDs18B20ConfigFromFS()) {
+    LOG_CAT(DBG_CONFIG, "[DS18B20Config] Loaded DS18B20 assignment config from %s\n", DS18B20_CONFIG_PATH);
+  } else {
+    LOG_CAT(DBG_CONFIG, "[DS18B20Config] No valid config at %s; saving defaults.\n", DS18B20_CONFIG_PATH);
+    saveDs18B20ConfigToFS();
+  }
+
+  initDS18B20Sensors();
+
   xTaskNotifyGive(thSetupNetwork);
   vTaskDelete(NULL);
 }
@@ -381,7 +392,9 @@ void TaskSetupThirdPage(void *pvParameters) {
 
 void TaskSetupLogDataRoute(void *pvParameters) {
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  setupLogDataRoute();
+
+  // Legacy /get-log-data route removed.
+  // Keep this task only to preserve the existing boot notification chain.
   xTaskNotifyGive(threfreshCurrentTime);
   vTaskDelete(NULL);
 }
@@ -414,6 +427,11 @@ void TaskUpdateTemperatures(void *pvParameters) {
     for (;;) {
         // 2. CRITICAL: Pet the watchdog so the ESP32 doesn't reboot!
         esp_task_wdt_reset(); 
+
+        if (!ds18B20SensorsReady()) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
 
         // 3. Read the physical hardware (DS18B20s, PT1000)
         updateTemperatures(); 

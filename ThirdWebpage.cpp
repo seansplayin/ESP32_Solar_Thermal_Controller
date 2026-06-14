@@ -35,12 +35,61 @@ static void finishFsLockedStream(FsLockedStreamSession *s) {
   xSemaphoreGive(fileSystemMutex);
 }
 
+// Normalize LittleFS paths used by the browser/delete routes.
+static String normalizeFsPath(String path, bool wantDir) {
+  path.trim();
+  if (path.length() == 0) path = "/";
+  if (!path.startsWith("/")) path = "/" + path;
+
+  // Collapse trailing slashes except for root.  LittleFS.rmdir() is
+  // noticeably less forgiving about "/folder/" than "/folder" on some builds.
+  while (path.length() > 1 && path.endsWith("/")) {
+    path.remove(path.length() - 1);
+  }
+
+  if (wantDir && path != "/") path += "/";
+  return path;
+}
+
+static bool jsonListAlreadyHasName(JsonArray arr, const String& name) {
+  for (JsonObject obj : arr) {
+    const char* n = obj["name"] | "";
+    if (name == n) return true;
+  }
+  return false;
+}
+
+static String directChildPathFromEntryName(const String& parentNoTrailingSlash, const String& entryName) {
+  String parent = parentNoTrailingSlash;
+  if (parent.length() == 0) parent = "/";
+  while (parent.length() > 1 && parent.endsWith("/")) parent.remove(parent.length() - 1);
+
+  String full = entryName;
+  if (!full.startsWith("/")) {
+    full = (parent == "/") ? ("/" + full) : (parent + "/" + full);
+  }
+
+  String prefix = (parent == "/") ? "/" : (parent + "/");
+  if (!full.startsWith(prefix)) return full;
+
+  String rel = full.substring(prefix.length());
+  if (rel.length() == 0) return full;
+
+  int slash = rel.indexOf('/');
+  if (slash < 0) return full;
+
+  String firstSegment = rel.substring(0, slash);
+  return prefix + firstSegment;
+}
+
 // Recursive delete helper (caller must hold fileSystemMutex!)
-static bool deletePathRecursiveUnlocked(const String &path) {
+static bool deletePathRecursiveUnlocked(String path) {
+  path = normalizeFsPath(path, false);
+
   // Never allow deleting root
   if (path == "/") return false;
 
-  File node = LittleFS.open(path);
+  File node = LittleFS.open(path, "r");
   if (!node) {
     // If it doesn't exist, treat as "already gone"
     return !LittleFS.exists(path);
@@ -53,34 +102,45 @@ static bool deletePathRecursiveUnlocked(const String &path) {
     return LittleFS.remove(path);
   }
 
-  // Directory: delete children first
-  File dir = LittleFS.open(path);
-  if (!dir || !dir.isDirectory()) {
-    if (dir) dir.close();
-    // last-ditch attempt
-    return LittleFS.rmdir(path) || LittleFS.remove(path);
-  }
-
   bool ok = true;
-  File entry = dir.openNextFile();
-  while (entry) {
-    String childPath = String(entry.name());  // full path
-    bool childIsDir = entry.isDirectory();
-    entry.close();
 
-    if (childIsDir) {
-      ok = deletePathRecursiveUnlocked(childPath) && ok;
-    } else {
-      ok = LittleFS.remove(childPath) && ok;
+  // Delete one child per pass, then reopen the directory.  This is more robust
+  // on LittleFS when deleting while iterating and also handles builds where
+  // openNextFile() returns recursive names instead of direct children only.
+  for (;;) {
+    File dir = LittleFS.open(path, "r");
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
+      break;
     }
 
-    // Safety valve: Guaranteed 2ms gap between every file removal
-    vTaskDelay(pdMS_TO_TICKS(2)); 
-    entry = dir.openNextFile();
-  }
-  dir.close();
+    String childToDelete;
+    File entry = dir.openNextFile();
+    while (entry) {
+      String entryName = String(entry.name());
+      entry.close();
 
-  ok = (LittleFS.rmdir(path) || LittleFS.remove(path)) && ok;
+      String childPath = directChildPathFromEntryName(path, entryName);
+      childPath = normalizeFsPath(childPath, false);
+
+      if (childPath.length() > 1 && childPath != path) {
+        childToDelete = childPath;
+        break;
+      }
+
+      entry = dir.openNextFile();
+    }
+    dir.close();
+
+    if (childToDelete.length() == 0) break;
+
+    ok = deletePathRecursiveUnlocked(childToDelete) && ok;
+
+    // Safety valve: Guaranteed 2ms gap between every file/folder removal pass.
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+
+  ok = LittleFS.rmdir(path) && ok;
   return ok;
 }
 
@@ -216,53 +276,65 @@ static const char *thirdPageHtml = R"rawliteral(
       }    
 
     #fileBrowser {
-      margin: 20px auto 0;
-      border: 1px solid #ccc;
-      padding: 10px;
+      margin: 8px auto 0;
+      border: 1px solid #b8c7d9;
+      background: #fbfdff;
+      padding: 8px;
       display: none;
-      width: fit-content;
+      width: 100%;
+      max-width: 980px;
+      text-align: left;
       }
 
-    #fileBrowser ul {
-      list-style-type: none;
-      padding: 0;
-      margin: 0;
+    #fileBrowser .browserHeader {
+      text-align: center;
+      color: #459;
+      font-weight: bold;
+      margin-bottom: 4px;
     }
 
-    #fileBrowser li {
-      padding: 5px;
+    #fileBrowser .browserToolbar {
+      text-align: center;
+      margin-bottom: 5px;
+    }
+
+    #fileBrowser .browserPath {
+      text-align: center;
+      font-size: 12px;
+      color: purple;
+      margin: 3px 0 5px 0;
+      overflow-wrap: anywhere;
+    }
+
+    #fileBrowser .browserRow {
       display: flex;
       align-items: center;
-    }
-
-    #fileBrowser li.dir {
-      font-weight: bold;
-      color: #0066cc;
-      cursor: pointer;
-    }
-
-    #fileBrowser li.file {
-      color: blue;
-      cursor: pointer;
-    }
-
-    #fileBrowser li.file span:hover {
-      text-decoration: underline;
-    }
-
-    #fileBrowser button {
-      margin-left: 10px;
+      gap: 6px;
+      padding: 3px 0;
       font-size: 12px;
-      padding: 3px 6px;
+      border-bottom: 1px solid #eef4fb;
     }
 
-    #fileContent {
-      white-space: pre-wrap;
-      background: #f8f8f8;
-      padding: 10px;
-      margin-top: 10px;
-      border: 1px solid #ccc;
-      display: none;
+    #fileBrowser .browserRow:last-child { border-bottom: 0; }
+
+    #fileBrowser .browserRow .name {
+      flex: 1 1 auto;
+      overflow-wrap: anywhere;
+      cursor: pointer;
+    }
+
+    #fileBrowser .browserRow.dir .name {
+      color: #0066cc;
+      font-weight: bold;
+    }
+
+    #fileBrowser .browserRow.file .name { color: blue; }
+
+    #fileBrowser .emptyNote {
+      text-align: center;
+      color: #777;
+      font-size: 12px;
+      padding: 8px;
     }
 
     #tooltip {
@@ -282,7 +354,7 @@ static const char *thirdPageHtml = R"rawliteral(
   <div id="pageWrap">
 
     <h3 class="top-heading">
-      <a id="temperatureLogsLink" target="_blank">Temperature Logs</a>
+      <a id="temperatureLogsLink" target="_blank" title="Open the full Temperature Logs page">Temperature Logs</a>
     </h3>
 
     <div id="controlsRow">
@@ -300,20 +372,11 @@ static const char *thirdPageHtml = R"rawliteral(
       <div id="tooltip"></div>
     </div>
 
-    <button id="browserToggleBtn" class="blue-button">Flash Memory Browser</button>
+    <button id="browserToggleBtn" class="blue-button">View Temperature Logs</button>
+    <button id="downloadSelectedTempLogsBtn" class="blue-button" style="display:none;">Download Selected</button>
+    <button id="downloadAllTempLogsBtn" class="blue-button" style="display:none;">Download All</button>
 
-    <div id="fileBrowser">
-    <h4>Flash Memory Browser</h4>
-    <button onclick="navigate('/')">Root</button>
-    <button onclick="goUp()">.. (Up)</button>
-    <button onclick="document.getElementById('uploadInput').click()">Upload to Current</button>
-    <input type="file" id="uploadInput" style="display:none;" onchange="uploadFile(this.files)">
-    <button onclick="createFolder()">Create Folder</button>
-    <p>Current path: <span id="currentPath">/</span></p>
-    <ul id="fileList"></ul>
-    <div id="fileContent"></div>
-  
-  </div>
+    <div id="fileBrowser"></div>
 
   </div> 
 
@@ -323,7 +386,8 @@ static const char *thirdPageHtml = R"rawliteral(
 
 
 
-let currentPath = '/';
+const tempLogRoot = '/Temperature_Logs/';
+let tempLogCurrentPath = tempLogRoot;
 
 let lastPostedHeight = 0;
 
@@ -749,23 +813,39 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
 
-  // Toggle flash browser
+  // Toggle scoped Temperature_Logs browser
   const browserBtn = document.getElementById('browserToggleBtn');
+  const selectedBtn = document.getElementById('downloadSelectedTempLogsBtn');
+  const allBtn = document.getElementById('downloadAllTempLogsBtn');
   if (browserBtn) {
-  browserBtn.addEventListener('click', () => {
-    const fb = document.getElementById('fileBrowser');
-    if (!fb) return;
+    browserBtn.addEventListener('click', () => {
+      const fb = document.getElementById('fileBrowser');
+      if (!fb) return;
 
-    if (fb.style.display === 'none' || fb.style.display === '') {
-  fb.style.display = 'block';
-  listFiles(currentPath); // listFiles() will post the height after it renders
-} else {
-  fb.style.display = 'none';
-  requestAnimationFrame(() => requestAnimationFrame(postHeightToParent));
-}
+      const opening = (fb.style.display === 'none' || fb.style.display === '');
+      if (opening) {
+        fb.style.display = 'block';
+        if (selectedBtn) selectedBtn.style.display = 'inline';
+        if (allBtn) allBtn.style.display = 'inline';
+        tempLogCurrentPath = tempLogRoot;
+        listTemperatureLogFiles();
+      } else {
+        fb.style.display = 'none';
+        if (selectedBtn) selectedBtn.style.display = 'none';
+        if (allBtn) allBtn.style.display = 'none';
+        requestAnimationFrame(() => requestAnimationFrame(postHeightToParent));
+      }
+    });
+  }
 
-  });
-}
+  if (selectedBtn) {
+    selectedBtn.addEventListener('click', downloadSelectedTemperatureLogs);
+  }
+  if (allBtn) {
+    allBtn.addEventListener('click', () => {
+      window.open('/fs/download_compressed?dir=' + encodeURIComponent('/Temperature_Logs'), '_blank');
+    });
+  }
 
 
 
@@ -787,132 +867,297 @@ function checkAndLoadGraph() {
   if (sensor && day) loadGraph();
 }
 
-// === LittleFS Browser Functions ===
-async function listFiles(path) {
-  const r = await fetch(`/fs/list?dir=${encodeURIComponent(path)}`);
-  const data = await r.json();
-  const list = document.getElementById('fileList');
-  list.innerHTML = '';
-  data.forEach(item => {
-    const li = document.createElement('li');
-    li.className = item.isDir ? 'dir' : 'file';
+// === Scoped Temperature_Logs Browser Functions ===
+function normalizeTempLogDir(path) {
+  if (!path || path[0] !== '/') path = '/' + (path || '');
+  if (!path.endsWith('/')) path += '/';
+  if (!path.startsWith(tempLogRoot)) path = tempLogRoot;
+  return path;
+}
 
-    const nameSpan = document.createElement('span');
-    nameSpan.textContent = item.name;
-    if (item.isDir) {
-      nameSpan.onclick = () => navigate(path + item.name + '/');
-    } else {
-      nameSpan.onclick = () => viewFile(path + item.name);
-    }
-    li.appendChild(nameSpan);
+function tempLogJoin(path, name, isDir) {
+  const base = normalizeTempLogDir(path);
+  return base + name + (isDir ? '/' : '');
+}
 
-    if (item.isDir) {
-      // Download Compressed button for directories
-      const compDlBtn = document.createElement('button');
-            compDlBtn.textContent = 'Download Compressed';
-      compDlBtn.onclick = (e) => {
-        e.stopPropagation();
-        window.open(
-          `/fs/download_compressed?dir=${encodeURIComponent(path + item.name)}`,
-          '_blank'
-        );
-      };
-      li.appendChild(compDlBtn);
-    } else {
+function tempLogCanGoUp() {
+  return tempLogCurrentPath !== tempLogRoot;
+}
 
-      // Download button for files
-      const dlBtn = document.createElement('button');
-      dlBtn.textContent = 'Download';
-      dlBtn.onclick = (e) => {
-        e.stopPropagation();
-        window.open(
-          `/fs/download?path=${encodeURIComponent(path + item.name)}`,
-          '_blank'
-        );
-      };
-      li.appendChild(dlBtn);
-    }
+async function listTemperatureLogFiles() {
+  const list = document.getElementById('fileBrowser');
+  list.innerHTML = '<div class="emptyNote">Loading temperature logs...</div>';
 
-    // Delete button
-    const delBtn = document.createElement('button');
-    delBtn.textContent = 'Delete';
-    delBtn.onclick = (e) => {
-      e.stopPropagation();
-      if (confirm(`Delete ${item.name}?`)) {
-        fetch(`/fs/delete?path=${encodeURIComponent(path + item.name)}`, {
-          method: 'DELETE'
-        }).then(() => listFiles(path));
-      }
+  try {
+    const r = await fetch(`/fs/list?dir=${encodeURIComponent(tempLogCurrentPath)}&ts=${Date.now()}`, { cache: 'no-store' });
+    const items = await r.json();
+    list.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.className = 'browserHeader';
+    header.textContent = 'Temperature Logs';
+    list.appendChild(header);
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'browserToolbar';
+
+    const rootBtn = document.createElement('button');
+    rootBtn.className = 'blue-button';
+    rootBtn.textContent = 'Temperature Logs Root';
+    rootBtn.onclick = () => { tempLogCurrentPath = tempLogRoot; listTemperatureLogFiles(); };
+    toolbar.appendChild(rootBtn);
+
+    const upBtn = document.createElement('button');
+    upBtn.className = 'blue-button';
+    upBtn.textContent = '.. (Up)';
+    upBtn.disabled = !tempLogCanGoUp();
+    upBtn.onclick = () => {
+      if (!tempLogCanGoUp()) return;
+      tempLogCurrentPath = tempLogCurrentPath.substring(0, tempLogCurrentPath.lastIndexOf('/', tempLogCurrentPath.length - 2) + 1);
+      tempLogCurrentPath = normalizeTempLogDir(tempLogCurrentPath);
+      listTemperatureLogFiles();
     };
-    li.appendChild(delBtn);
+    toolbar.appendChild(upBtn);
+    list.appendChild(toolbar);
 
-    list.appendChild(li);
-  });
-    document.getElementById('currentPath').textContent = path;
+    const pathLine = document.createElement('div');
+    pathLine.className = 'browserPath';
+    pathLine.textContent = 'Current path: ' + tempLogCurrentPath;
+    list.appendChild(pathLine);
 
-  // If browser is visible, update iframe height after DOM updates
-  const fb = document.getElementById('fileBrowser');
-  if (fb && fb.style.display === 'block') {
-    setTimeout(postHeightToParent, 50);
+    if (!Array.isArray(items) || items.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'emptyNote';
+      empty.textContent = 'No temperature logs found.';
+      list.appendChild(empty);
+      setTimeout(postHeightToParent, 50);
+      return;
+    }
+
+    items.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'browserRow ' + (item.isDir ? 'dir' : 'file');
+      const fullPath = tempLogJoin(tempLogCurrentPath, item.name, item.isDir);
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = fullPath;
+      checkbox.dataset.isdir = item.isDir ? '1' : '0';
+      row.appendChild(checkbox);
+
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = (item.isDir ? '[DIR] ' : '') + item.name;
+      name.onclick = () => {
+        if (item.isDir) {
+          tempLogCurrentPath = fullPath;
+          listTemperatureLogFiles();
+        }
+      };
+      row.appendChild(name);
+
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'blue-button';
+      dlBtn.textContent = item.isDir ? 'Download .tar.gz' : 'Download';
+      dlBtn.onclick = () => {
+        const endpoint = item.isDir ? '/fs/download_compressed?dir=' : '/fs/download?path=';
+        window.open(endpoint + encodeURIComponent(fullPath), '_blank');
+      };
+      row.appendChild(dlBtn);
+
+      list.appendChild(row);
+    });
+  } catch (e) {
+    list.innerHTML = '<div class="emptyNote">Failed to list temperature logs.</div>';
+    console.log(e);
   }
-}
 
-
-function navigate(path) {
-  currentPath = path;
-  listFiles(path);
-}
-
-function goUp() {
-  if (currentPath === '/') return;
-  currentPath = currentPath.substring(
-    0,
-    currentPath.lastIndexOf('/', currentPath.length - 2) + 1
-  );
-  listFiles(currentPath);
-}
-
-async function viewFile(path) {
-  const r = await fetch(`/fs/view?path=${encodeURIComponent(path)}`);
-  const text = await r.text();
-  const content = document.getElementById('fileContent');
-  content.textContent = text;
-  content.style.display = 'block';
   setTimeout(postHeightToParent, 50);
 }
 
-function uploadFile(files) {
-  if (!files.length) return;
-  const file = files[0];
-  const form = new FormData();
-  form.append('file', file);
-  fetch(`/fs/upload?dir=${encodeURIComponent(currentPath)}`, {
-    method: 'POST',
-    body: form
-  }).then(() => {
-    listFiles(currentPath);
+function downloadSelectedTemperatureLogs() {
+  const selected = document.querySelectorAll('#fileBrowser input[type="checkbox"]:checked');
+  selected.forEach(checkbox => {
+    const endpoint = checkbox.dataset.isdir === '1' ? '/fs/download_compressed?dir=' : '/fs/download?path=';
+    window.open(endpoint + encodeURIComponent(checkbox.value), '_blank');
   });
 }
 
-function createFolder() {
-  const name = prompt("New folder name:");
-  if (!name) return;
-  fetch(`/fs/mkdir?path=${encodeURIComponent(currentPath + name)}`, {
-    method: 'POST'
-  }).then(() => listFiles(currentPath));
-}
-
-// Initial load (hidden browser populated)
-listFiles(currentPath);
   </script>
 </body>
 </html>
 )rawliteral";
 
 
+
+static const char *fsBrowserHtml = R"rawliteral(
+<!doctype html>
+<html>
+<head>
+  <link rel="icon" href="/static/favicon.png">
+  <title>Flash Memory Browser</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html, body { margin:0; padding:0; overflow-x:hidden; }
+    *, *::before, *::after { box-sizing:border-box; }
+    body { font-family: Arial, sans-serif; background:white; text-align:center; font-size:13px; }
+    #pageWrap { max-width: 1000px; margin: 0 auto; padding: 4px 8px 10px; }
+    h3 { color:#459; font-size:26px; line-height:1.1; margin:2px 0 6px; }
+    .blue-button { background:white; color:blue; padding:0 4px; font-size:14px; cursor:pointer; border:1px solid blue; border-radius:3px; margin:1px; }
+    .blue-button:hover { background:darkblue; color:white; }
+    #browserBox { border:1px solid #b8c7d9; background:#fbfdff; padding:8px; text-align:left; }
+    #toolbar { text-align:center; margin-bottom:6px; }
+    #pathLine { text-align:center; color:purple; font-size:12px; margin:4px 0 8px; overflow-wrap:anywhere; }
+    .row { display:flex; align-items:center; gap:6px; border-bottom:1px solid #eef4fb; padding:3px 0; }
+    .row:last-child { border-bottom:0; }
+    .name { flex:1 1 auto; overflow-wrap:anywhere; cursor:pointer; }
+    .dir .name { color:#0066cc; font-weight:bold; }
+    .file .name { color:blue; }
+    #fileContent { white-space:pre-wrap; background:#f8f8f8; padding:8px; margin-top:8px; border:1px solid #ccc; display:none; text-align:left; max-height:420px; overflow:auto; }
+    .emptyNote { text-align:center; color:#777; padding:8px; }
+  </style>
+</head>
+<body>
+<div id="pageWrap">
+  <h3 id="browserTitle">Flash Memory Browser</h3>
+  <div id="browserBox">
+    <div id="toolbar">
+      <button class="blue-button" onclick="navigate('/')">Root</button>
+      <button class="blue-button" onclick="goUp()">.. (Up)</button>
+      <button class="blue-button" onclick="document.getElementById('uploadInput').click()">Upload to Current</button>
+      <input type="file" id="uploadInput" style="display:none;" onchange="uploadFile(this.files)">
+      <button class="blue-button" onclick="createFolder()">Create Folder</button>
+      <button class="blue-button" onclick="downloadCurrentDir()">Download Current Dir</button>
+    </div>
+    <div id="pathLine">Current path: <span id="currentPath">/</span></div>
+    <div id="fileList"></div>
+    <div id="fileContent"></div>
+  </div>
+</div>
+<script>
+const params = new URLSearchParams(window.location.search);
+const postType = params.get('postType') || 'fsBrowserHeight';
+const title = params.get('title') || 'Flash Memory Browser';
+let currentPath = normalizeDir(params.get('start') || '/');
+document.getElementById('browserTitle').textContent = title;
+
+let lastPostedHeight = 0;
+function postHeightToParent() {
+  if (window === window.parent) return;
+  const wrap = document.getElementById('pageWrap');
+  if (!wrap) return;
+  const h = Math.ceil(wrap.getBoundingClientRect().height);
+  if (Math.abs(h - lastPostedHeight) < 2) return;
+  lastPostedHeight = h;
+  window.parent.postMessage({ type: postType, height: h }, window.location.origin);
+}
+
+function normalizeDir(path) {
+  if (!path || path[0] !== '/') path = '/' + (path || '');
+  if (!path.endsWith('/')) path += '/';
+  return path;
+}
+function joinPath(path, name, isDir) {
+  return normalizeDir(path) + name + (isDir ? '/' : '');
+}
+async function listFiles(path) {
+  currentPath = normalizeDir(path);
+  const list = document.getElementById('fileList');
+  const content = document.getElementById('fileContent');
+  content.style.display = 'none';
+  content.textContent = '';
+  list.innerHTML = '<div class="emptyNote">Loading...</div>';
+  try {
+    const r = await fetch(`/fs/list?dir=${encodeURIComponent(currentPath)}&ts=${Date.now()}`, { cache:'no-store' });
+    const data = await r.json();
+    list.innerHTML = '';
+    if (!Array.isArray(data) || data.length === 0) {
+      list.innerHTML = '<div class="emptyNote">No files or folders.</div>';
+    } else {
+      data.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'row ' + (item.isDir ? 'dir' : 'file');
+        const fullPath = joinPath(currentPath, item.name, item.isDir);
+
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = (item.isDir ? '[DIR] ' : '') + item.name;
+        name.onclick = () => item.isDir ? navigate(fullPath) : viewFile(fullPath);
+        row.appendChild(name);
+
+        const dl = document.createElement('button');
+        dl.className = 'blue-button';
+        dl.textContent = item.isDir ? 'Download .tar.gz' : 'Download';
+        dl.onclick = () => {
+          const endpoint = item.isDir ? '/fs/download_compressed?dir=' : '/fs/download?path=';
+          window.open(endpoint + encodeURIComponent(fullPath), '_blank');
+        };
+        row.appendChild(dl);
+
+        const del = document.createElement('button');
+        del.className = 'blue-button';
+        del.textContent = 'Delete';
+        del.onclick = () => {
+          if (confirm('Delete ' + item.name + '?')) {
+            fetch('/fs/delete?path=' + encodeURIComponent(fullPath), { method:'DELETE' }).then(() => listFiles(currentPath));
+          }
+        };
+        row.appendChild(del);
+        list.appendChild(row);
+      });
+    }
+  } catch (e) {
+    list.innerHTML = '<div class="emptyNote">Failed to list files.</div>';
+    console.log(e);
+  }
+  document.getElementById('currentPath').textContent = currentPath;
+  setTimeout(postHeightToParent, 50);
+}
+function navigate(path) { listFiles(path); }
+function goUp() {
+  if (currentPath === '/') return;
+  currentPath = currentPath.substring(0, currentPath.lastIndexOf('/', currentPath.length - 2) + 1);
+  listFiles(currentPath);
+}
+async function viewFile(path) {
+  try {
+    const r = await fetch('/fs/view?path=' + encodeURIComponent(path));
+    const text = await r.text();
+    const content = document.getElementById('fileContent');
+    content.textContent = text;
+    content.style.display = 'block';
+  } catch(e) { console.log(e); }
+  setTimeout(postHeightToParent, 50);
+}
+function uploadFile(files) {
+  if (!files.length) return;
+  const form = new FormData();
+  form.append('file', files[0]);
+  fetch('/fs/upload?dir=' + encodeURIComponent(currentPath), { method:'POST', body:form }).then(() => listFiles(currentPath));
+}
+function createFolder() {
+  const name = prompt('New folder name:');
+  if (!name) return;
+  fetch('/fs/mkdir?path=' + encodeURIComponent(normalizeDir(currentPath) + name), { method:'POST' }).then(() => listFiles(currentPath));
+}
+function downloadCurrentDir() {
+  window.open('/fs/download_compressed?dir=' + encodeURIComponent(currentPath === '/' ? '/' : currentPath.replace(/\/$/, '')), '_blank');
+}
+window.addEventListener('resize', () => setTimeout(postHeightToParent, 50), { passive:true });
+listFiles(currentPath);
+</script>
+</body>
+</html>
+)rawliteral";
+
 void setupThirdPageRoutes() {
   server.on("/third-page", HTTP_GET, [](AsyncWebServerRequest *req) {
     req->send(200, "text/html", thirdPageHtml);
+  });
+
+
+  server.on("/fs-browser", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send(200, "text/html", fsBrowserHtml);
   });
 
 
@@ -998,6 +1243,7 @@ void setupThirdPageRoutes() {
   server.on("/fs/list", HTTP_GET, [](AsyncWebServerRequest *req) {
     String dir = req->hasParam("dir") ? req->getParam("dir")->value() : "/";
     if (!dir.startsWith("/")) dir = "/" + dir;
+    dir = normalizeFsPath(dir, false);
 
     if (!isSafePath(dir)) {
       req->send(400, "application/json", "[]");
@@ -1010,7 +1256,7 @@ void setupThirdPageRoutes() {
       return;
     }
 
-    File root = LittleFS.open(dir);
+    File root = LittleFS.open(dir, "r");
     if (!root || !root.isDirectory()) {
       if (root) root.close();
       xSemaphoreGive(fileSystemMutex);
@@ -1024,13 +1270,49 @@ void setupThirdPageRoutes() {
     File entry = root.openNextFile();
     while (entry) {
       vTaskDelay(pdMS_TO_TICKS(1)); // Safety valve: Yield on every file
-      JsonObject obj = arr.createNestedObject();
 
       String full = String(entry.name());
-      obj["name"] = full.substring(full.lastIndexOf('/') + 1);
-      obj["isDir"] = entry.isDirectory();
+      bool entryIsDir = entry.isDirectory();
+      entry.close();  // ✅ IMPORTANT: close each entry before doing anything else
 
-      entry.close();  // ✅ IMPORTANT: close each entry
+      // LittleFS/openNextFile() can return recursive children depending on core/build.
+      // The browser needs a normal directory view, so only emit the immediate child
+      // for the requested directory and synthesize direct child directories when needed.
+      String parent = normalizeFsPath(dir, false);
+      String prefix = (parent == "/") ? "/" : (parent + "/");
+
+      if (!full.startsWith("/")) {
+        full = (parent == "/") ? ("/" + full) : (parent + "/" + full);
+      }
+
+      if (!full.startsWith(prefix)) {
+        entry = root.openNextFile();
+        continue;
+      }
+
+      String rel = full.substring(prefix.length());
+      if (rel.length() == 0) {
+        entry = root.openNextFile();
+        continue;
+      }
+
+      int slash = rel.indexOf('/');
+      String displayName;
+      bool displayIsDir = entryIsDir;
+
+      if (slash >= 0) {
+        displayName = rel.substring(0, slash);
+        displayIsDir = true;
+      } else {
+        displayName = rel;
+      }
+
+      if (displayName.length() > 0 && !jsonListAlreadyHasName(arr, displayName)) {
+        JsonObject obj = arr.createNestedObject();
+        obj["name"] = displayName;
+        obj["isDir"] = displayIsDir;
+      }
+
       entry = root.openNextFile();
     }
 
@@ -1053,6 +1335,7 @@ void setupThirdPageRoutes() {
 
     String path = req->getParam("path")->value();
     if (!path.startsWith("/")) path = "/" + path;
+    path = normalizeFsPath(path, false);
 
     if (!isSafePath(path) || path == "/") {
       req->send(400, "text/plain", "bad path");
@@ -1126,6 +1409,7 @@ void setupThirdPageRoutes() {
 
     String path = req->getParam("path")->value();
     if (!path.startsWith("/")) path = "/" + path;
+    path = normalizeFsPath(path, false);
 
     if (!isSafePath(path) || path == "/") {
       req->send(400, "text/plain", "bad path");
@@ -1204,6 +1488,7 @@ void setupThirdPageRoutes() {
 
     String path = req->getParam("path")->value();
     if (!path.startsWith("/")) path = "/" + path;
+    path = normalizeFsPath(path, false);
 
     if (!isSafePath(path) || path == "/") {
       req->send(400, "text/plain", "bad path");

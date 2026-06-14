@@ -80,7 +80,57 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
 
     .header-with-date { white-space: normal; }
     #buttonContainer { margin: 4px 0 0 0; }
-    #filesContainer { display: none; text-align: left; max-width: 400px; margin: auto; }
+    #filesContainer {
+      display: none;
+      text-align: left;
+      width: auto;
+      margin: 6px auto 0;
+      border: 1px solid #b8c7d9;
+      background: #fbfdff;
+      padding: 6px;
+    }
+    #filesContainer .browserHeader {
+      text-align: center;
+      color: #459;
+      font-weight: bold;
+      margin-bottom: 4px;
+    }
+    #filesContainer .browserToolbar {
+      text-align: center;
+      margin-bottom: 5px;
+    }
+    #filesContainer .browserPath {
+      text-align: center;
+      font-size: 11px;
+      color: purple;
+      margin: 3px 0 5px 0;
+      overflow-wrap: anywhere;
+    }
+    #filesContainer .browserRow {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 0;
+      font-size: 12px;
+      border-bottom: 1px solid #eef4fb;
+    }
+    #filesContainer .browserRow:last-child { border-bottom: 0; }
+    #filesContainer .browserRow .name {
+      flex: 1 1 auto;
+      overflow-wrap: anywhere;
+      cursor: pointer;
+    }
+    #filesContainer .browserRow.dir .name {
+      color: #0066cc;
+      font-weight: bold;
+    }
+    #filesContainer .browserRow.file .name { color: blue; }
+    #filesContainer .emptyNote {
+      text-align: center;
+      color: #777;
+      font-size: 12px;
+      padding: 8px;
+    }
 
     h3.top-heading {
       color:#459;
@@ -123,7 +173,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
   </style>
 
   <script>
-    // Safely inject % CSS rules without crashing the ESPAsyncWebServer C++ parser
+    // Safely inject percent CSS rules without confusing the ESPAsyncWebServer template processor
     document.addEventListener('DOMContentLoaded', function() {
       const p = String.fromCharCode(37);
       const style = document.createElement('style');
@@ -146,7 +196,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
 <body>
   <div id="pageWrap">
   <h3 class="top-heading">
-  <a id="pumpRuntimesLink" target="_blank">Pump Runtimes</a>
+  <a id="pumpRuntimesLink" target="_blank" title="Open the full Pump Runtimes page">Pump Runtimes</a>
 </h3>
   <button id="updateAllButton" class="blue-button">Update All</button>
 
@@ -174,8 +224,9 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
   </div>
 
   <div id="buttonContainer">
-    <button id="listFilesButton"    class="blue-button">List Files</button>
+    <button id="listFilesButton"    class="blue-button">View Pump Logs</button>
     <button id="downloadFilesButton" class="blue-button" style="display:none;">Download Selected</button>
+    <button id="downloadAllFilesButton" class="blue-button" style="display:none;">Download All</button>
   </div>
   <div id="filesContainer"></div>
 
@@ -322,54 +373,144 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
         updateAllRuntimesViaFetch().catch(console.log);
       };
 
-      // —— File listing & download —— 
+      // —— Scoped Pump Log browser/downloader ——
+      const pumpLogRoot = '/Pump_Logs/';
+      let pumpLogCurrentPath = pumpLogRoot;
+
+      function normalizePumpLogDir(path) {
+        if (!path || path[0] !== '/') path = '/' + (path || '');
+        if (!path.endsWith('/')) path += '/';
+        if (!path.startsWith(pumpLogRoot)) path = pumpLogRoot;
+        return path;
+      }
+
+      function pumpLogJoin(path, name, isDir) {
+        const base = normalizePumpLogDir(path);
+        return base + name + (isDir ? '/' : '');
+      }
+
+      function pumpLogCanGoUp() {
+        return pumpLogCurrentPath !== pumpLogRoot;
+      }
+
+      function setPumpLogButtonsVisible(visible) {
+        document.getElementById('downloadFilesButton').style.display = visible ? 'inline' : 'none';
+        document.getElementById('downloadAllFilesButton').style.display = visible ? 'inline' : 'none';
+      }
+
       document.getElementById('listFilesButton').addEventListener('click', function() {
+        const container = document.getElementById('filesContainer');
+        const opening = (container.style.display === 'none' || container.style.display === '');
+        if (opening) {
+          container.style.display = 'block';
+          setPumpLogButtonsVisible(true);
+          pumpLogCurrentPath = pumpLogRoot;
+          fetchPumpLogFileList();
+        } else {
+          container.style.display = 'none';
+          setPumpLogButtonsVisible(false);
+          requestAnimationFrame(() => requestAnimationFrame(postHeightToParent));
+        }
+      });
 
-                const container = document.getElementById('filesContainer');
-                const downloadButton = document.getElementById('downloadFilesButton');
-                // Toggle visibility
-                if (container.style.display === 'none' || container.style.display === '') {
-                    fetchFileList();  // Call fetchFileList to update the file list
-                    container.style.display = 'block';
-                    downloadButton.style.display = 'inline'; // Show download button when listing files
-                } else {
-                    container.style.display = 'none';
-                    downloadButton.style.display = 'none'; // Hide download button when not listing files
-                    requestAnimationFrame(() => requestAnimationFrame(postHeightToParent));
-                }
-            });
+      async function fetchPumpLogFileList() {
+        const list = document.getElementById('filesContainer');
+        list.innerHTML = '<div class="emptyNote">Loading pump logs...</div>';
+        try {
+          const r = await fetch(`/fs/list?dir=${encodeURIComponent(pumpLogCurrentPath)}&ts=${Date.now()}`, { cache: 'no-store' });
+          const items = await r.json();
+          list.innerHTML = '';
 
-            function fetchFileList() {
-                fetch('/list-logs')
-                .then(response => response.json())
-                .then(files => {
-                    const list = document.getElementById('filesContainer');
-                    list.innerHTML = ''; // Clear current list
-                    files.forEach(file => {
-                        const label = document.createElement('label');
-                        const checkbox = document.createElement('input');
-                        checkbox.type = 'checkbox';
-                        checkbox.value = file;
-                        label.appendChild(checkbox);
-                        label.appendChild(document.createTextNode(file));
-                        list.appendChild(label);
-                        list.appendChild(document.createElement('br'));
-                    });
-                    setTimeout(postHeightToParent, 50);
-                });
-            }
+          const header = document.createElement('div');
+          header.className = 'browserHeader';
+          header.textContent = 'Pump Logs';
+          list.appendChild(header);
 
-            document.getElementById('downloadFilesButton').addEventListener('click', function() {
-                downloadSelected();
-            });
+          const toolbar = document.createElement('div');
+          toolbar.className = 'browserToolbar';
+          const rootBtn = document.createElement('button');
+          rootBtn.className = 'blue-button';
+          rootBtn.textContent = 'Pump Logs Root';
+          rootBtn.onclick = () => { pumpLogCurrentPath = pumpLogRoot; fetchPumpLogFileList(); };
+          toolbar.appendChild(rootBtn);
 
-            function downloadSelected() {
-                const checkboxes = document.querySelectorAll('#filesContainer input[type="checkbox"]:checked');
-                checkboxes.forEach(checkbox => {
-                    const file = checkbox.value;
-                    window.open('/download-log?file=' + encodeURIComponent(file), '_blank');
-                });
-            }
+          const upBtn = document.createElement('button');
+          upBtn.className = 'blue-button';
+          upBtn.textContent = '.. (Up)';
+          upBtn.disabled = !pumpLogCanGoUp();
+          upBtn.onclick = () => {
+            if (!pumpLogCanGoUp()) return;
+            pumpLogCurrentPath = pumpLogCurrentPath.substring(0, pumpLogCurrentPath.lastIndexOf('/', pumpLogCurrentPath.length - 2) + 1);
+            pumpLogCurrentPath = normalizePumpLogDir(pumpLogCurrentPath);
+            fetchPumpLogFileList();
+          };
+          toolbar.appendChild(upBtn);
+          list.appendChild(toolbar);
+
+          const pathLine = document.createElement('div');
+          pathLine.className = 'browserPath';
+          pathLine.textContent = 'Current path: ' + pumpLogCurrentPath;
+          list.appendChild(pathLine);
+
+          if (!Array.isArray(items) || items.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'emptyNote';
+            empty.textContent = 'No pump log files found.';
+            list.appendChild(empty);
+            setTimeout(postHeightToParent, 50);
+            return;
+          }
+
+          items.forEach(item => {
+            const row = document.createElement('div');
+            row.className = 'browserRow ' + (item.isDir ? 'dir' : 'file');
+            const fullPath = pumpLogJoin(pumpLogCurrentPath, item.name, item.isDir);
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.value = fullPath;
+            checkbox.dataset.isdir = item.isDir ? '1' : '0';
+            row.appendChild(checkbox);
+
+            const name = document.createElement('span');
+            name.className = 'name';
+            name.textContent = (item.isDir ? '[DIR] ' : '') + item.name;
+            name.onclick = () => {
+              if (item.isDir) {
+                pumpLogCurrentPath = fullPath;
+                fetchPumpLogFileList();
+              }
+            };
+            row.appendChild(name);
+
+            const dlBtn = document.createElement('button');
+            dlBtn.className = 'blue-button';
+            dlBtn.textContent = item.isDir ? 'Download .tar.gz' : 'Download';
+            dlBtn.onclick = () => {
+              const endpoint = item.isDir ? '/fs/download_compressed?dir=' : '/fs/download?path=';
+              window.open(endpoint + encodeURIComponent(fullPath), '_blank');
+            };
+            row.appendChild(dlBtn);
+            list.appendChild(row);
+          });
+        } catch (e) {
+          list.innerHTML = '<div class="emptyNote">Failed to list pump logs.</div>';
+          console.log(e);
+        }
+        setTimeout(postHeightToParent, 50);
+      }
+
+      document.getElementById('downloadFilesButton').addEventListener('click', function() {
+        const selected = document.querySelectorAll('#filesContainer input[type="checkbox"]:checked');
+        selected.forEach(checkbox => {
+          const endpoint = checkbox.dataset.isdir === '1' ? '/fs/download_compressed?dir=' : '/fs/download?path=';
+          window.open(endpoint + encodeURIComponent(checkbox.value), '_blank');
+        });
+      });
+
+      document.getElementById('downloadAllFilesButton').addEventListener('click', function() {
+        window.open('/fs/download_compressed?dir=' + encodeURIComponent('/Pump_Logs'), '_blank');
+      });
         });
      document
     .getElementById('pumpRuntimesLink')

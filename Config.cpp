@@ -4,6 +4,7 @@
 #include "FileSystemManager.h"
 #include <LittleFS.h>
 #include <string.h>
+#include <stdlib.h>
 #include "TarGZ.h"
 #include "DiagLog.h"
 #include "DiagConfig.h"
@@ -29,26 +30,260 @@ extern float DTempAverage[13];  // Assuming DTempAverage[0..12] for 1-13
 
 SystemConfig g_config;
 TimeConfig g_timeConfig;
+Ds18B20Config g_ds18b20Config;
 
 float getTempByIndex(int idx) {
   if (idx < 1 || idx > 14) return NAN;
   switch (idx) {
-    case 1: return pt1000Average;
-    case 2: return DTempAverage[0];  // DTemp1Average
-    case 3: return DTempAverage[1];  // DTemp2Average
-    case 4: return DTempAverage[2];  // DTemp3Average
-    case 5: return DTempAverage[3];  // DTemp4Average
-    case 6: return DTempAverage[4];  // DTemp5Average
-    case 7: return DTempAverage[5];
-    case 8: return DTempAverage[6];
-    case 9: return DTempAverage[7];
-    case 10: return DTempAverage[8];
-    case 11: return DTempAverage[9];
-    case 12: return DTempAverage[10];
-    case 13: return DTempAverage[11];
-    case 14: return DTempAverage[12];
+    case 1:  return panelT;
+    case 2:  return CSupplyT;
+    case 3:  return storageT;
+    case 4:  return outsideT;
+    case 5:  return CircReturnT;
+    case 6:  return supplyT;
+    case 7:  return CreturnT;
+    case 8:  return DhwSupplyT;
+    case 9:  return DhwReturnT;
+    case 10: return HeatingSupplyT;
+    case 11: return HeatingReturnT;
+    case 12: return dhwT;
+    case 13: return PotHeatXinletT;
+    case 14: return PotHeatXoutletT;
     default: return NAN;
   }
+}
+
+static void copyConfigString(char* dst, size_t dstLen, const char* src) {
+  if (!dst || dstLen == 0) return;
+  if (!src) src = "";
+  strncpy(dst, src, dstLen - 1);
+  dst[dstLen - 1] = '\0';
+}
+
+static void setDs18B20Assignment(uint8_t slot,
+                                 uint64_t rom,
+                                 const char* systemTemp,
+                                 uint8_t bus,
+                                 bool enabled,
+                                 float offsetF) {
+  if (slot >= DS18B20_ASSIGNMENT_COUNT) return;
+  g_ds18b20Config.assignments[slot].rom = rom;
+  copyConfigString(g_ds18b20Config.assignments[slot].systemTemp,
+                   sizeof(g_ds18b20Config.assignments[slot].systemTemp),
+                   systemTemp);
+  g_ds18b20Config.assignments[slot].bus = (bus == 1) ? 1 : 2;
+  g_ds18b20Config.assignments[slot].enabled = enabled;
+  g_ds18b20Config.assignments[slot].offsetF = offsetF;
+}
+
+bool isValidSystemTempName(const char* systemTemp) {
+  if (!systemTemp || systemTemp[0] == '\0') return false;
+
+  static const char* const validNames[] = {
+    "panelT",
+    "CSupplyT",
+    "storageT",
+    "outsideT",
+    "CircReturnT",
+    "supplyT",
+    "CreturnT",
+    "DhwSupplyT",
+    "DhwReturnT",
+    "HeatingSupplyT",
+    "HeatingReturnT",
+    "dhwT",
+    "PotHeatXinletT",
+    "PotHeatXoutletT"
+  };
+
+  for (size_t i = 0; i < (sizeof(validNames) / sizeof(validNames[0])); i++) {
+    if (strcmp(systemTemp, validNames[i]) == 0) return true;
+  }
+  return false;
+}
+
+String ds18b20RomToString(uint64_t rom) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)rom);
+  return String(buf);
+}
+
+bool parseDs18b20RomString(const char* text, uint64_t& romOut) {
+  if (!text) return false;
+
+  while (*text == ' ' || *text == '	') text++;
+  if (text[0] == '\0') return false;
+
+  if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    text += 2;
+  }
+
+  char* endPtr = nullptr;
+  uint64_t parsed = strtoull(text, &endPtr, 16);
+  if (endPtr == text) return false;
+
+  while (*endPtr == ' ' || *endPtr == '	') endPtr++;
+  if (*endPtr != '\0') return false;
+
+  // DS18B20 family code is 0x28 in the low byte with the ROM formatting used here.
+  if (parsed != 0ULL && ((parsed & 0xFFULL) != 0x28ULL)) return false;
+
+  romOut = parsed;
+  return true;
+}
+
+int findDs18B20AssignmentByRom(uint64_t rom) {
+  if (rom == 0ULL) return -1;
+
+  for (uint8_t i = 0; i < DS18B20_ASSIGNMENT_COUNT; i++) {
+    if (!g_ds18b20Config.assignments[i].enabled) continue;
+    if (g_ds18b20Config.assignments[i].rom == rom) return i;
+  }
+  return -1;
+}
+
+int findDs18B20AssignmentBySystemTemp(const char* systemTemp) {
+  if (!systemTemp) return -1;
+
+  for (uint8_t i = 0; i < DS18B20_ASSIGNMENT_COUNT; i++) {
+    if (!g_ds18b20Config.assignments[i].enabled) continue;
+    if (strcmp(g_ds18b20Config.assignments[i].systemTemp, systemTemp) == 0) return i;
+  }
+  return -1;
+}
+
+static float getDs18B20ValueForSystemTemp(const char* systemTemp, float fallbackValue) {
+  int slot = findDs18B20AssignmentBySystemTemp(systemTemp);
+  if (slot < 0 || slot >= DS18B20_ASSIGNMENT_COUNT) return fallbackValue;
+  return DTempAverage[slot];
+}
+
+void applyConfiguredSystemTemperatureAssignments() {
+  // Default collector manifold source remains PT1000 unless a DS18B20 assignment
+  // explicitly maps one of the configured DS18B20 slots to panelT.
+  panelT          = getDs18B20ValueForSystemTemp("panelT",          pt1000Average);
+  CSupplyT        = getDs18B20ValueForSystemTemp("CSupplyT",        NAN);
+  storageT        = getDs18B20ValueForSystemTemp("storageT",        NAN);
+  outsideT        = getDs18B20ValueForSystemTemp("outsideT",        NAN);
+  CircReturnT     = getDs18B20ValueForSystemTemp("CircReturnT",     NAN);
+  supplyT         = getDs18B20ValueForSystemTemp("supplyT",         NAN);
+  CreturnT        = getDs18B20ValueForSystemTemp("CreturnT",        NAN);
+  DhwSupplyT      = getDs18B20ValueForSystemTemp("DhwSupplyT",      NAN);
+  DhwReturnT      = getDs18B20ValueForSystemTemp("DhwReturnT",      NAN);
+  HeatingSupplyT  = getDs18B20ValueForSystemTemp("HeatingSupplyT",  NAN);
+  HeatingReturnT  = getDs18B20ValueForSystemTemp("HeatingReturnT",  NAN);
+  dhwT            = getDs18B20ValueForSystemTemp("dhwT",            NAN);
+  PotHeatXinletT  = getDs18B20ValueForSystemTemp("PotHeatXinletT",  NAN);
+  PotHeatXoutletT = getDs18B20ValueForSystemTemp("PotHeatXoutletT", NAN);
+}
+
+void initDs18B20ConfigDefaults() {
+  g_ds18b20Config.version = 1;
+
+  setDs18B20Assignment(0,  0x3f3c910457bbd028ULL, "CSupplyT",        2, true, 0.0f);
+  setDs18B20Assignment(1,  0xa13c690457350428ULL, "storageT",        2, true, 0.0f);
+  setDs18B20Assignment(2,  0x13cf60457fee428ULL,  "outsideT",        2, true, 0.0f);
+  setDs18B20Assignment(3,  0x770722b2275a8c28ULL, "CircReturnT",     2, true, 0.0f);
+  setDs18B20Assignment(4,  0xe23c350457fddc28ULL, "supplyT",         2, true, 0.0f);
+  setDs18B20Assignment(5,  0xa13ca704574f5d28ULL, "CreturnT",        2, true, 0.0f);
+  setDs18B20Assignment(6,  0x2b3c54045745c028ULL, "DhwSupplyT",      1, true, 0.0f);
+  setDs18B20Assignment(7,  0x3c6fe381c97c28ULL,   "DhwReturnT",      1, true, 0.0f);
+  setDs18B20Assignment(8,  0xfa3cc80457e29e28ULL, "HeatingSupplyT",  1, true, 0.0f);
+  setDs18B20Assignment(9,  0x753ccdf64815f128ULL, "HeatingReturnT",  1, true, 0.0f);
+  setDs18B20Assignment(10, 0xa23c330457d1fb28ULL, "dhwT",            1, true, 0.0f);
+  setDs18B20Assignment(11, 0x963cf2045776e728ULL, "PotHeatXinletT",  1, true, 0.0f);
+  setDs18B20Assignment(12, 0xe80722b24856bf28ULL, "PotHeatXoutletT", 1, true, 0.0f);
+}
+
+bool loadDs18B20ConfigFromFS() {
+  if (!g_fileSystemReady) return false;
+
+  if (!takeFileSystemMutexWithRetry("[DS18B20Config] load", pdMS_TO_TICKS(1000), 2)) return false;
+
+  if (!LittleFS.exists(DS18B20_CONFIG_PATH)) {
+    xSemaphoreGive(fileSystemMutex);
+    return false;
+  }
+
+  File f = LittleFS.open(DS18B20_CONFIG_PATH, "r");
+  if (!f) {
+    xSemaphoreGive(fileSystemMutex);
+    return false;
+  }
+
+  DynamicJsonDocument doc(3072);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  xSemaphoreGive(fileSystemMutex);
+
+  if (err) return false;
+
+  JsonArray assignments = doc["assignments"];
+  if (assignments.isNull()) return false;
+
+  // Keep compile-time defaults for any invalid or missing row.
+  for (JsonVariant v : assignments) {
+    int slot = v["slot"] | -1;
+    if (slot < 0 || slot >= DS18B20_ASSIGNMENT_COUNT) continue;
+
+    const char* systemTemp = v["systemTemp"] | "";
+    if (!isValidSystemTempName(systemTemp)) continue;
+
+    const char* romText = v["rom"] | "";
+    uint64_t rom = 0ULL;
+    if (!parseDs18b20RomString(romText, rom)) continue;
+
+    uint8_t bus = v["bus"] | g_ds18b20Config.assignments[slot].bus;
+    if (bus != 1 && bus != 2) continue;
+
+    bool enabled = v["enabled"] | true;
+    float offsetF = v["offsetF"] | 0.0f;
+
+    setDs18B20Assignment((uint8_t)slot, rom, systemTemp, bus, enabled, offsetF);
+  }
+
+  return true;
+}
+
+bool saveDs18B20ConfigToFS() {
+  if (!g_fileSystemReady) return false;
+
+  if (!takeFileSystemMutexWithRetry("[DS18B20Config] save", pdMS_TO_TICKS(1000), 2)) return false;
+
+  if (!LittleFS.exists(DIAG_SERIAL_CONFIG_DIR)) {
+    LittleFS.mkdir(DIAG_SERIAL_CONFIG_DIR);
+  }
+
+  DynamicJsonDocument doc(3072);
+  doc["version"] = g_ds18b20Config.version;
+
+  JsonArray assignments = doc.createNestedArray("assignments");
+  for (uint8_t i = 0; i < DS18B20_ASSIGNMENT_COUNT; i++) {
+    JsonObject row = assignments.createNestedObject();
+    row["slot"] = i;
+    row["rom"] = ds18b20RomToString(g_ds18b20Config.assignments[i].rom);
+    row["systemTemp"] = g_ds18b20Config.assignments[i].systemTemp;
+    row["bus"] = g_ds18b20Config.assignments[i].bus;
+    row["enabled"] = g_ds18b20Config.assignments[i].enabled;
+    row["offsetF"] = g_ds18b20Config.assignments[i].offsetF;
+  }
+
+  File f = LittleFS.open(DS18B20_CONFIG_PATH, "w");
+  if (!f) {
+    xSemaphoreGive(fileSystemMutex);
+    return false;
+  }
+
+  serializeJson(doc, f);
+  f.close();
+
+  xSemaphoreGive(fileSystemMutex);
+  return true;
+}
+
+bool resetDs18B20ConfigToDefaults() {
+  initDs18B20ConfigDefaults();
+  return saveDs18B20ConfigToFS();
 }
 
 void initSystemConfigDefaults() {

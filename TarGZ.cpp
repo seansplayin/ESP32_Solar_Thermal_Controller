@@ -206,10 +206,17 @@ public:
   size_t write(uint8_t b) override { return write(&b, 1); }
 
   size_t write(const uint8_t *data, size_t len) override {
-    if (!ok() || _cancelled) return 0;
+    if (!ok()) return 0;
+
+    // If the browser/client disconnects, do NOT return 0 to ESP32-targz.
+    // Some compression paths treat a short/failed Stream::write() as fatal and abort().
+    // Instead, become a "black-hole" sink: accept the bytes, discard them, and let the
+    // producer finish cleanly so the controller does not crash from a cancelled download.
+    if (_cancelled) return len;
 
     size_t written = 0;
-    while (written < len && !_cancelled) {
+    while (written < len) {
+      if (_cancelled) return len;
       
       // YIELD: This is the critical injection point!
       // The compression library runs hot. By forcing the producer task to yield 
@@ -491,14 +498,31 @@ static void handleDownloadCompressed(AsyncWebServerRequest* request) {
 
         if (want > effectiveChunk) want = effectiveChunk;
 
-        size_t got = session->stream->readBytes(outBuf, want);
-        if (got > 0) {
-          return got;
-        }
+        // IMPORTANT:
+        // Do not return 0 just because the producer has not emitted data yet.
+        // Returning 0 tells AsyncWebServer that the response is complete. For large
+        // directories, ESP32-targz can spend several seconds walking/opening files before
+        // it writes the next gzip bytes. A premature 0 closes the browser connection,
+        // triggers onDisconnect(), and can make ESP32-targz abort inside the producer.
+        const uint32_t waitStart = millis();
+        while (!session->stream->done() && !session->abortRequested) {
+          size_t got = session->stream->readBytes(outBuf, want);
+          if (got > 0) {
+            return got;
+          }
 
+          if (session->stream->done()) {
+            return 0;
+          }
 
-        if (session->stream->done()) {
-          return 0;
+          if (millis() - waitStart > 30000UL) {
+            LOG_ERR("[TGZ] HTTP chunk timed out waiting for producer data; cancelling archive stream\n");
+            session->abortRequested = true;
+            if (session->stream) session->stream->cancel();
+            return 0;
+          }
+
+          vTaskDelay(pdMS_TO_TICKS(10));
         }
 
         return 0;

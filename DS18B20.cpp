@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "DiagLog.h"
 #include "AlarmManager.h"
+#include <ArduinoJson.h>
 
 OneWire32 sensors1(ONE_WIRE_BUS_1);
 OneWire32 sensors2(ONE_WIRE_BUS_2);
@@ -23,64 +24,24 @@ SensorMapping sensorMappings[NUM_SENSORS];  // runtime mapping, indexed by logic
 
 static bool sensorPresent[NUM_SENSORS] = {false};
 static bool sensorOnBus1[NUM_SENSORS] = {false};
+static bool sensorObserved[NUM_SENSORS] = {false};
+static uint8_t sensorObservedBus[NUM_SENSORS] = {0};
 static bool sensorFaultLatched[NUM_SENSORS] = {false};
 
-// Expected sensor list (exact addresses from your diagnostic run)
-// ── Test Bennch SENSORS  ───────
-static const SensorMapping expectedMappings[NUM_SENSORS] = {
-/*
-// ── Test Bench SENSORS  ───────
-    {0x3f3c910457bbd028ULL, 0},
-    {0xa13c690457350428ULL, 1},
-    {0x13cf60457fee428ULL,  2},
-    {0x770722b2275a8c28ULL, 3},
-    {0xe23c350457fddc28ULL, 4},
-    {0xa13ca704574f5d28ULL, 5},
-    {0x2b3c54045745c028ULL, 6},
-    {0x3c6fe381c97c28ULL,   7},
-    {0xfa3cc80457e29e28ULL, 8},
-    {0x753ccdf64815f128ULL, 9},
-    {0xa23c330457d1fb28ULL, 10},
-    {0x963cf2045776e728ULL, 11},
-    {0xe80722b24856bf28ULL, 12}
-*/   
-    
-// ── SOLAR HOUSE SENSORS  ───────
-    {0x2D3C0DF649163728ULL, 0},
-    {0xAD3C7AF6489A6928ULL, 1},
-    {0x023C01F096165228ULL, 2},
-    {0xF23C2BE381EA8528ULL, 3},
-    {0x2B0722B20EA9F628ULL, 4},
-    {0x0F3C01F096842A28ULL, 5},
-    {0xB53C53E3811A2928ULL, 6},
-    {0x923C17E381C62228ULL, 7},
-    {0xA53CD2E381F16628ULL, 8},
-    {0xD83CDCE381142228ULL, 9},
-    {0xC70922B208BD0328ULL, 10},
-    {0xEB3C01F0969BDD28ULL, 11},
-    {0x4D3CE6F648E23728ULL, 12}
+static volatile bool g_ds18b20Ready = false;
 
-
-};
-
-
-
-static int findExpectedLogicalIndex(uint64_t address) {
-    for (int e = 0; e < NUM_SENSORS; e++) {
-        if (expectedMappings[e].address == address) {
-            return expectedMappings[e].arrayIndex;
-        }
-    }
-    return -1;
+static bool assignmentMatchesBus(uint8_t slot, bool wantBus1) {
+    if (slot >= NUM_SENSORS) return false;
+    const Ds18B20SensorAssignment& a = g_ds18b20Config.assignments[slot];
+    if (!a.enabled) return false;
+    return (a.bus == (wantBus1 ? 1 : 2));
 }
 
-// House controller physical bus layout:
-// logical indices 0..5  = outside sensors on Bus 2
-// logical indices 6..12 = inside sensors on Bus 1
-static const bool expectedOnBus1[NUM_SENSORS] = {
-    false, false, false, false, false, false,
-    true,  true,  true,  true,  true,  true,  true
-};
+static bool isAssignmentEnabled(uint8_t slot) {
+    if (slot >= NUM_SENSORS) return false;
+    return g_ds18b20Config.assignments[slot].enabled &&
+           g_ds18b20Config.assignments[slot].rom != 0ULL;
+}
 
 static constexpr uint32_t DS18_BOOT_SETTLE_MS      = 1200;
 static constexpr uint8_t  DS18_BOOT_SCAN_RETRIES   = 5;
@@ -98,8 +59,8 @@ static bool isLikelyValidDs18Rom(uint64_t rom) {
 }
 
 static bool anySensorsMissingOnBus(bool wantBus1) {
-    for (int i = 0; i < NUM_SENSORS; i++) {
-        if (expectedOnBus1[i] == wantBus1 && !sensorPresent[i]) {
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        if (assignmentMatchesBus(i, wantBus1) && !sensorPresent[i]) {
             return true;
         }
     }
@@ -107,20 +68,20 @@ static bool anySensorsMissingOnBus(bool wantBus1) {
 }
 
 static void logMissingSensorsOnBus(bool wantBus1, bool logFoundDevices, bool emitMissingAlarms) {
-    for (int e = 0; e < NUM_SENSORS; e++) {
-        int logicalIndex = expectedMappings[e].arrayIndex;
-        uint64_t expectedAddr = expectedMappings[e].address;
+    for (uint8_t slot = 0; slot < NUM_SENSORS; slot++) {
+        const Ds18B20SensorAssignment& expected = g_ds18b20Config.assignments[slot];
 
-        if (expectedOnBus1[logicalIndex] != wantBus1) continue;
+        if (!assignmentMatchesBus(slot, wantBus1)) continue;
 
-        if (!sensorPresent[logicalIndex] && expectedAddr != 0ULL) {
-            int nameIndex = logicalIndex + 2; // DTemp1 starts at SENSOR_NAMES[2]
+        if (!sensorPresent[slot] && expected.rom != 0ULL) {
+            int nameIndex = slot + 2; // DTemp1 starts at SENSOR_NAMES[2]
 
             if (logFoundDevices) {
                 LOG_CAT(DBG_1WIRE,
-                        "DS18B20 Sensor Missing on Bus %d: address 0x%llxULL, SOURCE_MAP=%d, SENSOR_NAME=%s\n",
+                        "DS18B20 Sensor Missing on Bus %d: address 0x%llxULL, SYSTEM_TEMP=%s, SOURCE_MAP=%d, SENSOR_NAME=%s\n",
                         wantBus1 ? 1 : 2,
-                        expectedAddr,
+                        expected.rom,
+                        expected.systemTemp,
                         SOURCE_MAP[nameIndex],
                         SENSOR_NAMES[nameIndex]);
             }
@@ -188,7 +149,7 @@ static void scanAndAddMissingSensorsOnBus(bool wantBus1, bool logFoundDevices, b
         }
         acceptedThisPass[acceptedCount++] = rom;
 
-        int logicalIndex = findExpectedLogicalIndex(rom);
+        int logicalIndex = findDs18B20AssignmentByRom(rom);
 
         if (logicalIndex < 0 || logicalIndex >= NUM_SENSORS) {
             if (logFoundDevices) {
@@ -200,12 +161,21 @@ static void scanAndAddMissingSensorsOnBus(bool wantBus1, bool logFoundDevices, b
             continue;
         }
 
-        if (expectedOnBus1[logicalIndex] != wantBus1) {
+        const Ds18B20SensorAssignment& expected = g_ds18b20Config.assignments[logicalIndex];
+
+        // Record where the configured ROM was actually observed even if it
+        // is on the wrong bus. This lets the web UI show a clear wrong-bus
+        // condition instead of only saying the sensor is missing.
+        sensorObserved[logicalIndex] = true;
+        sensorObservedBus[logicalIndex] = wantBus1 ? 1 : 2;
+
+        if (expected.bus != (wantBus1 ? 1 : 2)) {
             if (logFoundDevices) {
                 LOG_CAT(DBG_1WIRE,
-                        "[DS18B20] Sensor 0x%llxULL belongs on Bus %d but was found on Bus %d\n",
+                        "[DS18B20] Sensor 0x%llxULL (%s) belongs on Bus %d but was found on Bus %d\n",
                         rom,
-                        expectedOnBus1[logicalIndex] ? 1 : 2,
+                        expected.systemTemp,
+                        expected.bus,
                         wantBus1 ? 1 : 2);
             }
             continue;
@@ -220,9 +190,10 @@ static void scanAndAddMissingSensorsOnBus(bool wantBus1, bool logFoundDevices, b
             if (logFoundDevices) {
                 int nameIndex = logicalIndex + 2;
                 LOG_CAT(DBG_1WIRE,
-                        "[DS18B20] Added missing sensor on Bus %d: logical=%d SOURCE_MAP=%d SENSOR_NAME=%s\n",
+                        "[DS18B20] Added missing sensor on Bus %d: logical=%d SYSTEM_TEMP=%s SOURCE_MAP=%d SENSOR_NAME=%s\n",
                         wantBus1 ? 1 : 2,
                         logicalIndex,
+                        expected.systemTemp,
                         SOURCE_MAP[nameIndex],
                         SENSOR_NAMES[nameIndex]);
             }
@@ -232,7 +203,80 @@ static void scanAndAddMissingSensorsOnBus(bool wantBus1, bool logFoundDevices, b
     logMissingSensorsOnBus(wantBus1, logFoundDevices, emitMissingAlarms);
 }
 
+static void addScanResultToJson(JsonArray& arr, uint8_t bus, uint64_t rom) {
+    JsonObject obj = arr.createNestedObject();
+    obj["bus"] = bus;
+    obj["rom"] = ds18b20RomToString(rom);
+
+    int slot = findDs18B20AssignmentByRom(rom);
+    obj["assigned"] = (slot >= 0 && slot < NUM_SENSORS);
+    obj["slot"] = slot;
+    obj["dtemp"] = (slot >= 0 && slot < NUM_SENSORS) ? (slot + 1) : 0;
+
+    if (slot >= 0 && slot < NUM_SENSORS) {
+        obj["systemTemp"] = g_ds18b20Config.assignments[slot].systemTemp;
+    } else {
+        obj["systemTemp"] = "";
+    }
+}
+
+String buildDS18B20ScanJson() {
+    DynamicJsonDocument doc(4096);
+    doc["ok"] = true;
+
+    JsonArray sensors = doc.createNestedArray("sensors");
+
+    bool locked = false;
+    if (temperatureMutex != nullptr) {
+        locked = (xSemaphoreTake(temperatureMutex, pdMS_TO_TICKS(2500)) == pdTRUE);
+        if (!locked) {
+            doc["ok"] = false;
+            doc["error"] = "temperatureMutex busy";
+            String busyJson;
+            serializeJson(doc, busyJson);
+            return busyJson;
+        }
+    }
+
+    uint64_t foundAddrs[20];
+
+    uint8_t count1 = sensors1.search(foundAddrs, 20);
+    JsonArray bus1 = doc.createNestedArray("bus1");
+    for (uint8_t i = 0; i < count1; i++) {
+        uint64_t rom = foundAddrs[i];
+        if (!isLikelyValidDs18Rom(rom)) continue;
+        addScanResultToJson(bus1, 1, rom);
+        addScanResultToJson(sensors, 1, rom);
+    }
+
+    uint8_t count2 = sensors2.search(foundAddrs, 20);
+    JsonArray bus2 = doc.createNestedArray("bus2");
+    for (uint8_t i = 0; i < count2; i++) {
+        uint64_t rom = foundAddrs[i];
+        if (!isLikelyValidDs18Rom(rom)) continue;
+        addScanResultToJson(bus2, 2, rom);
+        addScanResultToJson(sensors, 2, rom);
+    }
+
+    // Restart conversions because a manual bus search may interrupt the normal
+    // conversion/read cadence.
+    sensors1.request();
+    sensors2.request();
+
+    if (locked) {
+        xSemaphoreGive(temperatureMutex);
+    }
+
+    doc["count"] = sensors.size();
+
+    String json;
+    serializeJson(doc, json);
+    return json;
+}
+
 void initDS18B20Sensors() {
+    g_ds18b20Ready = false;
+
     // Give the long outside bus a little time to settle after boot.
     vTaskDelay(pdMS_TO_TICKS(DS18_BOOT_SETTLE_MS));
 
@@ -241,12 +285,15 @@ void initDS18B20Sensors() {
         sensorMappings[i] = {0ULL, i};
         sensorPresent[i] = false;
         sensorOnBus1[i] = false;
+        sensorObserved[i] = false;
+        sensorObservedBus[i] = 0;
         sensorFaultLatched[i] = false;
         DTempLastGoodReadMs[i] = 0;
+        sensorOffsets[i] = g_ds18b20Config.assignments[i].offsetF;
     }
 
-    bool needBus1 = true; // inside sensors
-    bool needBus2 = true; // outside sensors
+    bool needBus1 = true;
+    bool needBus2 = true;
 
     for (uint8_t attempt = 1; attempt <= DS18_BOOT_SCAN_RETRIES; attempt++) {
         LOG_CAT(DBG_1WIRE,
@@ -285,8 +332,24 @@ void initDS18B20Sensors() {
 
     s_lastMissingRescanMs = millis();
 
+    g_ds18b20Ready = true;
+
     LOG_CAT(DBG_1WIRE,
-            "[DS18B20] Init complete – runtime mapping built additively from expected address matches\n");
+            "[DS18B20] Init complete – runtime mapping built additively from configured address matches\n");
+}
+
+bool ds18B20SensorsReady() {
+    return g_ds18b20Ready;
+}
+
+bool getDS18B20SlotStatus(uint8_t slot, bool* presentOut, uint8_t* observedBusOut, uint32_t* lastGoodMsOut) {
+    if (slot >= NUM_SENSORS) return false;
+
+    if (presentOut) *presentOut = sensorPresent[slot];
+    if (observedBusOut) *observedBusOut = sensorObserved[slot] ? sensorObservedBus[slot] : 0;
+    if (lastGoodMsOut) *lastGoodMsOut = DTempLastGoodReadMs[slot];
+
+    return true;
 }
 
 float calculateAverage(float values[], int numReadings) {
@@ -311,12 +374,12 @@ void updateDS18B20Readings() {
             LOG_CAT(DBG_1WIRE, "[DS18B20] Periodic targeted rescan for missing sensors\n");
 
             if (needBus1) {
-                LOG_CAT(DBG_1WIRE, "[DS18B20] Rescanning Bus 1 (inside sensors)\n");
+                LOG_CAT(DBG_1WIRE, "[DS18B20] Rescanning Bus 1\n");
                 scanAndAddMissingSensorsOnBus(true, true, false);
             }
 
             if (needBus2) {
-                LOG_CAT(DBG_1WIRE, "[DS18B20] Rescanning Bus 2 (outside sensors)\n");
+                LOG_CAT(DBG_1WIRE, "[DS18B20] Rescanning Bus 2\n");
                 scanAndAddMissingSensorsOnBus(false, true, false);
             }
 
@@ -331,8 +394,8 @@ void updateDS18B20Readings() {
         // YIELD: Give the network stack time to process W5500 interrupts.
         vTaskDelay(pdMS_TO_TICKS(1));
 
-        // Skip unassigned / missing sensors entirely.
-        if (!sensorPresent[i] || sensorMappings[i].address == 0ULL) {
+        // Skip disabled / unassigned / missing sensors entirely.
+        if (!isAssignmentEnabled(i) || !sensorPresent[i] || sensorMappings[i].address == 0ULL) {
             continue;
         }
 

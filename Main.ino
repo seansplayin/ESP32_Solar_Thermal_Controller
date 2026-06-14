@@ -79,8 +79,9 @@ void setup() {
   };
   esp_task_wdt_init(&wdt_config);
 
-  initPT1000Sensor();     // Initialize the Max31865 sensor
-  initDS18B20Sensors();   // Initialize DS18B20 sensors
+  initPT1000Sensor();             // Initialize the Max31865 sensor
+  initDs18B20ConfigDefaults();    // Seed DS18B20 assignment defaults before tasks start
+  // DS18B20 sensors are initialized after LittleFS/config load in TaskLoadSystemConfigFromFS().
 
   // Create mutexes
   pumpStateMutex = xSemaphoreCreateMutex();
