@@ -529,45 +529,16 @@ void TasklogZeroLengthMessages(void *pvParameters) {
 
 
 void TaskLogger(void* pv) {
-  LogEvent ev;
+  (void)pv;
+
+  // Phase 1 pump-log buffering:
+  // logPumpEvent() now captures START/STOP records in RAM immediately.
+  // This task only services the legacy fallback queue and periodically flushes
+  // the RAM buffer to /Pump_Logs.  A busy filesystem/TGZ download no longer
+  // causes pump runtime events to be dropped.
   for (;;) {
-    if (xQueueReceive(logQueue, &ev, portMAX_DELAY)) {
-
-      // 1) Make sure the FS is mounted
-      if (!g_fileSystemReady) {
-        LOG_ERR("[TaskLogger] FS not ready; dropping log event\n");
-        continue;
-      }
-
-      // 2) Try to lock the filesystem mutex with retries
-      if (!takeFileSystemMutexWithRetry("[TaskLogger]",
-                                        pdMS_TO_TICKS(2000),
-                                        3)) {
-        LOG_ERR("[TaskLogger] Failed to lock FS mutex; dropping log event\n");
-        continue;
-      }
-
-      // 3) Create /Pump_Logs if missing
-      if (!LittleFS.exists("/Pump_Logs")) {
-        LittleFS.mkdir("/Pump_Logs");
-      }
-
-      // 4) Do the actual append
-      String fn = "/Pump_Logs/pump" + String(ev.pumpIndex + 1) + "_Log.txt";
-      File f = LittleFS.open(fn, FILE_APPEND);
-      if (!f) {
-        LOG_ERR("[TaskLogger] Failed to open '%s' for append\n", fn.c_str());
-      } else {
-        f.printf("%s %04d-%02d-%02d %02d:%02d:%02d\n",
-                 ev.isStart ? "START" : "STOP",
-                 ev.ts.year(),  ev.ts.month(), ev.ts.day(),
-                 ev.ts.hour(),  ev.ts.minute(), ev.ts.second());
-        f.close();
-      }
-
-      // 5) Always release the mutex
-      xSemaphoreGive(fileSystemMutex);
-    }
+    servicePumpLogBufferOnce(600000UL, 64); // 10-minute flush or 64 pending events
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 

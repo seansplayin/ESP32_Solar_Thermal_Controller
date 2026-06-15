@@ -16,6 +16,7 @@
 #include "TarGZ.h"
 #include <esp_task_wdt.h>
 #include "DiagLog.h"
+#include "Logging.h"
 
 
 extern AsyncWebServer server;
@@ -1250,6 +1251,12 @@ void setupThirdPageRoutes() {
       return;
     }
 
+    // If the user is browsing Pump_Logs, flush RAM-cached START/STOP events first
+    // so newly-created/updated pump log files are visible before listing/downloading.
+    if (dir == "/Pump_Logs" || dir.startsWith("/Pump_Logs/")) {
+      (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(1500), 2);
+    }
+
     if (!takeFileSystemMutexWithRetry("[FS] /fs/list",
                                       pdMS_TO_TICKS(2000), 3)) {
       req->send(503, "application/json", "[]");
@@ -1414,6 +1421,11 @@ void setupThirdPageRoutes() {
     if (!isSafePath(path) || path == "/") {
       req->send(400, "text/plain", "bad path");
       return;
+    }
+
+    // Flush RAM-cached pump events before direct pump-log file downloads.
+    if (path.startsWith("/Pump_Logs/")) {
+      (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(1500), 2);
     }
 
     if (!takeFileSystemMutexWithRetry("[FS] /fs/download(stream)",

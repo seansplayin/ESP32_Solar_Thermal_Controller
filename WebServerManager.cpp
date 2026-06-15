@@ -439,8 +439,11 @@ static void delayedControllerRebootTask(void* pvParameters);
 static void delayedControllerRebootTask(void* pvParameters) {
   (void)pvParameters;
 
-  // Give the HTTP response time to leave the controller before restarting.
-  vTaskDelay(pdMS_TO_TICKS(750));
+  // Give the HTTP response time to leave the controller before restarting, then
+  // flush RAM-cached pump START/STOP events so runtime history survives the reboot.
+  vTaskDelay(pdMS_TO_TICKS(500));
+  (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(3000), 3);
+  vTaskDelay(pdMS_TO_TICKS(250));
   ESP.restart();
 
   vTaskDelete(NULL);
@@ -2782,7 +2785,7 @@ loadConfig(true);
         xTaskCreate(
           delayedControllerRebootTask,
           "DelayedReboot",
-          2048,
+          4096,
           nullptr,
           1,
           nullptr
@@ -2858,6 +2861,10 @@ void refreshRuntimeCache() {
 
 
 void updateAllRuntimes() {
+    // Pump START/STOP events are now RAM-cached first.
+    // Flush them before runtime aggregation so the webpage sees current logs.
+    (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(1000), 2);
+
     // Capture the version that caused this build before doing the long filesystem work.
     // If another page requests a newer version while this build is running, the task
     // will process that next queued notification afterward.

@@ -117,6 +117,248 @@ static uint32_t claimJobs() {
 
 extern QueueHandle_t logQueue;
 
+// -----------------------------------------------------------------------------
+// Pump log RAM buffering
+// -----------------------------------------------------------------------------
+// Pump START/STOP events are control-history data. They must not be lost just
+// because a large TGZ download, file browser stream, or cleanup task is holding
+// the filesystem mutex.  Phase 1 behavior:
+//   * logPumpEvent() captures the event in RAM immediately.
+//   * TaskLogger flushes RAM events to /Pump_Logs every 10 minutes or when the
+//     buffer reaches a small threshold.
+//   * Web/runtime code can call flushPendingPumpLogEvents() before reading logs.
+//
+// This keeps pump control and runtime accounting independent from long FS work.
+static constexpr size_t PUMP_LOG_PENDING_CAPACITY = 512;
+static constexpr size_t PUMP_LOG_FLUSH_CHUNK      = 64;
+
+static LogEvent g_pendingPumpLogs[PUMP_LOG_PENDING_CAPACITY];
+static size_t   g_pendingPumpLogHead  = 0;
+static size_t   g_pendingPumpLogCount = 0;
+
+static SemaphoreHandle_t g_pendingPumpLogMutex = nullptr;
+static SemaphoreHandle_t g_pumpLogFlushMutex   = nullptr;
+static uint32_t          g_lastPumpLogFlushMs  = 0;
+
+static void ensurePumpLogBufferMutexes() {
+  if (!g_pendingPumpLogMutex) {
+    g_pendingPumpLogMutex = xSemaphoreCreateMutex();
+  }
+  if (!g_pumpLogFlushMutex) {
+    g_pumpLogFlushMutex = xSemaphoreCreateMutex();
+  }
+}
+
+static bool validPumpLogIndex(uint8_t pumpIndex) {
+  return pumpIndex < 10;
+}
+
+bool bufferPumpLogEvent(const LogEvent& ev, TickType_t waitTicks) {
+  if (!validPumpLogIndex(ev.pumpIndex)) {
+    LOG_ERR("[PumpLogBuffer] Invalid pump index %u; event ignored\n", (unsigned)ev.pumpIndex);
+    return true; // handled/ignored; do not keep retrying an invalid event
+  }
+
+  ensurePumpLogBufferMutexes();
+  if (!g_pendingPumpLogMutex) return false;
+
+  if (xSemaphoreTake(g_pendingPumpLogMutex, waitTicks) != pdTRUE) {
+    return false;
+  }
+
+  if (g_pendingPumpLogCount >= PUMP_LOG_PENDING_CAPACITY) {
+    xSemaphoreGive(g_pendingPumpLogMutex);
+    LOG_ERR("[PumpLogBuffer] RAM buffer FULL; pump event not buffered. pump=%u pending=%u\n",
+            (unsigned)(ev.pumpIndex + 1), (unsigned)g_pendingPumpLogCount);
+    return false;
+  }
+
+  size_t pos = (g_pendingPumpLogHead + g_pendingPumpLogCount) % PUMP_LOG_PENDING_CAPACITY;
+  g_pendingPumpLogs[pos] = ev;
+  g_pendingPumpLogCount++;
+
+  xSemaphoreGive(g_pendingPumpLogMutex);
+  return true;
+}
+
+size_t getPendingPumpLogEventCount() {
+  ensurePumpLogBufferMutexes();
+  if (!g_pendingPumpLogMutex) return 0;
+
+  size_t n = 0;
+  if (xSemaphoreTake(g_pendingPumpLogMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    n = g_pendingPumpLogCount;
+    xSemaphoreGive(g_pendingPumpLogMutex);
+  }
+  return n;
+}
+
+static void drainLegacyPumpLogQueueToRam() {
+  if (!logQueue) return;
+
+  LogEvent ev;
+  uint16_t drained = 0;
+  while (xQueueReceive(logQueue, &ev, 0) == pdTRUE) {
+    (void)bufferPumpLogEvent(ev, pdMS_TO_TICKS(5));
+    drained++;
+    if (drained >= 64) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      drained = 0;
+    }
+  }
+}
+
+static size_t copyPendingPumpLogChunk(LogEvent* out, size_t maxEvents, size_t targetRemaining) {
+  if (!out || maxEvents == 0 || targetRemaining == 0) return 0;
+
+  ensurePumpLogBufferMutexes();
+  if (!g_pendingPumpLogMutex) return 0;
+
+  size_t copied = 0;
+  if (xSemaphoreTake(g_pendingPumpLogMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    copied = g_pendingPumpLogCount;
+    if (copied > maxEvents) copied = maxEvents;
+    if (copied > targetRemaining) copied = targetRemaining;
+
+    for (size_t i = 0; i < copied; i++) {
+      size_t pos = (g_pendingPumpLogHead + i) % PUMP_LOG_PENDING_CAPACITY;
+      out[i] = g_pendingPumpLogs[pos];
+    }
+    xSemaphoreGive(g_pendingPumpLogMutex);
+  }
+  return copied;
+}
+
+static void removeFlushedPumpLogEvents(size_t count) {
+  if (count == 0) return;
+
+  ensurePumpLogBufferMutexes();
+  if (!g_pendingPumpLogMutex) return;
+
+  if (xSemaphoreTake(g_pendingPumpLogMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (count > g_pendingPumpLogCount) count = g_pendingPumpLogCount;
+    g_pendingPumpLogHead = (g_pendingPumpLogHead + count) % PUMP_LOG_PENDING_CAPACITY;
+    g_pendingPumpLogCount -= count;
+    xSemaphoreGive(g_pendingPumpLogMutex);
+  }
+}
+
+static bool writePumpLogEventsToFs(const LogEvent* events,
+                                   size_t count,
+                                   size_t& successCount,
+                                   TickType_t mutexWaitTicks,
+                                   uint8_t retries) {
+  successCount = 0;
+  if (!events || count == 0) return true;
+
+  if (!g_fileSystemReady) {
+    return false;
+  }
+
+  if (!takeFileSystemMutexWithRetry("[PumpLogBuffer] flush", mutexWaitTicks, retries)) {
+    return false;
+  }
+
+  if (!LittleFS.exists("/Pump_Logs")) {
+    LittleFS.mkdir("/Pump_Logs");
+  }
+
+  bool ok = true;
+  for (size_t i = 0; i < count; i++) {
+    const LogEvent& ev = events[i];
+
+    if (!validPumpLogIndex(ev.pumpIndex)) {
+      successCount++;
+      continue;
+    }
+
+    String fn = "/Pump_Logs/pump" + String(ev.pumpIndex + 1) + "_Log.txt";
+    File f = LittleFS.open(fn, FILE_APPEND);
+    if (!f) {
+      LOG_ERR("[PumpLogBuffer] Failed to open '%s' for append\n", fn.c_str());
+      ok = false;
+      break;
+    }
+
+    f.printf("%s %04d-%02d-%02d %02d:%02d:%02d\n",
+             ev.isStart ? "START" : "STOP",
+             ev.ts.year(),  ev.ts.month(), ev.ts.day(),
+             ev.ts.hour(),  ev.ts.minute(), ev.ts.second());
+    f.close();
+    successCount++;
+
+    if ((i % 16) == 15) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+
+  xSemaphoreGive(fileSystemMutex);
+  return ok;
+}
+
+bool flushPendingPumpLogEvents(TickType_t mutexWaitTicks, uint8_t retries) {
+  drainLegacyPumpLogQueueToRam();
+
+  ensurePumpLogBufferMutexes();
+  if (!g_pumpLogFlushMutex) return false;
+
+  if (xSemaphoreTake(g_pumpLogFlushMutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+    return false; // another caller is already flushing
+  }
+
+  size_t target = getPendingPumpLogEventCount();
+  size_t remaining = target;
+  bool allOk = true;
+
+  LogEvent chunk[PUMP_LOG_FLUSH_CHUNK];
+
+  while (remaining > 0) {
+    size_t n = copyPendingPumpLogChunk(chunk, PUMP_LOG_FLUSH_CHUNK, remaining);
+    if (n == 0) break;
+
+    size_t success = 0;
+    bool ok = writePumpLogEventsToFs(chunk, n, success, mutexWaitTicks, retries);
+
+    if (success > 0) {
+      removeFlushedPumpLogEvents(success);
+      remaining = (success >= remaining) ? 0 : (remaining - success);
+    }
+
+    if (!ok || success < n) {
+      allOk = false;
+      break;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  if (allOk) {
+    g_lastPumpLogFlushMs = millis();
+  }
+
+  xSemaphoreGive(g_pumpLogFlushMutex);
+  return allOk;
+}
+
+void servicePumpLogBufferOnce(uint32_t flushIntervalMs, size_t flushCountThreshold) {
+  drainLegacyPumpLogQueueToRam();
+
+  size_t pending = getPendingPumpLogEventCount();
+  if (pending == 0) return;
+
+  uint32_t now = millis();
+  bool dueByTime = (g_lastPumpLogFlushMs == 0) || ((uint32_t)(now - g_lastPumpLogFlushMs) >= flushIntervalMs);
+  bool dueByCount = (pending >= flushCountThreshold);
+
+  if (dueByTime || dueByCount) {
+    if (!flushPendingPumpLogEvents(pdMS_TO_TICKS(2000), 3)) {
+      LOG_CAT(DBG_PUMPLOG,
+              "[PumpLogBuffer] Flush deferred; pending=%u FS may be busy\n",
+              (unsigned)getPendingPumpLogEventCount());
+    }
+  }
+}
+
 // 4 functions in this file that read/write to file system for Pump Logs:
 // logPumpEvent, aggregatePumptoDailyLogs, aggregateDailyToMonthlyLogs, aggregateMonthlyToYearlyLogs
 
@@ -126,14 +368,23 @@ DateTime parseDateTime(String datetimeStr);
 DateTime parseDateTimeFromLog(const String& datetimeStr);
 
 // New queue based Logging Topology for Pump Runtimes: checkTimeAndAct → setElapsed_Day / setperformLogAggregation → performLogAggregation.
-// queue is written to LittleFS File System using task "TaskLogger" in TaskManager.cpp file.
-// Log pump event (writer version — called from processLogQueue)
+// Phase 1 update: logPumpEvent now captures the event in RAM immediately.
+// TaskLogger later flushes RAM events to /Pump_Logs so long TGZ/file-browser activity
+// cannot cause START/STOP events to be dropped.
 void logPumpEvent(uint8_t pumpIndex, bool isStart, const DateTime &ts) {
-  if (!logQueue) return;
   LogEvent ev{ pumpIndex, isStart, ts };
 
-  // Never block here; TaskLogger is the single consumer.
-  (void)xQueueSend(logQueue, &ev, 0);
+  if (bufferPumpLogEvent(ev, pdMS_TO_TICKS(10))) {
+    return;
+  }
+
+  // Fallback only.  The normal path is the RAM buffer above.
+  if (logQueue && xQueueSend(logQueue, &ev, 0) == pdTRUE) {
+    return;
+  }
+
+  LOG_ERR("[PumpLogBuffer] FAILED to capture pump event. pump=%u state=%s\n",
+          (unsigned)(pumpIndex + 1), isStart ? "START" : "STOP");
 }
 
 //********List files in the LittleFS********
@@ -585,6 +836,9 @@ void aggregateMonthlyToYearlyLogs(int pumpIndex) {
 }
 
 void performLogAggregation() {
+  // Make sure RAM-cached START/STOP events are on disk before aggregation reads /Pump_Logs.
+  (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(1000), 2);
+
   // Aggregate daily logs for each pump
   memMark("AGG_start");
   for (int i = 0; i < 10; i++) {

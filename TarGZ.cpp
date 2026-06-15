@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "DiagLog.h"
+#include "Logging.h"
 
 
 
@@ -387,6 +388,13 @@ static void handleDownloadCompressed(AsyncWebServerRequest* request) {
   if (!isSafePath(dir)) {
     request->send(400, "text/plain", "Unsafe path");
     return;
+  }
+
+  // Pump log archives must include any RAM-cached START/STOP events before
+  // the directory is compressed.  This is intentionally best-effort: if a huge
+  // archive is already using the FS, the request will still fail via tgzInProgress/FS busy.
+  if (dir == "/Pump_Logs" || dir.startsWith("/Pump_Logs/")) {
+    (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(3000), 3);
   }
 
   // Validate directory existence under mutex

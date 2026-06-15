@@ -475,6 +475,10 @@ ESP32_Solar_Thermal_Controller_20260613094449 - small changes to DS18B20 page, c
 
 ESP32_Solar_Thermal_Controller_20260614092600 - Modified file system options under Pump Runtimes/Temperature Logs webpage sections and moved Flash Memory Browser to the Unused Webpage Dashboard section. Resolved directory deletion failure when not empty. Resolved intermittent Temperature Logs download failure and tgz compressor now ignores connection status. This comes with a small caviat that if a network disconnect occurs the compressor will continue to run until the operation is complete even though there is no client to receive the data. 
 
+ESP32_Solar_Thermal_Controller_20260614225730 - Pump Log RAM Buffering, Pump START/STOP events are captured in RAM first, logPumpEvent() no longer depends on immediate filesystem access. This protects pump runtime history if a large .tar.gz download is holding the filesystem mutex. TaskLogger now flushes RAM-cached pump events, Flushes every 10 minutes, Also flushes sooner if 64 pump events are pending. Events remain in RAM if the filesystem is busy, instead of being dropped. Webpage runtime aggregation flushes first updateAllRuntimes() now flushes pending pump events before parsing /Pump_Logs. This covers both: the automatic Update All when the Pump Runtimes iframe loads the manual Update All button Pump log browser/download flushes first Browsing /Pump_Logs flushes pending events before listing. Downloading an individual pump log flushes first. Downloading /Pump_Logs as .tar.gz flushes first. Daily aggregation flushes first performLogAggregation() flushes pending pump events before aggregating daily/monthly/yearly runtime files. Reboot button flushes first The delayed reboot task now flushes pending pump events before calling ESP.restart().
+
+
+
 
 
 Work on this in the future:
