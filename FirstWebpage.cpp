@@ -6,7 +6,7 @@
 #include "DiagLog.h"
 
 
-#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260614225730 - "
+#define VERSION_INFO " - ESP32_Solar_Thermal_Controller_20260614234210 - "
 
 extern AsyncWebServer server;
 

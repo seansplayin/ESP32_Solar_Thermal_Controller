@@ -513,27 +513,44 @@ void setupPumpBroadcasting() {
 // ***** Set Pump State Function *****
 void setPumpState(int pumpIndex, int state) {
     int arrayIndex = pumpIndex; // Now zero-based index
+
     // Validate arrayIndex
     if (arrayIndex < 0 || arrayIndex >= 10) {
         LOG_ERR("[Pump] Invalid pump index in setPumpState.\n");
         return;
     }
 
+    // Only START/STOP log real state edges.  A lot of code paths call
+    // setPumpState(PUMP_OFF) or setPumpState(PUMP_ON) as an "ensure" action
+    // when applying modes, refreshing UI state, or enforcing AUTO logic.
+    // Logging those non-edges creates duplicate STOP rows and can confuse
+    // runtime review.  We still refresh the physical relay output and
+    // broadcast status so the webpage stays current, but the pump runtime
+    // history only records actual OFF->ON and ON->OFF transitions.
+    const bool stateChanged = (pumpStates[arrayIndex] != state);
+
     // Determine the digital signal to write based on the relay style
     bool isActiveHigh = pumpOnStateHigh[arrayIndex];
     int signal = (state == PUMP_ON) ? (isActiveHigh ? HIGH : LOW) :
                                        (isActiveHigh ? LOW : HIGH);
 
-    // Update the physical state of the pump
+    // Refresh the physical output even when state did not change.  This is
+    // harmless and keeps apply-mode / recovery style calls deterministic.
     digitalWrite(pumpPins[arrayIndex], signal);
-    pumpStates[arrayIndex] = state;
 
-    // Log the event
-    LOG_CAT(DBG_PUMP, "[Pump] Pump %d %s\n", pumpIndex + 1, (state == PUMP_ON ? "ON" : "OFF"));
+    if (stateChanged) {
+        pumpStates[arrayIndex] = state;
 
-    logPumpEvent(pumpIndex, state == PUMP_ON, getCurrentTimeAtomic());
+        LOG_CAT(DBG_PUMP, "[Pump] Pump %d %s\n",
+                pumpIndex + 1, (state == PUMP_ON ? "ON" : "OFF"));
 
-    // Broadcast the new state
+        logPumpEvent(pumpIndex, state == PUMP_ON, getCurrentTimeAtomic());
+    } else {
+        LOG_CAT(DBG_PUMP, "[Pump] Pump %d already %s - no runtime log event\n",
+                pumpIndex + 1, (state == PUMP_ON ? "ON" : "OFF"));
+    }
+
+    // Broadcast the current state/mode even if this was an ensure-only call.
     broadcastPumpState(pumpIndex);
 }
 

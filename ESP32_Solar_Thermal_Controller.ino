@@ -477,6 +477,7 @@ ESP32_Solar_Thermal_Controller_20260614092600 - Modified file system options und
 
 ESP32_Solar_Thermal_Controller_20260614225730 - Pump Log RAM Buffering, Pump START/STOP events are captured in RAM first, logPumpEvent() no longer depends on immediate filesystem access. This protects pump runtime history if a large .tar.gz download is holding the filesystem mutex. TaskLogger now flushes RAM-cached pump events, Flushes every 10 minutes, Also flushes sooner if 64 pump events are pending. Events remain in RAM if the filesystem is busy, instead of being dropped. Webpage runtime aggregation flushes first updateAllRuntimes() now flushes pending pump events before parsing /Pump_Logs. This covers both: the automatic Update All when the Pump Runtimes iframe loads the manual Update All button Pump log browser/download flushes first Browsing /Pump_Logs flushes pending events before listing. Downloading an individual pump log flushes first. Downloading /Pump_Logs as .tar.gz flushes first. Daily aggregation flushes first performLogAggregation() flushes pending pump events before aggregating daily/monthly/yearly runtime files. Reboot button flushes first The delayed reboot task now flushes pending pump events before calling ESP.restart().
 
+ESP32_Solar_Thermal_Controller_20260614234210 - Pump log start and stop events are now only recorded when the relay state change occurs.   
 
 
 
