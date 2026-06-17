@@ -1,56 +1,103 @@
+// Max31865-PT1000.cpp
 #include "Max31865-PT1000.h"
+#include <Arduino.h>
 #include <Adafruit_MAX31865.h>
 #include "Config.h"
 #include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "esp_task_wdt.h"
+#include "DiagLog.h"
+#include "AlarmManager.h"
+#include <SPI.h>
 
 #define RREF      4300.0
 #define RNOMINAL  1000.0
 
-Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS_PIN, MAX31865_DO_PIN, MAX31865_DI_PIN, MAX31865_CLK_PIN);
+// 1. Create a dedicated HSPI instance to force Max31865 to use Hardware SPI
+SPIClass spiMAX(HSPI);
+
+//Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS_PIN, MAX31865_DO_PIN, MAX31865_DI_PIN, MAX31865_CLK_PIN);
+// 2. Use the 2-argument constructor: (CS_PIN, &SPI_PORT) this will force hardware spi mode.
+Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS_PIN, &spiMAX);
+
 
 float pt1000Current = 0.0;
 float pt1000Average = 0.0;
+uint32_t pt1000LastGoodReadMs = 0;
 
 #define pt1000NumReadings 3
 float pt1000Values[pt1000NumReadings];
 int pt1000Index = 0;
 
 void initPT1000Sensor() {
+
+    // 3. Initialize the HSPI bus BEFORE beginning the thermo sensor
+    // spiMAX.begin(SCK, MISO, MOSI, SS);
+    spiMAX.begin(MAX31865_CLK_PIN, MAX31865_DO_PIN, MAX31865_DI_PIN, MAX31865_CS_PIN);
+
     thermo.begin(MAX31865_4WIRE);
+
     for (int i = 0; i < pt1000NumReadings; i++) {
-        pt1000Values[i] = 32.0; // Default 0°C (32°F)
+        pt1000Values[i] = 32.0f; // Default 0°C (32°F)
     }
-    pt1000Current = 32.0;
-    pt1000Average = 32.0;
+
+    pt1000Current = 32.0f;
+    pt1000Average = 32.0f;
+    pt1000LastGoodReadMs = 0;
+
+    LOG_CAT(DBG_RTD, "[PT1000] MAX31865 init complete (4-wire). Defaults set to 32.0F\n");
 }
 
 float calculatePT1000Average(float values[], int numReadings, int currentIndex) {
-    float sum = 0;
+    float sum = 0.0f;
     int count = 0;
+
     for (int i = 0; i < numReadings && i <= currentIndex; i++) {
-        if (values[i] > -100.0) {
+        if (values[i] > -100.0f) {
             sum += values[i];
             count++;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    return count > 0 ? sum / count : -999.0; // PT1000-specific invalid marker
+
+    return (count > 0) ? (sum / (float)count) : -999.0f; // PT1000-specific invalid marker
 }
 
 void updatePT1000Readings() {
-    float newF = thermo.temperature(RNOMINAL, RREF) * 1.8 + 32;
+    // Check for hardware faults first
+    uint8_t fault = thermo.readFault();
+    if (fault) {
+        LOG_ERR("[PT1000] Hardware Fault Detected: 0x%02X\n", fault);
+        AlarmManager_set(ALM_PT1000_FAULT, ALM_ALARM, "PT1000 Sensor HW Fault (Code 0x%02X)", fault);
+        thermo.clearFault();
+        
+        // Use a default/error value so the system knows it's invalid
+        pt1000Values[pt1000Index] = -999.0f; 
+    } else {
+        // Clear the alarm if the sensor comes back online
+        AlarmManager_clear(ALM_PT1000_FAULT, "PT1000 Online");
 
-    if (newF <= -100.0 || isnan(newF)) {
+        float newF = thermo.temperature(RNOMINAL, RREF) * 1.8f + 32.0f;
+        bool validRead = !(newF <= -100.0f || isnan(newF));
+
+    if (!validRead) {
         // invalid, keep last average
+        LOG_ERR("[PT1000] Invalid reading (%.2f). Keeping last average %.2f\n", newF, pt1000Average);
         newF = pt1000Average;
     }
 
-    // rolling window
+// rolling window
     pt1000Values[pt1000Index] = newF;
     pt1000Current = newF;
     pt1000Index = (pt1000Index + 1) % pt1000NumReadings;
     pt1000Average = calculatePT1000Average(pt1000Values, pt1000NumReadings, pt1000Index);
+
+    if (validRead) {
+        pt1000LastGoodReadMs = millis();
+    }
+
+    LOG_CAT(DBG_RTD, "[PT1000] Current=%.2fF Avg=%.2fF (idx=%d)\n", pt1000Current, pt1000Average, pt1000Index);
 }
+}
+

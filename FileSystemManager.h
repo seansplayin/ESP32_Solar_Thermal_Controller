@@ -1,3 +1,4 @@
+// FileSystemManager.h
 #ifndef FILE_SYSTEM_MANAGER_H
 #define FILE_SYSTEM_MANAGER_H
 
@@ -6,11 +7,22 @@
 #include <RTClib.h>
 #include <FreeRTOS.h>
 #include <semphr.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// ================================
+// ✅ Log File FILESYSTEM MUTEX
+// ================================
+File openLogFileUnlocked(const String& filename, const char* mode);
+File openLogFileLocked(const String& filename, const char* mode);
+void closeLogFileLocked(File& f);
+
 
 // ================================
 // ✅ GLOBAL FILESYSTEM MUTEX
 // ================================
 extern SemaphoreHandle_t fileSystemMutex;
+extern bool g_fileSystemReady;
 
 // ================================
 // FILESYSTEM CORE CONTROL
@@ -31,7 +43,8 @@ void closeAllOpenPumpLogs();
 // ================================
 // MEMORY / DISK STATS
 // ================================
-String getFreeHeapString();
+extern String g_cachedFsStatsJson;
+void updateFSStatsCache();
 String getFSStatsString();
 
 // ================================
@@ -44,17 +57,13 @@ bool deleteTemperatureLogsRecursive(const char* basePath = "/Temperature_Logs");
 // ✅ AUTO CLEANUP WHEN DISK FULL
 void enforceTemperatureLogDiskLimit();
 
-
-
-extern bool g_fileSystemReady;
-
-
 bool mountLittleFS();
 
 
 bool takeFileSystemMutexWithRetry(const char *tag,
                                   TickType_t perAttemptTicks,
                                   int maxAttempts);
+
 
 
 #endif // FILE_SYSTEM_MANAGER_H

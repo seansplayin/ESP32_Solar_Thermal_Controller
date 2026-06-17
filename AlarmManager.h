@@ -1,3 +1,4 @@
+// AlarmManager.h
 #ifndef ALARMMANAGER_H
 #define ALARMMANAGER_H
 
@@ -6,21 +7,21 @@
 #include <stddef.h>
 
 // Severity
-enum AlarmSeverity : uint8_t {
+enum AlarmSeverity {
   ALM_INFO  = 0,
   ALM_WARN  = 1,
   ALM_ALARM = 2
 };
 
 // Action (what happened)
-enum AlarmAction : uint8_t {
+enum AlarmAction {
   ALM_ACT_SET   = 0,  // state became active
   ALM_ACT_CLEAR = 1,  // state became inactive
   ALM_ACT_EVENT = 2   // one-off event (no state)
 };
 
 // Codes (keep <= 32 unless you expand ALM_CODE_MAX in AlarmManager.cpp)
-enum AlarmCode : uint8_t {
+enum AlarmCode {
   ALM_NONE = 0,
 
   // Hardware / time
@@ -34,18 +35,18 @@ enum AlarmCode : uint8_t {
   ALM_STORAGE_OVERTEMP   = 6,
 
   // Outside Freeze Protection
-  ALM_COLLECTOR_FREEZE_PROTECT,   // Collector loop freeze-protect cycle active/blocked
-  ALM_CIRC_FREEZE_PROTECT,        // Circ loop freeze-protect cycle active/blocked
+  ALM_COLLECTOR_FREEZE_PROTECT,   
+  ALM_LINE_FREEZE_PROTECT,        
 
+  // Network & Connectivity Events
+  ALM_NETWORK_FAULT,              
+  ALM_WS_DISCONNECT,
 
-  // Heat tape ineffective 
-  ALM_HEAT_TAPE_INEFFECTIVE,   // Heat tape relay ON but CSupply stays freezing
-  ALM_TANK_FREEZE_PROTECT,     // Storage tank freeze protection active/blocked
-
-
-
+  // Sensor & Storage Hardware Faults
+  ALM_FS_WRITE_FAIL,
+  ALM_SENSOR_FAULT,
+  ALM_PT1000_FAULT
 };
-
 
 // Active state
 struct AlarmState {

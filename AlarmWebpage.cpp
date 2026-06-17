@@ -1,7 +1,11 @@
+// AlarmWebpage.cpp
 #include "AlarmWebpage.h"
 #include <ESPAsyncWebServer.h>
 #include <Arduino.h>
 #include "AlarmHistory.h"
+#include <ArduinoJson.h>
+#include "DiagLog.h"
+
 
 // Provided by WebServerManager.cpp
 extern AsyncWebServer server;
@@ -139,15 +143,16 @@ async function load(){
       setExpandedGroups(expGroups);
     });
 
-    tr.innerHTML =
+      tr.innerHTML =
       `<td></td>
-       <td>${fmtTs(g.latest.ts)}</td>
-       <td>${sev}</td>
-       <td>${g.code}</td>
-       <td>${act}</td>
-       <td>${g.detail}</td>
-       <td>${dupCount}</td>
-       <td></td>`;
+      <td>${fmtTs(g.latest.ts)}</td>
+      <td>${sev}</td>
+      <td>${g.code}</td>
+      <td>${act}</td>
+      <td>${(g.latest && g.latest.detail) ? g.latest.detail : ''}</td>
+      <td>${dupCount}</td>
+      <td></td>`;
+
 
     // left column: group checkbox + newest checkbox stacked
     const cell0 = tr.children[0];
@@ -176,14 +181,15 @@ async function load(){
       cb.setAttribute('data-group-child', idx);
 
       tr2.innerHTML =
-        `<td></td>
-         <td>${fmtTs(d.ts)}</td>
-         <td>${sev}</td>
-         <td>${g.code}</td>
-         <td>${act}</td>
-         <td>${g.detail}</td>
-         <td></td>
-         <td></td>`;
+      `<td></td>
+      <td>${fmtTs(d.ts)}</td>
+      <td>${sev}</td>
+      <td>${g.code}</td>
+      <td>${act}</td>
+      <td>${d.detail || ''}</td>
+      <td></td>
+      <td></td>`;
+
       tr2.children[0].appendChild(cb);
       tb.appendChild(tr2);
     });

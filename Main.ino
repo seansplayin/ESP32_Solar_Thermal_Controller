@@ -1,3 +1,4 @@
+// Main.ino
 #include <Arduino.h>
 #include <FreeRTOS.h>
 #include <Ticker.h>
@@ -17,6 +18,10 @@
 #include "Max31865-PT1000.h"
 #include "DS18B20.h"
 #include "TemperatureLogging.h"
+#include "DiagLog.h"
+#include <esp_system.h>
+
+
 
 #define configGENERATE_RUN_TIME_STATS        1
 #define configUSE_STATS_FORMATTING_FUNCTIONS 1
@@ -36,47 +41,74 @@ struct TempEntry {
 
 
 
+void setup() { 
+#if ENABLE_SERIAL_DIAGNOSTICS
+  Serial.begin(115200);
+
+  // Early boot defaults (may be overridden later by config loads)
+  g_config.diagSerialEnable = (DIAG_SERIAL_DEFAULT_ENABLE != 0);
+  g_config.diagSerialMask   = (uint32_t)DIAG_SERIAL_DEFAULT_MASK;
+
+  // Crash detector: if last reset looks like a crash/WDT/panic, force ALL categories for this boot only
+  esp_reset_reason_t rr = esp_reset_reason();
+  bool crashy =
+      (rr == ESP_RST_PANIC)     ||
+      (rr == ESP_RST_INT_WDT)   ||
+      (rr == ESP_RST_TASK_WDT)  ||
+      (rr == ESP_RST_WDT);
+
+  if (crashy) {
+    g_config.diagSerialEnable = true;
+    g_config.diagSerialMask   = DBG_ALL;
+
+    Serial.println();
+    Serial.printf("[BOOT] Crashy reset detected (reason=%d). Forcing DBG_ALL for THIS BOOT ONLY.\n", (int)rr);
+  } else {
+    Serial.println();
+    Serial.println("[BOOT] Serial enabled; using Config.h diag defaults until FS config loads.");
+  }
+#endif
+
+  esp_task_wdt_deinit();
+  esp_task_wdt_config_t wdt_config = {
 
 
+      .timeout_ms = 15000,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
 
-void setup() {
-Serial.begin(115200);
+  initPT1000Sensor();             // Initialize the Max31865 sensor
+  initDs18B20ConfigDefaults();    // Seed DS18B20 assignment defaults before tasks start
+  // DS18B20 sensors are initialized after LittleFS/config load in TaskLoadSystemConfigFromFS().
 
-esp_task_wdt_deinit();
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = 15000,
-        .idle_core_mask = 0,
-        .trigger_panic = true
-    };
-    esp_task_wdt_init(&wdt_config);
-  
-  initPT1000Sensor();   // Initialize the Max31865 sensor
-  initDS18B20Sensors();   // Initialize DS18B20 sensors
- 
-    // Create mutexes
-    pumpStateMutex = xSemaphoreCreateMutex();
-    if (pumpStateMutex == NULL) {
-        Serial.println("Failed to create pumpStateMutex");
-        while (1); // Halt execution
-    }
+  // Create mutexes
+  pumpStateMutex = xSemaphoreCreateMutex();
+  if (pumpStateMutex == NULL) {
+    LOG_ERR("[BOOT] Failed to create pumpStateMutex\n");
+    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); } // Halt execution
+  }
 
-    temperatureMutex = xSemaphoreCreateMutex();
-    if (temperatureMutex == NULL) {
-        Serial.println("Failed to create temperatureMutex");
-        while (1); // Halt execution
-    }
+  temperatureMutex = xSemaphoreCreateMutex();
+  if (temperatureMutex == NULL) {
+    LOG_ERR("[BOOT] Failed to create temperatureMutex\n");
+    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); } // Halt execution
+  }
 
-    fileSystemMutex = xSemaphoreCreateMutex();
-    if (fileSystemMutex == NULL) {
-        Serial.println("Failed to create fileSystemMutex");
-        while (1); // Halt execution
-    }
+  fileSystemMutex = xSemaphoreCreateMutex();
+  if (fileSystemMutex == NULL) {
+    LOG_ERR("[BOOT] Failed to create fileSystemMutex\n");
+    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); } // Halt execution
+  }
 
-    startAllTasks();  // Starts all tasks defined in TaskManager.cpp
+  LOG_CAT(DBG_TASK, "[BOOT] Mutexes created; starting all tasks...\n");
 
-   
+  startAllTasks();  // Starts all tasks defined in TaskManager.cpp
 }
 
 void loop() {
-    delay(1);
- }
+
+
+}
+

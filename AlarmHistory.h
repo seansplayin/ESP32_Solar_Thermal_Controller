@@ -1,5 +1,7 @@
+// AlarmHistory.h
 #pragma once
 #include <Arduino.h>
+#include <stddef.h>  // for size_t
 #include <stdint.h>
 #include "AlarmManager.h"
 

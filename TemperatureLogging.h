@@ -3,6 +3,11 @@
 
 #include <Arduino.h>
 
+// -----------------------------------------------------------------------
+// Mutex handles as extern to be accessible in other files - do not change
+// -----------------------------------------------------------------------
+extern SemaphoreHandle_t fileSystemMutex;
+
 // Set up directories and internal state for temperature logging
 void setupTemperatureLogging();
 
