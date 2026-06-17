@@ -1,4 +1,3 @@
-// AlarmHistory.cpp
 #include "AlarmHistory.h"
 #include "FileSystemManager.h"
 #include <LittleFS.h>
@@ -6,8 +5,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "DiagLog.h"
-
 
 extern bool g_fileSystemReady;
 extern SemaphoreHandle_t fileSystemMutex;
@@ -19,10 +16,9 @@ static const char* TMP_PATH  = "/Alarm_Logs/alarm_history.tmp";
 static const uint8_t MAX_GROUPS = 40;
 static const uint8_t MAX_DUPES  = 10;   // duplicates under the newest (so total per group = 1 + MAX_DUPES)
 
-struct Rec {
+struct RecRef {
   uint32_t id;
   uint32_t epoch;
-  char detail[140];
 };
 
 struct Group {
@@ -30,10 +26,10 @@ struct Group {
   uint8_t sev = 0;
   uint16_t code = 0;
   uint8_t action = 0;
-  char baseDetail[140] = {0};  // Normalized for grouping
+  char detail[140] = {0};
 
   uint8_t count = 0;           // how many recs used in recs[]
-  Rec recs[1 + MAX_DUPES];     // recs[0] newest, then older
+  RecRef recs[1 + MAX_DUPES];  // recs[0] newest, then older
   uint32_t latestEpoch = 0;
 };
 
@@ -67,58 +63,20 @@ static void jsonEscapePrint(Print& out, const char* s) {
   }
 }
 
-static void normalizeDetailKey(const char* in, char* out, size_t outSize) {
-  if (!out || outSize == 0) return;
-  out[0] = '\0';
-  if (!in) return;
-
-  const char* cut = strchr(in, '(');              // cut off dynamic "(...)" portion
-  size_t n = cut ? (size_t)(cut - in) : strlen(in);
-
-  if (n >= outSize) n = outSize - 1;
-  memcpy(out, in, n);
-  out[n] = '\0';
-
-  // trim trailing whitespace
-  while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\t')) {
-    out[--n] = '\0';
-  }
-}
-
+// Normalize certain alarm detail strings so changing values (temps) don't break dupe grouping.
+// For these patterns we collapse to a stable prefix.
 static void normalizeDetailForGrouping(const char* in, char* out, size_t outSz)
 {
   if (!out || outSz == 0) return;
   out[0] = '\0';
   if (!in) return;
 
-  // Group DS18B20 Offline / Online / Recovered events by logical sensor number.
-  // Example:
-  //   "DS18B20 Sensor 6 Offline" -> "DS18B20 Sensor 6"
-  //   "DS18B20 Sensor 6 Online"  -> "DS18B20 Sensor 6"
-  int ds18SensorNumber = 0;
-  char ds18State[16] = {0};
-
-  if (sscanf(in, "DS18B20 Sensor %d %15s", &ds18SensorNumber, ds18State) == 2) {
-    if (ds18SensorNumber > 0 &&
-        (strcmp(ds18State, "Offline") == 0 ||
-         strcmp(ds18State, "Online") == 0 ||
-         strcmp(ds18State, "Recovered") == 0)) {
-      snprintf(out, outSz, "DS18B20 Sensor %d", ds18SensorNumber);
-      out[outSz - 1] = '\0';
-      return;
-    }
-  }
-
   // Add patterns here as needed
   static const char* kPrefixes[] = {
     "Collector freeze cycle restart",
     "Collector freeze cycle start",
     "Circ freeze cycle restart",
-    "Circ freeze cycle start",
-    "Tank freeze protect started",
-    "Tank freeze protect ended",
-    "Line freeze cycle start",
-    "Line freeze cycle restart"  // Add for new combined
+    "Circ freeze cycle start"
   };
 
   for (size_t i = 0; i < (sizeof(kPrefixes) / sizeof(kPrefixes[0])); i++) {
@@ -136,14 +94,13 @@ static void normalizeDetailForGrouping(const char* in, char* out, size_t outSz)
   out[outSz - 1] = '\0';
 }
 
+
 static bool groupMatches(const Group& g, uint8_t sev, uint16_t code, uint8_t action, const char* detail) {
-  if (!g.used) return false;
-  if (g.sev != sev || g.code != code || g.action != action) return false;
-
-  char key[sizeof(g.baseDetail)];
-  normalizeDetailForGrouping(detail ? detail : "", key, sizeof(key));
-
-  return (strncmp(g.baseDetail, key, sizeof(g.baseDetail)) == 0);
+  return g.used &&
+         g.sev == sev &&
+         g.code == code &&
+         g.action == action &&
+         strncmp(g.detail, detail, sizeof(g.detail)) == 0;
 }
 
 static int findGroup(uint8_t sev, uint16_t code, uint8_t action, const char* detail) {
@@ -173,7 +130,7 @@ static int findOldestGroupIndex() {
   return idx;
 }
 
-static void insertRecordIntoGroup(Group& g, uint32_t id, uint32_t epoch, const char* fullDetail) {
+static void insertRecordIntoGroup(Group& g, uint32_t id, uint32_t epoch) {
   // shift right by 1
   const uint8_t maxCount = (uint8_t)(1 + MAX_DUPES);
   uint8_t newCount = g.count < maxCount ? (g.count + 1) : maxCount;
@@ -181,17 +138,13 @@ static void insertRecordIntoGroup(Group& g, uint32_t id, uint32_t epoch, const c
   for (int i=(int)newCount-1; i>=1; --i) {
     g.recs[i] = g.recs[i-1];
   }
-  g.recs[0].id = id;
-  g.recs[0].epoch = epoch;
-  strncpy(g.recs[0].detail, fullDetail ? fullDetail : "", sizeof(g.recs[0].detail)-1);
-  g.recs[0].detail[sizeof(g.recs[0].detail)-1] = '\0';
-
+  g.recs[0] = {id, epoch};
   g.count = newCount;
   g.latestEpoch = epoch;
 }
 
-static void applyRecord(uint32_t id, uint32_t epoch, uint8_t sev, uint16_t code, uint8_t action, const char* fullDetail) {
-  int gi = findGroup(sev, code, action, fullDetail);
+static void applyRecord(uint32_t id, uint32_t epoch, uint8_t sev, uint16_t code, uint8_t action, const char* detail) {
+  int gi = findGroup(sev, code, action, detail);
   if (gi < 0) {
     int slot = findFreeSlot();
     if (slot < 0) {
@@ -204,12 +157,13 @@ static void applyRecord(uint32_t id, uint32_t epoch, uint8_t sev, uint16_t code,
     g.sev = sev;
     g.code = code;
     g.action = action;
-    normalizeDetailForGrouping(fullDetail ? fullDetail : "", g.baseDetail, sizeof(g.baseDetail));
+    strncpy(g.detail, detail ? detail : "", sizeof(g.detail)-1);
+    g.detail[sizeof(g.detail)-1] = '\0';
     g.count = 0;
     g.latestEpoch = 0;
-    insertRecordIntoGroup(g, id, epoch, fullDetail);
+    insertRecordIntoGroup(g, id, epoch);
   } else {
-    insertRecordIntoGroup(s_groups[gi], id, epoch, fullDetail);
+    insertRecordIntoGroup(s_groups[gi], id, epoch);
   }
 }
 
@@ -233,10 +187,6 @@ static bool persistUnlocked() {
   // This keeps file bounded to <= 40*(1+10) lines.
   for (int i=0;i<MAX_GROUPS;i++){
     if (!s_groups[i].used) continue;
-    
-    // YIELD: Give the network stack breathing room during continuous FS writes
-    vTaskDelay(pdMS_TO_TICKS(1));
-    
     Group& g = s_groups[i];
     for (int r=0; r<g.count; r++){
       f.print("{\"id\":"); f.print(g.recs[r].id);
@@ -244,7 +194,7 @@ static bool persistUnlocked() {
       f.print(",\"sev\":"); f.print(g.sev);
       f.print(",\"code\":"); f.print(g.code);
       f.print(",\"act\":"); f.print(g.action);
-      f.print(",\"msg\":\""); jsonEscapePrint(f, g.recs[r].detail); f.print("\"}\n");
+      f.print(",\"msg\":\""); jsonEscapePrint(f, g.detail); f.print("\"}\n");
     }
   }
   f.close();
@@ -275,9 +225,6 @@ static void loadFromFSUnlocked() {
 
   char line[256];
   while (f.available()) {
-    // YIELD: Give the network stack breathing room during heavy JSON parsing
-    vTaskDelay(pdMS_TO_TICKS(1));
-
     size_t n = f.readBytesUntil('\n', line, sizeof(line)-1);
     line[n] = '\0';
     if (n < 10) continue;
@@ -301,9 +248,9 @@ static void loadFromFSUnlocked() {
   xSemaphoreGive(fileSystemMutex);
 }
 
-
 static void AlarmHistory_sink(const AlarmEvent* e) {
   if (!e || !s_q) return;
+
   Msg m;
   m.id = s_nextId++;          // monotonic id
   m.epoch = e->epoch;
@@ -316,7 +263,6 @@ static void AlarmHistory_sink(const AlarmEvent* e) {
   // Non-blocking enqueue (drop if full)
   xQueueSend(s_q, &m, 0);
 }
-
 
 static void AlarmHistory_task(void*) {
   for (;;) {
@@ -338,7 +284,6 @@ static void AlarmHistory_task(void*) {
     }
   }
 }
-
 
 void AlarmHistory_begin() {
   ensureMutex();
@@ -414,14 +359,15 @@ void AlarmHistory_writeJson(Print& out) {
     out.print("{\"sev\":"); out.print(g.sev);
     out.print(",\"code\":"); out.print(g.code);
     out.print(",\"act\":"); out.print(g.action);
+    out.print(",\"detail\":\""); jsonEscapePrint(out, g.detail); out.print("\"");
     out.print(",\"latest\":{\"id\":"); out.print(g.recs[0].id);
     out.print(",\"ts\":"); out.print(g.recs[0].epoch);
-    out.print(",\"detail\":\""); jsonEscapePrint(out, g.recs[0].detail); out.print("\"}");
+    out.print("}");
     out.print(",\"dupes\":[");
     for (int r=1; r<g.count; r++){
       out.print("{\"id\":"); out.print(g.recs[r].id);
       out.print(",\"ts\":"); out.print(g.recs[r].epoch);
-      out.print(",\"detail\":\""); jsonEscapePrint(out, g.recs[r].detail); out.print("\"}");
+      out.print("}");
       if (r+1<g.count) out.print(",");
     }
     out.print("]}");
@@ -463,7 +409,7 @@ bool AlarmHistory_deleteIds(const uint32_t* ids, size_t n) {
     Group& g = s_groups[gi];
     if (!g.used) continue;
 
-    Rec kept[1+MAX_DUPES];
+    RecRef kept[1+MAX_DUPES];
     uint8_t keptN = 0;
 
     for (int r=0; r<g.count; r++){
@@ -478,7 +424,7 @@ bool AlarmHistory_deleteIds(const uint32_t* ids, size_t n) {
       continue;
     }
 
-    memcpy(g.recs, kept, sizeof(Rec)*keptN);
+    memcpy(g.recs, kept, sizeof(RecRef)*keptN);
     g.count = keptN;
     g.latestEpoch = g.recs[0].epoch;
   }

@@ -1,43 +1,37 @@
-// DS18B20.h
 #ifndef DS18B20_H
 #define DS18B20_H
-
 #include "Config.h"
-#include <OneWireESP32.h>   // correct header for v2.0.3
+#include <DallasTemperature.h>
 
-#define NUM_SENSORS DS18B20_ASSIGNMENT_COUNT
+// Define the number of sensors
+#define NUM_SENSORS 13
 
+// Define sensor mapping
 struct SensorMapping {
-    uint64_t address;
-    int arrayIndex;
+    DeviceAddress address;
+    int arrayIndex; // Corresponds to DTempAverage[arrayIndex]
 };
+
+extern DallasTemperature sensors1;
+extern DallasTemperature sensors2;
 
 extern SensorMapping sensorMappings[NUM_SENSORS];
 
-// Global variables (unchanged API)
-extern float DTemp[NUM_SENSORS];
-extern float DTempAverage[NUM_SENSORS];
-extern uint32_t DTempLastGoodReadMs[NUM_SENSORS];
+// Declare global variables to hold temperature readings and averages
+extern float DTemp[NUM_SENSORS];        // Holds the most recent temperature readings for 13 sensors
 
-// Bus objects (correct class)
-extern OneWire32 sensors1;
-extern OneWire32 sensors2;
+extern float DTempAverage[NUM_SENSORS]; // Holds the rolling average temperature for 13 sensors
 
-// Public functions (exact same signatures as before)
-void initDS18B20Sensors();
-bool ds18B20SensorsReady();
-void updateDS18B20Readings();
-float calculateAverage(float values[], int numReadings);
-void updateDS18B20Temperature(int sensorIndex, float temperature);
+// Function declarations
+void initDS18B20Sensors();               // Initialize DS18B20 sensors
 
-// Manual scan support for the DS18B20 assignment webpage.
-// Returns JSON containing every valid ROM found on Bus 1 and Bus 2.
-// This does not modify the active runtime mapping or saved config.
-String buildDS18B20ScanJson();
+void updateDS18B20Readings();            // Update readings from DS18B20 sensors
 
-// Runtime assignment status for the DS18B20 assignment webpage.
-// present=true only when the configured ROM was accepted on its configured bus.
-// observedBus is the last boot/scan bus where that ROM was actually seen; 0 = not seen.
-bool getDS18B20SlotStatus(uint8_t slot, bool* presentOut, uint8_t* observedBusOut, uint32_t* lastGoodMsOut);
+float calculateAverage(float values[], int numReadings);  // Calculate the rolling average for a sensor
+
+void updateDS18B20Temperature(int sensorIndex, float temperature);  // Update temperature and calculate rolling average
+
+
+
 
 #endif

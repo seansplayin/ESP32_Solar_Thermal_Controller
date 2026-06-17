@@ -1,441 +1,168 @@
-// DS18B20.cpp 
-#include "DS18B20.h"
+// DS18B20.cpp
+#include "DS18B20.h" 
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include "Config.h"
-#include "DiagLog.h"
-#include "AlarmManager.h"
-#include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
-OneWire32 sensors1(ONE_WIRE_BUS_1);
-OneWire32 sensors2(ONE_WIRE_BUS_2);
 
+
+// Define the number of sensors
+#define NUM_SENSORS 13
+
+
+// OneWire bus pins (adjust these based on your configuration)
+OneWire oneWire1(ONE_WIRE_BUS_1);
+OneWire oneWire2(ONE_WIRE_BUS_2);
+
+// DallasTemperature instances for each bus
+DallasTemperature sensors1(&oneWire1);
+DallasTemperature sensors2(&oneWire2);
+
+// Temperature arrays to store readings and averages
 float DTemp[NUM_SENSORS] = {0};
 float DTempAverage[NUM_SENSORS] = {0.0};
-uint32_t DTempLastGoodReadMs[NUM_SENSORS] = {0};
 
+// Sensor offsets (adjust these values for each sensor)
 float sensorOffsets[NUM_SENSORS] = {
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-};
+}; 
 
+// Rolling average settings
 const int numReadings = 3;
 float DTempValues[NUM_SENSORS][numReadings] = {0};
 int readingsIndex[NUM_SENSORS] = {0};
 
-SensorMapping sensorMappings[NUM_SENSORS];  // runtime mapping, indexed by logical sensor index
 
-static bool sensorPresent[NUM_SENSORS] = {false};
-static bool sensorOnBus1[NUM_SENSORS] = {false};
-static bool sensorObserved[NUM_SENSORS] = {false};
-static uint8_t sensorObservedBus[NUM_SENSORS] = {0};
-static bool sensorFaultLatched[NUM_SENSORS] = {false};
+// Define sensor mapping
+// Desktop Sensors
+SensorMapping sensorMappings[NUM_SENSORS] = {
+    { {0x28, 0x5D, 0x4F, 0x57, 0x04, 0xA7, 0x3C, 0xA1}, 0 },  // DSensor1
+    { {0x28, 0x8C, 0x5A, 0x27, 0xB2, 0x22, 0x07, 0x77}, 1 },  // DSensor2
+    { {0x28, 0x04, 0x35, 0x57, 0x04, 0x69, 0x3C, 0xA1}, 2 },  // DSensor3
+    { {0x28, 0xDC, 0xFD, 0x57, 0x04, 0x35, 0x3C, 0xE2}, 3 },  // DSensor4
+    { {0x28, 0xE4, 0xFE, 0x57, 0x04, 0xF6, 0x3C, 0x01}, 4 },  // DSensor5
+    { {0x28, 0xD0, 0xBB, 0x57, 0x04, 0x91, 0x3C, 0x3F}, 5 },  // DSensor6
+    { {0x28, 0xE7, 0x76, 0x57, 0x04, 0xF2, 0x3C, 0x96}, 6 },  // DSensor7
+    { {0x28, 0xFB, 0xD1, 0x57, 0x04, 0x33, 0x3C, 0xA2}, 7 },  // DSensor8
+    { {0x28, 0x9E, 0xE2, 0x57, 0x04, 0xC8, 0x3C, 0xFA}, 8 },  // DSensor9
+    { {0x28, 0xC0, 0x45, 0x57, 0x04, 0x54, 0x3C, 0x2B}, 9 },  // DSensor10
+    { {0x28, 0x7C, 0xC9, 0x81, 0xE3, 0x6F, 0x3C, 0x00}, 10 }, // DSensor11
+    { {0x28, 0xF1, 0x15, 0x48, 0xF6, 0xCD, 0x3C, 0x75}, 11 }, // DSensor12
+    { {0x28, 0xBF, 0x56, 0x48, 0xB2, 0x22, 0x07, 0xE8}, 12 }  // DSensor13
+};
+/*
+// Solar System Sensors
+SensorMapping sensorMappings[NUM_SENSORS] = {
+    { {0x28, 0x37, 0x16, 0x49, 0xF6, 0x0D, 0x3C, 0x2D}, 0 },
+    { {0x28, 0x69, 0x9A, 0x48, 0xF6, 0x7A, 0x3C, 0xAD}, 1 },
+    { {0x28, 0x52, 0x16, 0x96, 0xF0, 0x01, 0x3C, 0x02}, 2 },
+    { {0x28, 0x85, 0xEA, 0x81, 0xE3, 0x2B, 0x3C, 0xF2}, 3 },
+    { {0x28, 0xF6, 0xA9, 0x0E, 0xB2, 0x22, 0x07, 0x2B}, 4 },
+    { {0x28, 0x2A, 0x84, 0x96, 0xF0, 0x01, 0x3C, 0x0F}, 5 },
+    { {0x28, 0x29, 0x1A, 0x81, 0xE3, 0x53, 0x3C, 0xB5}, 6 },
+    { {0x28, 0x22, 0xC6, 0x81, 0xE3, 0x17, 0x3C, 0x92}, 7 },
+    { {0x28, 0x66, 0xF1, 0x81, 0xE3, 0xD2, 0x3C, 0xA5}, 8 },
+    { {0x28, 0x22, 0x14, 0x81, 0xE3, 0xDC, 0x3C, 0xD8}, 9 },
+    { {0x28, 0x03, 0xBD, 0x08, 0xB2, 0x22, 0x09, 0xC7}, 10 },
+    { {0x28, 0xDD, 0x9B, 0x96, 0xF0, 0x01, 0x3C, 0xEB}, 11 },
+    { {0x28, 0x37, 0xE2, 0x48, 0xF6, 0xE6, 0x3C, 0x4D}, 12 },
+};    
+*/
+ 
 
-static volatile bool g_ds18b20Ready = false;
+static bool onBus1[NUM_SENSORS];
 
-static bool assignmentMatchesBus(uint8_t slot, bool wantBus1) {
-    if (slot >= NUM_SENSORS) return false;
-    const Ds18B20SensorAssignment& a = g_ds18b20Config.assignments[slot];
-    if (!a.enabled) return false;
-    return (a.bus == (wantBus1 ? 1 : 2));
-}
 
-static bool isAssignmentEnabled(uint8_t slot) {
-    if (slot >= NUM_SENSORS) return false;
-    return g_ds18b20Config.assignments[slot].enabled &&
-           g_ds18b20Config.assignments[slot].rom != 0ULL;
-}
 
-static constexpr uint32_t DS18_BOOT_SETTLE_MS      = 1200;
-static constexpr uint8_t  DS18_BOOT_SCAN_RETRIES   = 5;
-static constexpr uint32_t DS18_BOOT_RETRY_GAP_MS   = 250;
-static constexpr uint32_t DS18_MISSING_RESCAN_MS   = 60000;
-
-static uint32_t s_lastMissingRescanMs = 0;
-
-static bool isLikelyValidDs18Rom(uint64_t rom) {
-    // DS18B20 family code is 0x28 in the low byte of the 64-bit ROM value
-    // as printed by this sketch.
-    if (rom == 0ULL) return false;
-    if ((rom & 0xFFULL) != 0x28ULL) return false;
-    return true;
-}
-
-static bool anySensorsMissingOnBus(bool wantBus1) {
-    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-        if (assignmentMatchesBus(i, wantBus1) && !sensorPresent[i]) {
-            return true;
+// Helper function to check if a sensor is on a given bus
+bool isSensorOnBus(const DeviceAddress& addr, DallasTemperature& busSensors) {
+    DeviceAddress foundAddress;
+    for (int i = 0; i < busSensors.getDeviceCount(); i++) {
+        if (busSensors.getAddress(foundAddress, i)) {
+            if (memcmp(addr, foundAddress, 8) == 0) {
+                return true;
+            }
         }
     }
     return false;
 }
 
-static void logMissingSensorsOnBus(bool wantBus1, bool logFoundDevices, bool emitMissingAlarms) {
-    for (uint8_t slot = 0; slot < NUM_SENSORS; slot++) {
-        const Ds18B20SensorAssignment& expected = g_ds18b20Config.assignments[slot];
-
-        if (!assignmentMatchesBus(slot, wantBus1)) continue;
-
-        if (!sensorPresent[slot] && expected.rom != 0ULL) {
-            int nameIndex = slot + 2; // DTemp1 starts at SENSOR_NAMES[2]
-
-            if (logFoundDevices) {
-                LOG_CAT(DBG_1WIRE,
-                        "DS18B20 Sensor Missing on Bus %d: address 0x%llxULL, SYSTEM_TEMP=%s, SOURCE_MAP=%d, SENSOR_NAME=%s\n",
-                        wantBus1 ? 1 : 2,
-                        expected.rom,
-                        expected.systemTemp,
-                        SOURCE_MAP[nameIndex],
-                        SENSOR_NAMES[nameIndex]);
-            }
-
-            if (emitMissingAlarms) {
-                AlarmManager_event(ALM_SENSOR_FAULT, ALM_WARN,
-                    "DS18B20 Missing: %s (Map:%d)",
-                    SENSOR_NAMES[nameIndex],
-                    SOURCE_MAP[nameIndex]);
-            }
-        }
-    }
-}
-
-static void scanAndAddMissingSensorsOnBus(bool wantBus1, bool logFoundDevices, bool emitMissingAlarms) {
-    uint64_t foundAddrs[20];
-    uint8_t count = wantBus1 ? sensors1.search(foundAddrs, 20)
-                             : sensors2.search(foundAddrs, 20);
-
-    if (logFoundDevices) {
-        LOG_CAT(DBG_1WIRE, "[DS18B20] Bus %d found %d devices\n", wantBus1 ? 1 : 2, count);
-        for (uint8_t i = 0; i < count; i++) {
-            LOG_CAT(DBG_1WIRE, "  Bus%d[%d] = 0x%llxULL\n",
-                    wantBus1 ? 1 : 2, i, foundAddrs[i]);
-        }
-    }
-
-    // Track unique valid ROMs returned by THIS search pass only.
-    uint64_t acceptedThisPass[20];
-    uint8_t acceptedCount = 0;
-
-    // ADDITIVE ONLY:
-    // never clear an already-found sensor from the runtime map here.
-    // only add missing sensors when they are successfully found.
-    for (uint8_t i = 0; i < count; i++) {
-        uint64_t rom = foundAddrs[i];
-
-        // Reject obviously bad / noisy ROM values first.
-        if (!isLikelyValidDs18Rom(rom)) {
-            if (logFoundDevices) {
-                LOG_CAT(DBG_1WIRE,
-                        "[DS18B20] Ignoring invalid ROM on Bus %d: 0x%llxULL\n",
-                        wantBus1 ? 1 : 2,
-                        rom);
-            }
-            continue;
-        }
-
-        // Reject duplicates returned by the same search pass.
-        bool duplicateThisPass = false;
-        for (uint8_t j = 0; j < acceptedCount; j++) {
-            if (acceptedThisPass[j] == rom) {
-                duplicateThisPass = true;
-                break;
-            }
-        }
-        if (duplicateThisPass) {
-            if (logFoundDevices) {
-                LOG_CAT(DBG_1WIRE,
-                        "[DS18B20] Ignoring duplicate ROM on Bus %d: 0x%llxULL\n",
-                        wantBus1 ? 1 : 2,
-                        rom);
-            }
-            continue;
-        }
-        acceptedThisPass[acceptedCount++] = rom;
-
-        int logicalIndex = findDs18B20AssignmentByRom(rom);
-
-        if (logicalIndex < 0 || logicalIndex >= NUM_SENSORS) {
-            if (logFoundDevices) {
-                LOG_CAT(DBG_1WIRE,
-                        "[DS18B20] Unexpected valid sensor found on Bus %d: 0x%llxULL\n",
-                        wantBus1 ? 1 : 2,
-                        rom);
-            }
-            continue;
-        }
-
-        const Ds18B20SensorAssignment& expected = g_ds18b20Config.assignments[logicalIndex];
-
-        // Record where the configured ROM was actually observed even if it
-        // is on the wrong bus. This lets the web UI show a clear wrong-bus
-        // condition instead of only saying the sensor is missing.
-        sensorObserved[logicalIndex] = true;
-        sensorObservedBus[logicalIndex] = wantBus1 ? 1 : 2;
-
-        if (expected.bus != (wantBus1 ? 1 : 2)) {
-            if (logFoundDevices) {
-                LOG_CAT(DBG_1WIRE,
-                        "[DS18B20] Sensor 0x%llxULL (%s) belongs on Bus %d but was found on Bus %d\n",
-                        rom,
-                        expected.systemTemp,
-                        expected.bus,
-                        wantBus1 ? 1 : 2);
-            }
-            continue;
-        }
-
-        // If already found earlier, leave it alone.
-        if (!sensorPresent[logicalIndex]) {
-            sensorMappings[logicalIndex] = {rom, logicalIndex};
-            sensorPresent[logicalIndex] = true;
-            sensorOnBus1[logicalIndex] = wantBus1;
-
-            if (logFoundDevices) {
-                int nameIndex = logicalIndex + 2;
-                LOG_CAT(DBG_1WIRE,
-                        "[DS18B20] Added missing sensor on Bus %d: logical=%d SYSTEM_TEMP=%s SOURCE_MAP=%d SENSOR_NAME=%s\n",
-                        wantBus1 ? 1 : 2,
-                        logicalIndex,
-                        expected.systemTemp,
-                        SOURCE_MAP[nameIndex],
-                        SENSOR_NAMES[nameIndex]);
-            }
-        }
-    }
-
-    logMissingSensorsOnBus(wantBus1, logFoundDevices, emitMissingAlarms);
-}
-
-static void addScanResultToJson(JsonArray& arr, uint8_t bus, uint64_t rom) {
-    JsonObject obj = arr.createNestedObject();
-    obj["bus"] = bus;
-    obj["rom"] = ds18b20RomToString(rom);
-
-    int slot = findDs18B20AssignmentByRom(rom);
-    obj["assigned"] = (slot >= 0 && slot < NUM_SENSORS);
-    obj["slot"] = slot;
-    obj["dtemp"] = (slot >= 0 && slot < NUM_SENSORS) ? (slot + 1) : 0;
-
-    if (slot >= 0 && slot < NUM_SENSORS) {
-        obj["systemTemp"] = g_ds18b20Config.assignments[slot].systemTemp;
-    } else {
-        obj["systemTemp"] = "";
-    }
-}
-
-String buildDS18B20ScanJson() {
-    DynamicJsonDocument doc(4096);
-    doc["ok"] = true;
-
-    JsonArray sensors = doc.createNestedArray("sensors");
-
-    bool locked = false;
-    if (temperatureMutex != nullptr) {
-        locked = (xSemaphoreTake(temperatureMutex, pdMS_TO_TICKS(2500)) == pdTRUE);
-        if (!locked) {
-            doc["ok"] = false;
-            doc["error"] = "temperatureMutex busy";
-            String busyJson;
-            serializeJson(doc, busyJson);
-            return busyJson;
-        }
-    }
-
-    uint64_t foundAddrs[20];
-
-    uint8_t count1 = sensors1.search(foundAddrs, 20);
-    JsonArray bus1 = doc.createNestedArray("bus1");
-    for (uint8_t i = 0; i < count1; i++) {
-        uint64_t rom = foundAddrs[i];
-        if (!isLikelyValidDs18Rom(rom)) continue;
-        addScanResultToJson(bus1, 1, rom);
-        addScanResultToJson(sensors, 1, rom);
-    }
-
-    uint8_t count2 = sensors2.search(foundAddrs, 20);
-    JsonArray bus2 = doc.createNestedArray("bus2");
-    for (uint8_t i = 0; i < count2; i++) {
-        uint64_t rom = foundAddrs[i];
-        if (!isLikelyValidDs18Rom(rom)) continue;
-        addScanResultToJson(bus2, 2, rom);
-        addScanResultToJson(sensors, 2, rom);
-    }
-
-    // Restart conversions because a manual bus search may interrupt the normal
-    // conversion/read cadence.
-    sensors1.request();
-    sensors2.request();
-
-    if (locked) {
-        xSemaphoreGive(temperatureMutex);
-    }
-
-    doc["count"] = sensors.size();
-
-    String json;
-    serializeJson(doc, json);
-    return json;
-}
 
 void initDS18B20Sensors() {
-    g_ds18b20Ready = false;
+  sensors1.setWaitForConversion(false);
+  sensors2.setWaitForConversion(false);
+  sensors1.begin();
+  sensors2.begin();
 
-    // Give the long outside bus a little time to settle after boot.
-    vTaskDelay(pdMS_TO_TICKS(DS18_BOOT_SETTLE_MS));
+  // set all resolutions to 10-bit
+  for(int i=0; i<NUM_SENSORS; i++){
+    if (onBus1[i] = sensors1.setResolution(sensorMappings[i].address, 10)) {}
+    else       sensors2.setResolution(sensorMappings[i].address, 10);
+  }
 
-    // Clear runtime state once at boot.
-    for (int i = 0; i < NUM_SENSORS; i++) {
-        sensorMappings[i] = {0ULL, i};
-        sensorPresent[i] = false;
-        sensorOnBus1[i] = false;
-        sensorObserved[i] = false;
-        sensorObservedBus[i] = 0;
-        sensorFaultLatched[i] = false;
-        DTempLastGoodReadMs[i] = 0;
-        sensorOffsets[i] = g_ds18b20Config.assignments[i].offsetF;
-    }
-
-    bool needBus1 = true;
-    bool needBus2 = true;
-
-    for (uint8_t attempt = 1; attempt <= DS18_BOOT_SCAN_RETRIES; attempt++) {
-        LOG_CAT(DBG_1WIRE,
-                "[DS18B20] Boot scan attempt %u/%u\n",
-                (unsigned)attempt,
-                (unsigned)DS18_BOOT_SCAN_RETRIES);
-
-        bool finalAttempt = (attempt == DS18_BOOT_SCAN_RETRIES);
-
-        if (needBus1) {
-            scanAndAddMissingSensorsOnBus(true, true, finalAttempt);
-        }
-
-        if (needBus2) {
-            scanAndAddMissingSensorsOnBus(false, true, finalAttempt);
-        }
-
-        needBus1 = anySensorsMissingOnBus(true);
-        needBus2 = anySensorsMissingOnBus(false);
-
-        if (!needBus1 && !needBus2) {
-            LOG_CAT(DBG_1WIRE,
-                    "[DS18B20] All expected sensors found on attempt %u\n",
-                    (unsigned)attempt);
-            break;
-        }
-
-        if (!finalAttempt) {
-            vTaskDelay(pdMS_TO_TICKS(DS18_BOOT_RETRY_GAP_MS));
-        }
-    }
-
-    // Kick the first non-blocking conversion.
-    sensors1.request();
-    sensors2.request();
-
-    s_lastMissingRescanMs = millis();
-
-    g_ds18b20Ready = true;
-
-    LOG_CAT(DBG_1WIRE,
-            "[DS18B20] Init complete – runtime mapping built additively from configured address matches\n");
+  // build our one-time bus lookup
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    onBus1[i] = isSensorOnBus(sensorMappings[i].address, sensors1);
+  }
 }
 
-bool ds18B20SensorsReady() {
-    return g_ds18b20Ready;
-}
-
-bool getDS18B20SlotStatus(uint8_t slot, bool* presentOut, uint8_t* observedBusOut, uint32_t* lastGoodMsOut) {
-    if (slot >= NUM_SENSORS) return false;
-
-    if (presentOut) *presentOut = sensorPresent[slot];
-    if (observedBusOut) *observedBusOut = sensorObserved[slot] ? sensorObservedBus[slot] : 0;
-    if (lastGoodMsOut) *lastGoodMsOut = DTempLastGoodReadMs[slot];
-
-    return true;
-}
-
+// Calculate rolling average for a sensor
 float calculateAverage(float values[], int numReadings) {
-    float sum = 0; int count = 0;
+    float sum = 0;
+    int count = 0;
     for (int i = 0; i < numReadings; i++) {
-        if (values[i] > -100) { sum += values[i]; count++; }
+        if (values[i] > -100) {  // Exclude invalid readings
+            sum += values[i];
+            count++;
+        }
     }
-    return count > 0 ? sum / count : -196.60f;
+    return count > 0 ? sum / count : -196.60;  // Return average or invalid if no valid readings
 }
 
+// Read DS18B20 temperatures and apply offsets, update globals
 void updateDS18B20Readings() {
-    // If sensors are still missing, do a low-duty-cycle additive rescan once per minute,
-    // and only on the bus(es) that are still missing sensors.
-    bool needBus1 = anySensorsMissingOnBus(true);
-    bool needBus2 = anySensorsMissingOnBus(false);
+  sensors1.requestTemperatures();
+  sensors2.requestTemperatures();
+  vTaskDelay(pdMS_TO_TICKS(94));    // ~10-bit conversion time
+  esp_task_wdt_reset();
 
-    if (needBus1 || needBus2) {
-        uint32_t now = millis();
-        if ((uint32_t)(now - s_lastMissingRescanMs) >= DS18_MISSING_RESCAN_MS) {
-            s_lastMissingRescanMs = now;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    // pick the right bus once (onBus1[i] was set in init)
+    float rawF = onBus1[i]
+      ? sensors1.getTempF(sensorMappings[i].address)
+      : sensors2.getTempF(sensorMappings[i].address);
 
-            LOG_CAT(DBG_1WIRE, "[DS18B20] Periodic targeted rescan for missing sensors\n");
-
-            if (needBus1) {
-                LOG_CAT(DBG_1WIRE, "[DS18B20] Rescanning Bus 1\n");
-                scanAndAddMissingSensorsOnBus(true, true, false);
-            }
-
-            if (needBus2) {
-                LOG_CAT(DBG_1WIRE, "[DS18B20] Rescanning Bus 2\n");
-                scanAndAddMissingSensorsOnBus(false, true, false);
-            }
-
-            // Start a fresh conversion after rescanning and skip this read cycle.
-            sensors1.request();
-            sensors2.request();
-            return;
-        }
+    if (rawF == DEVICE_DISCONNECTED_F) {
+      Serial.printf("Sensor %d disconnected\n", i);
+      continue;
     }
 
-    for (int i = 0; i < NUM_SENSORS; i++) {
-        // YIELD: Give the network stack time to process W5500 interrupts.
-        vTaskDelay(pdMS_TO_TICKS(1));
+    // apply any per-sensor offset
+    rawF += sensorOffsets[sensorMappings[i].arrayIndex];
 
-        // Skip disabled / unassigned / missing sensors entirely.
-        if (!isAssignmentEnabled(i) || !sensorPresent[i] || sensorMappings[i].address == 0ULL) {
-            continue;
-        }
-
-        float tempC = 0.0f;
-        uint8_t err = sensorOnBus1[i]
-            ? sensors1.getTemp(sensorMappings[i].address, tempC)
-            : sensors2.getTemp(sensorMappings[i].address, tempC);
-
-                if (err != 0) {
-            if (!sensorFaultLatched[i]) {
-                LOG_ERR("[DS18B20] Sensor %d error %d\n", i + 1, err);
-                AlarmManager_event(ALM_SENSOR_FAULT, ALM_WARN,
-                                   "DS18B20 Sensor %d Offline", i + 1);
-                sensorFaultLatched[i] = true;
-            }
-            continue;
-        }
-
-        if (sensorFaultLatched[i]) {
-            LOG_CAT(DBG_1WIRE, "[DS18B20] Sensor %d recovered\n", i + 1);
-            AlarmManager_event(ALM_SENSOR_FAULT, ALM_WARN,
-                               "DS18B20 Sensor %d Online", i + 1);
-            sensorFaultLatched[i] = false;
-        }
-
-        float rawF = tempC * 1.8f + 32.0f;
-        rawF += sensorOffsets[i];
-        updateDS18B20Temperature(i, rawF);
-    }
-
-    // Start the next non-blocking conversion for both buses.
-    sensors1.request();
-    sensors2.request();
+    // now push it into your rolling buffer & compute the new average
+    updateDS18B20Temperature(sensorMappings[i].arrayIndex, rawF);
+  }
 }
 
+
+// Update temperature readings and calculate rolling average
 void updateDS18B20Temperature(int sensorIndex, float temperature) {
-    if (temperature <= -126.0f) return;
+    // Check for invalid reading
+    if (temperature == DEVICE_DISCONNECTED_F) {
+        Serial.println("[DS18B20 Error] Invalid temperature reading for Sensor " + String(sensorIndex + 1));
+        // Optionally, retain the last valid temperature or set to a default value
+        return;
+    }
+
+    // Store the reading in the rolling array
     DTempValues[sensorIndex][readingsIndex[sensorIndex]] = temperature;
     readingsIndex[sensorIndex] = (readingsIndex[sensorIndex] + 1) % numReadings;
+
+    // Update the current temperature and calculate the average
     DTemp[sensorIndex] = temperature;
     DTempAverage[sensorIndex] = calculateAverage(DTempValues[sensorIndex], numReadings);
-    DTempLastGoodReadMs[sensorIndex] = millis();
+
+   // Serial.println("[DS18B20] Sensor " + String(sensorIndex + 1) + " - Temp: " + String(temperature) + "°F, Avg: " + String(DTempAverage[sensorIndex]) + "°F");
 }

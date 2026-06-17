@@ -1,4 +1,3 @@
-// TemperatureLopgging.cpp
 #include "TemperatureLogging.h"
 #include "Config.h"
 #include "FileSystemManager.h"
@@ -9,10 +8,8 @@
 #include <esp_task_wdt.h>
 #include <math.h>
 #include <TimeLib.h>
-#include "DiagLog.h"
-#include "AlarmManager.h"
 
-
+extern SemaphoreHandle_t fileSystemMutex;
 
 // External temperature globals
 extern float panelT;
@@ -47,34 +44,30 @@ extern const char* SENSOR_NAMES[15];        // Human readable
 #define TEMP_LOG_FLUSH_MIN    60
 #endif
 
-static uint32_t lastAddMs[14] = {0};           // Last add time per sensor
-static uint32_t lastFlushMsGlobal = 0;         // Track last successful flush across all sensors
+static uint32_t lastAddMs[14] = {0};  // Last add time per sensor
+static uint32_t lastFlushMsGlobal = 0;  // Track last successful flush across all sensors
 static const char* BASE_DIR    = "/Temperature_Logs";
-static const int   NUM_SENSORS = 14;           // 1..14
+static const int   NUM_SENSORS = 14;  // 1..14
 
 extern bool g_fileSystemReady;  // from FileSystemManager
 extern bool g_timeValid;        // from RTCManager / TimeSync
 
-// Temperature logging stays disabled until valid time exists.
+// Call this **once**, after network, web server, pumps, etc. are all up
 static bool g_tempLogEnabled = false;
 
 void enableTemperatureLogging()
 {
-    if (g_tempLogEnabled) return;   // idempotent
     g_tempLogEnabled = true;
-    LOG_CAT(DBG_TEMPLOG, "[TempLog] Enabled after valid time acquired\n");
+    Serial.println("[TempLog] Enabled after system boot complete");
 }
 
-// RAM cache — fixed size to prevent heap fragmentation
-#define CACHE_MAX_ENTRIES 120  // Safely holds up to 2 hours of 1-minute samples
-
+// RAM cache — unlimited size, grows as needed
 struct LogEntry {
     DateTime dt;   // RTC local time at moment of sample
     float  value;
 };
 
-// Statically allocated fixed arrays (No realloc!)
-static LogEntry  cache[NUM_SENSORS][CACHE_MAX_ENTRIES];
+static LogEntry* cache[NUM_SENSORS]      = { nullptr };
 static int       cacheCount[NUM_SENSORS] = { 0 };
 
 // This is the **only** value we compare against for delta checks
@@ -119,7 +112,7 @@ static bool ensureSensorDir(int year, int month, int sensor1)
         if (!LittleFS.exists(cur)) {
             if (!LittleFS.mkdir(cur)) {
 #ifdef TEMP_LOG_DEBUG_ERRORS
-                LOG_ERR("[TempLog] ERROR: mkdir failed for %s\n", cur.c_str());
+                Serial.println("[TempLog] ERROR: mkdir failed for " + cur);
 #endif
                 return false;
             }
@@ -168,7 +161,7 @@ static void writeToFlash(int sensorIdx0, const DateTime& dt, float value) {
     if (!takeFileSystemMutexWithRetry("[TempLog] writeToFlash",
                                       pdMS_TO_TICKS(2000), 3)) {
 #ifdef TEMP_LOG_DEBUG_ERRORS
-        LOG_ERR("[TempLog] ERROR: mutex timeout in writeToFlash\n");
+        Serial.println("[TempLog] ERROR: mutex timeout in writeToFlash");
 #endif
         return;
     }
@@ -180,10 +173,10 @@ static void writeToFlash(int sensorIdx0, const DateTime& dt, float value) {
     }
 
     File f = LittleFS.open(path, "a");  // append + create
+
     if (!f) {
 #ifdef TEMP_LOG_DEBUG_ERRORS
-        LOG_ERR("[TempLog] ERROR: cannot open %s\n", path.c_str());
-        AlarmManager_event(ALM_FS_WRITE_FAIL, ALM_ALARM, "Log Write Fail: %s", SENSOR_NAMES[sensorIdx0 + 1]);
+        Serial.println("[TempLog] ERROR: cannot open " + path);
 #endif
         xSemaphoreGive(fileSystemMutex);
         return;
@@ -198,14 +191,13 @@ static void writeToFlash(int sensorIdx0, const DateTime& dt, float value) {
 
     if (f.print(line)) {
 #ifdef TEMP_LOG_DEBUG_FLUSH
-        LOG_CAT(DBG_TEMPLOG, "[TempLog] WRITE %s -> %.2fF\n", path.c_str(), value);
+        Serial.printf("[TempLog] WRITE %s → %.2f°F\n", path.c_str(), value);
 #endif
     } else {
 #ifdef TEMP_LOG_DEBUG_ERRORS
-        LOG_ERR("[TempLog] WRITE FAILED %s\n", path.c_str());
+        Serial.println("[TempLog] WRITE FAILED " + path);
 #endif
     }
-
     f.close();
     xSemaphoreGive(fileSystemMutex);
 
@@ -214,123 +206,145 @@ static void writeToFlash(int sensorIdx0, const DateTime& dt, float value) {
     lastWrittenDay[sensorIdx0]     = day;
 }
 
+
 // ---------------------------------------------------------------------------
 // Add to RAM cache and update lastLoggedValue[]
 // ---------------------------------------------------------------------------
 static void addToCache(int sensorIdx0, float value) {
     DateTime dt = getCurrentTimeAtomic();   // RTC local time
 
-    // Prevent buffer overflow. (Hourly flush guarantees we rarely exceed 60).
-    if (cacheCount[sensorIdx0] >= CACHE_MAX_ENTRIES) {
-        LOG_ERR("[TempLog] WARNING: Cache full for sensor %d! Dropping sample.\n", sensorIdx0 + 1);
-        return; 
+    int newCount = cacheCount[sensorIdx0] + 1;
+    LogEntry* newBuf = (LogEntry*)realloc(cache[sensorIdx0], sizeof(LogEntry) * newCount);
+    if (!newBuf) {
+#ifdef TEMP_LOG_DEBUG_ERRORS
+        Serial.println("[TempLog] ERROR: realloc failed for cache");
+#endif
+        return;  // keep old cache untouched
     }
 
-    int idx = cacheCount[sensorIdx0];
-    cache[sensorIdx0][idx].dt    = dt;
-    cache[sensorIdx0][idx].value = value;
-    cacheCount[sensorIdx0]++;
+    cache[sensorIdx0] = newBuf;
+    cache[sensorIdx0][cacheCount[sensorIdx0]].dt    = dt;
+    cache[sensorIdx0][cacheCount[sensorIdx0]].value = value;
+    cacheCount[sensorIdx0] = newCount;
 
     lastLoggedValue[sensorIdx0] = value;
     lastLoggedValid[sensorIdx0] = true;
 
 #ifdef TEMP_LOG_DEBUG_CACHE
-    LOG_CAT(DBG_TEMPLOG, "[TempLog] CACHED %s = %.2fF\n",
-            SENSOR_NAMES[sensorIdx0 + 1], value);
+    Serial.printf("[TempLog] CACHED %s = %.2f°F\n",
+                  SENSOR_NAMES[sensorIdx0 + 1], value);
 #endif
 }
 
+
 // ---------------------------------------------------------------------------
-// Flush all caches to flash (Batch Write to Minimize Mutex Holds)
+// Flush all caches to flash (called hourly and at midnight)
 // ---------------------------------------------------------------------------
 static void flushCache() {
     uint32_t nowMs = millis();
-
-    // Gate time value since last flush (Config.h)
-    if (nowMs - lastFlushMsGlobal < (TEMP_LOG_SAMPLE_SEC * 1000UL)) {
-#ifdef TEMP_LOG_DEBUG_FLUSH
-        LOG_CAT(DBG_TEMPLOG, "[TempLog] Flush skipped -- less than 1 min since last\n");
-#endif
+    if (nowMs - lastFlushMsGlobal < TEMP_LOG_SAMPLE_SEC) {  // Gate time value since last flush,  set in Config.h
+        #ifdef TEMP_LOG_DEBUG_FLUSH
+        Serial.println("[TempLog] Flush skipped — less than 1 min since last");
+        #endif
         return;
     }
 
     for (int i = 0; i < NUM_SENSORS; i++) {
-        // YIELD: Give the network stack a break between sensors.
-        vTaskDelay(pdMS_TO_TICKS(2));
-
-        if (cacheCount[i] == 0) {
+        if (cacheCount[i] == 0 || cache[i] == nullptr) {
             continue;
         }
 
-        // 1. Build the entire payload in RAM *BEFORE* taking the filesystem lock.
-        // A typical line is ~32 bytes. Reserve memory to prevent String reallocation.
-        String payload;
-        payload.reserve(cacheCount[i] * 35);
+        if (!takeFileSystemMutexWithRetry("[TempLog] flushCache",
+                                          pdMS_TO_TICKS(2000), 3)) {
+            #ifdef TEMP_LOG_DEBUG_ERRORS
+            Serial.printf("[TempLog] ERROR: mutex timeout in flushCache for sensor %d\n",
+                          i + 1);
+            #endif
+            continue;
+        }
+
+        String currentPath;
+        File   f;
 
         for (int j = 0; j < cacheCount[i]; j++) {
-            char line[64];
-            snprintf(line, sizeof(line),
-                     "%04d-%02d-%02d,%02d:%02d:00,%.2f\n",
-                     cache[i][j].dt.year(), cache[i][j].dt.month(), cache[i][j].dt.day(),
-                     cache[i][j].dt.hour(), cache[i][j].dt.minute(),
-                     cache[i][j].value);
-            payload += line;
+            DateTime dt = cache[i][j].dt;
+            
+
+
+    int year   = dt.year();
+    int month  = dt.month();
+    int day    = dt.day();
+    int hour   = dt.hour();
+    int minute = dt.minute();
+
+    String path = buildFilePath(year, month, day, i + 1);
+
+    // If we changed day/file, close the old one and open the new one
+    if (!f || path != currentPath) {
+        if (f) {
+            f.close();
+        }
+        currentPath = path;
+
+        // Make sure directory hierarchy exists
+        if (!ensureSensorDir(year, month, i + 1)) {
+            #ifdef TEMP_LOG_DEBUG_ERRORS
+            Serial.println("[TempLog] ERROR: ensureSensorDir failed for " + currentPath);
+            #endif
+            break;
         }
 
-        // Because midnight rollover explicitly triggers a flush, all items currently 
-        // in this cache are guaranteed to belong to the exact same day. 
-        // We use the date from the LAST entry to determine the file path.
-        int lastIdx = cacheCount[i] - 1;
-        int year   = cache[i][lastIdx].dt.year();
-        int month  = cache[i][lastIdx].dt.month();
-        int day    = cache[i][lastIdx].dt.day();
-        String path = buildFilePath(year, month, day, i + 1);
-
-        // 2. Take Mutex, Write the whole chunk, Release Mutex instantly
-        if (!takeFileSystemMutexWithRetry("[TempLog] flushCache", pdMS_TO_TICKS(2000), 3)) {
-#ifdef TEMP_LOG_DEBUG_ERRORS
-            LOG_ERR("[TempLog] ERROR: mutex timeout in flushCache for sensor %d\n", i + 1);
-#endif
-            continue; // Skip this sensor, try again next flush
+        f = LittleFS.open(currentPath, "a");
+        if (!f) {
+            #ifdef TEMP_LOG_DEBUG_ERRORS
+            Serial.println("[TempLog] ERROR: cannot open " + currentPath + " for flush");
+            #endif
+            break;
         }
+    }
 
-        if (ensureSensorDir(year, month, i + 1)) {
-            File f = LittleFS.open(path, "a");
-            if (f) {
-                f.print(payload);
-                f.close();
-                
-                // Update the persisted reference
-                lastWrittenToFlash[i] = cache[i][lastIdx].value;
-                lastWrittenDay[i]     = day;
-            } else {
-#ifdef TEMP_LOG_DEBUG_ERRORS
-                LOG_ERR("[TempLog] ERROR: cannot open %s for flush\n", path.c_str());
-#endif
-            }
-        } else {
-#ifdef TEMP_LOG_DEBUG_ERRORS
-            LOG_ERR("[TempLog] ERROR: ensureSensorDir failed for %s\n", path.c_str());
-#endif
+    char line[64];
+    snprintf(line, sizeof(line),
+             "%04d-%02d-%02d,%02d:%02d:00,%.2f\n",
+             year, month, day,
+             hour, minute,
+             cache[i][j].value);
+
+    f.print(line);
+
+    lastWrittenToFlash[i] = cache[i][j].value;
+    lastWrittenDay[i]     = day;
+
+    esp_task_wdt_reset();
+    vTaskDelay(1);   // yield
+}
+
+
+        if (f) {
+            f.close();
         }
 
         xSemaphoreGive(fileSystemMutex);
 
-        // 3. Clear cache count (No free() needed!)
+        free(cache[i]);
+        cache[i]      = nullptr;
         cacheCount[i] = 0;
 
-#ifdef TEMP_LOG_DEBUG_FLUSH
-        LOG_CAT(DBG_TEMPLOG, "[TempLog] Flushed cache for sensor %d (%s)\n",
-                i + 1, SENSOR_NAMES[i + 1]);
-#endif
+        #ifdef TEMP_LOG_DEBUG_FLUSH
+        Serial.printf("[TempLog] Flushed cache for sensor %d (%s)\n",
+                      i + 1, SENSOR_NAMES[i + 1]);
+        #endif
     }
 
-    lastFlushMsGlobal = millis();  // Update global last flush time on success
+    lastFlushMsGlobal = millis();  // CHANGE: Update global last flush time on success
 
-#ifdef TEMP_LOG_DEBUG_FLUSH
-    LOG_CAT(DBG_TEMPLOG, "[TempLog] Cache flush complete\n");
-#endif
+    #ifdef TEMP_LOG_DEBUG_FLUSH
+    Serial.println("[TempLog] Cache flush complete");
+    
+
+    #endif
 }
+
 
 // ---------------------------------------------------------------------------
 // Setup — called once at boot
@@ -343,7 +357,8 @@ void setupTemperatureLogging() {
         }
         xSemaphoreGive(fileSystemMutex);
     } else {
-        LOG_ERR("[TempLog] setupTemperatureLogging: failed to lock FS mutex, skipping BASE_DIR creation\n");
+        Serial.println("[TempLog] setupTemperatureLogging: failed to lock FS mutex, "
+                       "skipping BASE_DIR creation");
     }
 
     lastSampleMs    = millis();
@@ -351,26 +366,26 @@ void setupTemperatureLogging() {
     baselineWritten = false;   // ensure we’ll do a baseline later
 }
 
+
 // ---------------------------------------------------------------------------
 // Main task — runs forever
 // ---------------------------------------------------------------------------
 void TaskTemperatureLogging_Run(void*)
 {
-    LOG_CAT(DBG_TEMPLOG, "[TempLog] Attempting to start Temperature Logging...\n");
-
+    Serial.println("[TempLog] Attempting to start Temperature Logging...");
     for (;;) {
         esp_task_wdt_reset();
 
         // 1) Don’t do anything until we’re explicitly enabled
         if (!g_tempLogEnabled) {
-            LOG_CAT(DBG_TEMPLOG, "[TempLog] Waiting for g_tempLogEnabled...\n");
+            Serial.println("[TempLog] Waiting for g_tempLogEnabled...");
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
 
         // 2) Don’t do anything until LittleFS is mounted
         if (!g_fileSystemReady) {
-            LOG_CAT(DBG_TEMPLOG, "[TempLog] Waiting for filesystem...\n");
+            Serial.println("[TempLog] Waiting for filesystem...");
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
@@ -378,22 +393,21 @@ void TaskTemperatureLogging_Run(void*)
         // 3) Don’t do anything until time is valid and sane
         DateTime dt = getCurrentTimeAtomic();
         if (!g_timeValid) {
-            // Re-check the raw RTC directly. CurrentTime may still be stale/default
-            // even though the RTC itself already holds a valid value.
-            if (syncCurrentTimeFromRTCIfValid()) {
-                dt = getCurrentTimeAtomic();
-                LOG_CAT(DBG_TEMPLOG,
-                        "[TempLog] RTC year %d looks valid, enabling time.\n", dt.year());
-            } else {
-                int year = dt.year();
-                LOG_CAT(DBG_TEMPLOG,
-                        "[TempLog] Waiting for valid time, g_timeValid=0, RTC year=%d\n",
-                        year);
+            int year = dt.year();
+            if (year < 2025 || year > 2100) {
+                Serial.printf(
+                    "[TempLog] Waiting for valid time, g_timeValid=0, RTC year=%d\n",
+                    year);
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;   // stay alive, keep waiting
+            } else {
+                Serial.printf(
+                    "[TempLog] RTC year %d looks valid, enabling time.\n", year);
+                markTimeValid();   // let the rest of the system know time is OK
             }
         }
 
+        // From here on, dt is a valid local RTC time
         // 4) Respect the sample interval (based on millis, not wall clock)
         uint32_t nowMs = millis();
         if (nowMs - lastSampleMs < (TEMP_LOG_SAMPLE_SEC * 1000UL)) {
@@ -411,7 +425,7 @@ void TaskTemperatureLogging_Run(void*)
                 }
             }
             baselineWritten = true;
-            LOG_CAT(DBG_TEMPLOG, "[TempLog] Baseline values written after valid time acquired\n");
+            Serial.println("[TempLog] Baseline values written after valid time acquired");
         }
 
         // 6) Hourly flush (still driven by millis)
@@ -444,24 +458,28 @@ void TaskTemperatureLogging_Run(void*)
 
         // 8) Delta check — compare against last value **written to flash**
         for (int i = 0; i < NUM_SENSORS; i++) {
-            // Tiny yield to prevent this loop from becoming a solid block of CPU usage
-            if (i % 4 == 0) vTaskDelay(1); 
-
             float current = getValue(i);
             if (isnan(current)) continue;
 
-            uint32_t msNow = millis();
-            bool timeElapsed = (msNow - lastAddMs[i] >= (TEMP_LOG_SAMPLE_SEC * 1000UL));
+            uint32_t nowMs = millis();
+            bool timeElapsed = (nowMs - lastAddMs[i] >= TEMP_LOG_SAMPLE_SEC);  // Gate time value since last delta check,  set in Config.h
             bool changed = fabsf(current - lastWrittenToFlash[i]) >= TEMP_LOG_DELTA_F;
 
-            // Add if changed OR (cache empty AND 1 min elapsed)
+
+            // Add if changed OR (cache empty AND 1 min elapsed) OR forced hourly
             if (changed || (cacheCount[i] == 0 && timeElapsed)) {
-                addToCache(i, current);
-                lastAddMs[i] = msNow;
-            }
+                    addToCache(i, current);
+                        lastAddMs[i] = nowMs;  // Update last add time
+                        }
         }
+
+        
+
+        
 
         // Small yield so we don’t hog CPU
         vTaskDelay(1);
     }
 }
+
+

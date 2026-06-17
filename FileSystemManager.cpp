@@ -1,4 +1,3 @@
-// FileSystemManager.cpp
 #include "FileSystemManager.h"
 #include "Logging.h" // Assuming logMessage() is declared here
 #include "Config.h"
@@ -10,42 +9,22 @@
 #include <Arduino.h>
 #include <esp_err.h>
 #include <esp_task_wdt.h> 
-#include <freertos/semphr.h>
-#include <ESP32-targz.h>
-#include "DiagLog.h"
+
+#define FS_CLEANUP_DEBUG 1   // set to 1 temporarily if you want verbose listing
 
 
-// for Serial.printf diagnostics use LOG_CAT(DBG_FS, "whatever you want said goes here");
-// to display larger concerns use LOG_ERR("[FS] whatever you want said goes here");
-
-
-#define FS_CLEANUP_DEBUG 0  // set to 1 temporarily if you want verbose listing
-
-
-SemaphoreHandle_t fileSystemMutex = nullptr;
+SemaphoreHandle_t fileSystemMutex = xSemaphoreCreateMutex();
 bool g_fileSystemReady = false; // Global Flag to enable Temp Log after FS Mount
-
-
 
 // Forward declarations for internal helpers
 static String extractDateFromPath(const String &fullPath);
 static void   scanDirForOldestDate(const char *dirPath, String &oldestDate);
-
-
-// Unlocked helpers (caller must already hold fileSystemMutex)
-static bool findOldestTemperatureLogDateUnlocked(String &outDate);
-static void deleteTemperatureLogsForDateUnlocked(const String &dateStr);
-static bool deleteTemperatureLogsRecursiveUnlocked(const char* basePath);
-
-// Safe public wrappers (they acquire fileSystemMutex themselves)
+static bool   findOldestTemperatureLogDate(String &outDate);
+static void   deleteLogsForDateRecursive(const char *dirPath,
+                                         const String &targetDate);
+static void   deleteTemperatureLogsForDate(const String &dateStr);
 bool deleteTemperatureLogsRecursive(const char* basePath);
 void enforceTemperatureLogDiskLimit();
-
-static void   deleteLogsForDateRecursive(const char *dirPath,
-                                             const String &targetDate);
-                                             
-    static String formatBytes(size_t v); // Forward declaration for our zero-overhead cache
-
 
 // Extract first date from a filename/path.
 // Supported formats inside the *filename*:
@@ -120,14 +99,13 @@ bool takeFileSystemMutexWithRetry(const char *tag,
         if (xSemaphoreTake(fileSystemMutex, perAttemptTicks) == pdTRUE) {
             return true;
         }
-        LOG_CAT(DBG_FS, "%s: attempt %d/%d failed to lock FS mutex\n",
-                tag, attempt, maxAttempts);
+        Serial.printf("%s: attempt %d/%d failed to lock FS mutex\n",
+                      tag, attempt, maxAttempts);
         vTaskDelay(pdMS_TO_TICKS(50));  // small backoff
     }
 
-    LOG_CAT(DBG_FS, "%s: giving up acquiring filesystem mutex\n", tag);
+    Serial.printf("%s: giving up acquiring filesystem mutex\n", tag);
     return false;
-
 }
 
 
@@ -168,8 +146,7 @@ static void scanDirForOldestDate(const char *dirPath, String &oldestDate) {
                 }
             }
         }
-                
-        esp_task_wdt_reset();
+
         vTaskDelay(1);  // yield a little
         entry = dir.openNextFile();
     }
@@ -179,27 +156,22 @@ static void scanDirForOldestDate(const char *dirPath, String &oldestDate) {
 
 
 
-File openLogFileUnlocked(const String& filename, const char* mode) {
-  if (!g_fileSystemReady) return File();
-  return LittleFS.open(filename, mode);
-}
 
 
-
-static bool findOldestTemperatureLogDateUnlocked(String &outDate) {
+static bool findOldestTemperatureLogDate(String &outDate) {
     outDate = String();
     if (!LittleFS.exists("/Temperature_Logs")) {
-        LOG_CAT(DBG_FS, "[FS] ⚠ /Temperature_Logs does not exist\n");
+        Serial.println("[FS] ⚠ /Temperature_Logs does not exist");
         return false;
     }
 
     scanDirForOldestDate("/Temperature_Logs", outDate);
     if (outDate.isEmpty()) {
-        LOG_CAT(DBG_FS, "[FS] ⚠ No temperature log files with dates found\n");
+        Serial.println("[FS] ⚠ No temperature log files with dates found");
         return false;
     }
 
-    LOG_CAT(DBG_FS, "[FS] Oldest temperature log date found: %s\n", outDate.c_str());
+    Serial.printf("[FS] Oldest temperature log date found: %s\n", outDate.c_str());
     return true;
 }
 
@@ -209,9 +181,9 @@ static bool findOldestTemperatureLogDateUnlocked(String &outDate) {
 
 // Delete a directory tree by path (used from WebServerManager / ThirdWebpage)
 // This is *not* the date-based cleanup; it just nukes whatever subtree you pass.
-static bool deleteTemperatureLogsRecursiveUnlocked(const char* basePath) {
+bool deleteTemperatureLogsRecursive(const char* basePath) {
     if (!LittleFS.exists(basePath)) {
-        LOG_CAT(DBG_FS, "[FS] deleteTemperatureLogsRecursive: '%s' does not exist\n", basePath);
+        Serial.printf("[FS] deleteTemperatureLogsRecursive: '%s' does not exist\n", basePath);
         return true;  // nothing to do
     }
 
@@ -219,9 +191,8 @@ static bool deleteTemperatureLogsRecursiveUnlocked(const char* basePath) {
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
         bool ok = LittleFS.remove(basePath);
-        LOG_CAT(DBG_FS, "[FS] deleteTemperatureLogsRecursive: remove '%s' -> %s\n",
-                basePath, ok ? "OK" : "FAIL");
-
+        Serial.printf("[FS] deleteTemperatureLogsRecursive: remove '%s' -> %s\n",
+                      basePath, ok ? "OK" : "FAIL");
         return ok;
     }
 
@@ -241,39 +212,22 @@ static bool deleteTemperatureLogsRecursiveUnlocked(const char* basePath) {
         entry.close();
 
         if (isDir) {
-            deleteTemperatureLogsRecursiveUnlocked(childPath.c_str());
+            deleteTemperatureLogsRecursive(childPath.c_str());
         } else {
             if (!LittleFS.remove(childPath)) {
-                LOG_CAT(DBG_FS, "[FS] deleteTemperatureLogsRecursive: failed to remove file '%s'\n",
-                        childPath.c_str());
+                Serial.printf("[FS] deleteTemperatureLogsRecursive: failed to remove file '%s'\n",
+                              childPath.c_str());
             }
         }
 
-        // WDT friendliness during long delete passes
-        esp_task_wdt_reset();
         vTaskDelay(1);
         entry = dir.openNextFile();
     }
     dir.close();
 
     bool ok = LittleFS.rmdir(basePath) || LittleFS.remove(basePath);
-    LOG_CAT(DBG_FS, "[FS] deleteTemperatureLogsRecursive: remove dir '%s' -> %s\n",
+    Serial.printf("[FS] deleteTemperatureLogsRecursive: remove dir '%s' -> %s\n",
                   basePath, ok ? "OK" : "FAIL");
-    return ok;
-}
-
-bool deleteTemperatureLogsRecursive(const char* basePath) {
-    if (!g_fileSystemReady) return false;
-
-    if (!takeFileSystemMutexWithRetry("deleteTemperatureLogsRecursive",
-                                      pdMS_TO_TICKS(1000), 5)) {
-        LOG_CAT(DBG_FS, "[FS] ❌ deleteTemperatureLogsRecursive: failed to lock mutex\n");
-        return false;
-    }
-
-    bool ok = deleteTemperatureLogsRecursiveUnlocked(basePath);
-
-    xSemaphoreGive(fileSystemMutex);
     return ok;
 }
 
@@ -316,24 +270,24 @@ static void deleteLogsForDateRecursive(const char *dirPath,
         } else {
             String dateStr = extractDateFromPath(baseName);
             if (dateStr == targetDate) {
-                bool removed = LittleFS.remove(fullPath);
-                bool stillExists = LittleFS.exists(fullPath);
+    bool removed = LittleFS.remove(fullPath);
+    bool stillExists = LittleFS.exists(fullPath);
 
-                if (removed && !stillExists) {
-                    LOG_CAT(DBG_FS, "[FS] ✔ Verified deletion of '%s' (date %s)\n",
-                            fullPath.c_str(), targetDate.c_str());
+    if (removed && !stillExists) {
+        Serial.printf("[FS] ✔ Verified deletion of '%s' (date %s)\n",
+                      fullPath.c_str(), targetDate.c_str());
+    } else {
+        Serial.printf(
+            "[FS] ❌ Deletion check failed for '%s' (removed=%d, exists=%d)\n",
+            fullPath.c_str(),
+            removed ? 1 : 0,
+            stillExists ? 1 : 0
+        );
+    }
+}
 
-                } else {
-                    LOG_CAT(DBG_FS,
-                            "[FS] ❌ Deletion check failed for '%s' (removed=%d, exists=%d)\n",
-                            fullPath.c_str(),
-                            removed ? 1 : 0,
-                            stillExists ? 1 : 0);
-                }
-            }
         }
 
-        esp_task_wdt_reset();
         vTaskDelay(1);
         entry = dir.openNextFile();
     }
@@ -354,20 +308,19 @@ static void deleteLogsForDateRecursive(const char *dirPath,
 
         if (empty) {
             if (LittleFS.rmdir(dirPath)) {
-                LOG_CAT(DBG_FS, "[FS] 🗑 Removed empty directory '%s'\n", dirPath);
-
+                Serial.printf("[FS] 🗑 Removed empty directory '%s'\n", dirPath);
             } else {
-                LOG_CAT(DBG_FS, "[FS] ❌ Failed to remove empty directory '%s'\n", dirPath);
-
+                Serial.printf("[FS] ❌ Failed to remove empty directory '%s'\n",
+                              dirPath);
             }
         }
     }
 }
 
-static void deleteTemperatureLogsForDateUnlocked(const String &dateStr) {
+static void deleteTemperatureLogsForDate(const String &dateStr) {
     if (!LittleFS.exists("/Temperature_Logs")) return;
-    LOG_CAT(DBG_FS, "[FS] 🔎 Deleting all temperature logs for date %s\n", dateStr.c_str());
-
+    Serial.printf("[FS] 🔎 Deleting all temperature logs for date %s\n",
+                  dateStr.c_str());
     deleteLogsForDateRecursive("/Temperature_Logs", dateStr);
 }
 
@@ -378,123 +331,109 @@ static void deleteTemperatureLogsForDateUnlocked(const String &dateStr) {
 
 
 void enforceTemperatureLogDiskLimit() {
-    if (!g_fileSystemReady) return;
-    LOG_CAT(DBG_FS, "[FS] enforceTemperatureLogDiskLimit(): checking disk usage...\n");
-
-    if (!takeFileSystemMutexWithRetry("[FS] enforceTemperatureLogDiskLimit",
-                                      pdMS_TO_TICKS(1000), 5)) {
-
-        LOG_ERR("[FS] ❌ Failed to lock filesystem mutex in enforceTemperatureLogDiskLimit()");
-        return;
-    }
-
-    // WDT friendliness: we can spend time scanning/deleting while holding the mutex
-    esp_task_wdt_reset();
-    vTaskDelay(pdMS_TO_TICKS(1));
-
     size_t total = LittleFS.totalBytes();
     size_t used  = LittleFS.usedBytes();
 
-    LOG_CAT(DBG_FS, "[FS] used=%u, total=%u\n", (unsigned)used, (unsigned)total);
+    #if FS_CLEANUP_DEBUG
+    Serial.printf("[FS] enforceTemperatureLogDiskLimit(): used=%u, total=%u\n",
+                  (unsigned)used, (unsigned)total);
+#endif
 
     if (total == 0) {
-
-        LOG_ERR("[FS] ❌ Failed to get LittleFS size (total == 0)");
-
-        xSemaphoreGive(fileSystemMutex);
+        Serial.println("[FS] ❌ Failed to get LittleFS size (total == 0)");
         return;
     }
+
     float pctUsed = ((float)used / (float)total) * 100.0f;
+    
 
-        // --- ZERO-OVERHEAD WEBPAGE CACHE UPDATE (Part 1/2) ---
-        // A lambda function that uses the total/used values already pulled from memory
-        auto updateWebpageCache = [&]() {
-            size_t freeBytes = (total > used) ? (total - used) : 0;
-            g_cachedFsStatsJson = "{\"usedBytes\":" + String(used) +
-                         ",\"totalBytes\":" + String(total) +
-                         ",\"freeBytes\":" + String(freeBytes) +
-                         ",\"pctUsed\":" + String(pctUsed, 1) +
-                         ",\"usedLabel\":\"" + formatBytes(used) + "\"" +
-                         ",\"freeLabel\":\"" + formatBytes(freeBytes) + "\"" +
-                         ",\"totalLabel\":\"" + formatBytes(total) + "\"}";
-        };
-
-        if (pctUsed < FS_Cleaning_START_LIMIT) {
+     if (pctUsed < FS_Cleaning_START_LIMIT) {
 #if FS_CLEANUP_DEBUG
-            LOG_CAT(DBG_FS, "[FS] Disk Usage at %.1f%% — below start limit (%.1f%%), no cleanup needed.\n",
-                          pctUsed, FS_Cleaning_START_LIMIT);
+        Serial.printf("[FS] Disk Usage at %.1f%% — below start limit (%.1f%%), no cleanup needed.\n",
+                      pctUsed, FS_Cleaning_START_LIMIT);
 #endif
-            updateWebpageCache(); // Instantly update the UI before exiting
-            xSemaphoreGive(fileSystemMutex);
-            return;
-        }
+        return;
+    }
 
-    LOG_CAT(DBG_FS, "[FS] ⚠ Disk at %.1f%% used (start limit %.1f%%) — beginning temperature log cleanup\n",
-                  pctUsed, FS_Cleaning_START_LIMIT);
+        Serial.printf(
+        "[FS] ⚠ Disk at %.1f%% used (start limit %.1f%%) — beginning "
+        "temperature log cleanup\n",
+        pctUsed, FS_Cleaning_START_LIMIT
+    );
 
-    const int maxIterations = 32;
+    // Try for up to ~5 seconds total (5 × 1s attempts) instead of one 5s block.
+    if (!takeFileSystemMutexWithRetry("[FS] enforceTemperatureLogDiskLimit",
+                                      pdMS_TO_TICKS(1000),   // per attempt
+                                      5)) {                  // maxAttempts
+        Serial.println("[FS] ❌ Failed to lock filesystem mutex in "
+                       "enforceTemperatureLogDiskLimit()");
+        return;
+    }
+
+    const int maxIterations = 32;  // safety: max ~32 days per cleanup run
     String lastDateTried;
+
+
     for (int iteration = 0;
          iteration < maxIterations && pctUsed >= FS_Cleaning_STOP_LIMIT;
          ++iteration)
     {
         String oldestDate;
-        if (!findOldestTemperatureLogDateUnlocked(oldestDate)) {
-
-            LOG_CAT(DBG_FS, "[FS] ⚠ No more log dates found; stopping cleanup");
-
+        if (!findOldestTemperatureLogDate(oldestDate)) {
+            Serial.println("[FS] ⚠ No more log dates found; stopping cleanup");
             break;
         }
+
         if (oldestDate == lastDateTried && iteration > 0) {
-
-            LOG_ERR("[FS] ⚠ Oldest date (%s) repeated; aborting to avoid loop\n",
-                    oldestDate.c_str());
-
+            Serial.printf(
+                "[FS] ⚠ Oldest date (%s) is same as previous iteration and "
+                "did not free enough space; aborting to avoid loop\n",
+                oldestDate.c_str()
+            );
             break;
         }
         lastDateTried = oldestDate;
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(1));
 
         size_t usedBefore = used;
-        
-        LOG_CAT(DBG_FS, "[FS] 🧹 Iteration %d: deleting logs for oldest date %s\n",
-                      iteration + 1, oldestDate.c_str());
 
-        deleteTemperatureLogsForDateUnlocked(oldestDate);
-
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(1));
+        Serial.printf(
+            "[FS] 🧹 Iteration %d: deleting logs for oldest date %s\n",
+            iteration + 1, oldestDate.c_str()
+        );
+        deleteTemperatureLogsForDate(oldestDate);
 
         used = LittleFS.usedBytes();
         pctUsed = ((float)used / (float)total) * 100.0f;
 
-       
-        LOG_CAT(DBG_FS, "[FS] After deleting %s: used=%u bytes (%.1f%% of %u bytes)\n",
-                      oldestDate.c_str(), (unsigned)used, pctUsed, (unsigned)total);
+        Serial.printf(
+            "[FS] After deleting %s: used=%u bytes (%.1f%% of %u bytes)\n",
+            oldestDate.c_str(),
+            (unsigned)used,
+            pctUsed,
+            (unsigned)total
+        );
 
         if (used == usedBefore) {
-
-            LOG_ERR("[FS] ⚠ No bytes freed; stopping cleanup to avoid infinite loop");
-
+            Serial.println(
+                "[FS] ⚠ No bytes freed in this iteration; stopping cleanup "
+                "to avoid infinite loop"
+            );
             break;
         }
-       if (pctUsed < FS_Cleaning_STOP_LIMIT) {
 
-                LOG_CAT(DBG_FS, "[FS] ✅ Disk usage now %.1f%% (< %.1f%%); cleanup complete\n",
-                              pctUsed, FS_Cleaning_STOP_LIMIT);
-
-                break;
-            }
-            vTaskDelay(1);
+        if (pctUsed < FS_Cleaning_STOP_LIMIT) {
+            Serial.printf(
+                "[FS] ✅ Disk usage now %.1f%% (< %.1f%%); cleanup complete\n",
+                pctUsed, FS_Cleaning_STOP_LIMIT
+            );
+            break;
         }
-        
-        // --- ZERO-OVERHEAD WEBPAGE CACHE UPDATE (Part 2/2) ---
-        updateWebpageCache(); // Update the UI with the new disk sizes after files were deleted
-        
-        xSemaphoreGive(fileSystemMutex);
+
+        vTaskDelay(1); // small breather between days
     }
 
+    xSemaphoreGive(fileSystemMutex);
+}
 
 
 
@@ -502,91 +441,47 @@ void enforceTemperatureLogDiskLimit() {
 
 void LittleFSformat()  {
     if (LittleFS.format()) {
-        LOG_ERR("[FS] Formatting LittleFS succeeded. Attempting to mount again...\n");
-        if (LittleFS.begin()) {
-            LOG_ERR("[FS] LittleFS mounted successfully after formatting.\n");
-        } else {
-            LOG_ERR("[FS] Mounting LittleFS failed even after formatting.\n");
-        }
-    } else {
-        LOG_ERR("[FS] Formatting LittleFS failed.\n");
-    }
-}
+      Serial.println("Formatting LittleFS succeeded. Attempting to mount again...");
+       if (LittleFS.begin()) {
+        Serial.println("LittleFS mounted successfully after formatting.");
+         } else { Serial.println("Mounting LittleFS failed even after formatting.");
+          }} else {
+          Serial.println("Formatting LittleFS failed.");
+  }
+  }
 
 void initializeFileSystem() {
-    LOG_CAT(DBG_FS, "[FS] Attempting to mount LittleFS file system.\n");
+   // Attempt to mount LittleFS. If fail, provide instructions for manual formatting.
+   Serial.println("Attempting to mount LittleFS file system.");
+      if (!LittleFS.begin()) {
+       Serial.println("Mounting LittleFS failed. If you wish to format the filesystem to LittleFS,");
+       Serial.println("uncomment the 'LittleFS.format()' line in the 'initializeFileSystem()' function");
+      Serial.println("in the FileSystemManager.cpp file and re-upload your sketch.");
+      g_fileSystemReady = false; // sets flag false on mount failure
+        return;
 
-    if (!LittleFS.begin()) {
-        LOG_ERR("[FS] Initial LittleFS mount failed. Formatting and retrying...\n");
+// Uncomment the next line to enable formatting LittleFS automatically. Use with caution.
 
-        LittleFSformat(); // Uncomment this line to format the File System
-
-        if (!LittleFS.begin()) {
-            LOG_ERR("[FS] LittleFS still failed to mount after formatting.\n");
-            g_fileSystemReady = false;
-            return;
-        }
-    }
-
-    LOG_CAT(DBG_FS, "[FS] LittleFS mounted successfully.\n");
-
-    // Ensure JSON config directory exists (shared by multiple config files)
-    if (!LittleFS.exists(DIAG_SERIAL_CONFIG_DIR)) {
-        if (LittleFS.mkdir(DIAG_SERIAL_CONFIG_DIR)) {
-            LOG_CAT(DBG_FS, "[FS] Created %s\n", DIAG_SERIAL_CONFIG_DIR);
-        } else {
-            LOG_ERR("[FS] ERROR: Failed to create %s\n", DIAG_SERIAL_CONFIG_DIR);
-        }
-    }
-
-    g_fileSystemReady = true; // ✅ temp logger waits for this flag
-    
-    // Grab a baseline read at boot so the webpage UI isn't blank for the first hour
-    updateFSStatsCache(); 
-}
-
-
-
-File openLogFileLocked(const String& filename, const char* mode) {
-  if (!g_fileSystemReady) return File();
-
-  if (!takeFileSystemMutexWithRetry("openLogFileLocked", pdMS_TO_TICKS(50), 10)) {
-    return File();
-  }
-
-  // We intentionally KEEP the mutex held while returning the File.
-  File f = openLogFileUnlocked(filename, mode);
-
-  // If open failed, release immediately so we don't deadlock.
-  if (!f) {
-    xSemaphoreGive(fileSystemMutex);
-  }
-
-  return f;
-}
-
-void closeLogFileLocked(File& f) {
-  if (f) {
-    f.close();
-  }
-  // Always release the mutex that openLogFileLocked acquired.
-  xSemaphoreGive(fileSystemMutex);
+//LittleFSformat(); // Enabling LittleFSformat(); will format the flash 
+       
+       } Serial.println("LittleFS mounted successfully.");
+       g_fileSystemReady = true; // ✅ temp logger waits for this flag
+       
 }
 
 
 // Function definition
 File openLogFile(const String& filename, const char* mode) {
-
-  if (!g_fileSystemReady) return File();
-
-  if (!takeFileSystemMutexWithRetry("openLogFile", pdMS_TO_TICKS(50), 10)) {
-    return File();
-  }
-
-  File f = openLogFileUnlocked(filename, mode);
-
-  xSemaphoreGive(fileSystemMutex);
-  return f;
+    if (!LittleFS.exists(filename)) {
+        // Optionally, you can enable this message
+        // Serial.println("File does not exist: " + filename);
+        return File(); // Return an empty File object
+    }
+    File file = LittleFS.open(filename, mode);
+    if (!file) {
+        Serial.println("Failed to open " + filename + " for reading.");
+    }
+    return file;
 }
 
 // Append STOP event entry to open pump logs via TaskInitFileSystem at Bootup
@@ -614,44 +509,80 @@ static String formatBytes(size_t v) {
   return String(buf);
 }
 
+// Returns heap as JSON-like string (free, total, pctUsed) or plain formatted string
+String getFreeHeapString() {
+    // Raw values from the ESP32 heap API
+    size_t freeHeap  = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    size_t totalHeap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+
+    // Calculate USED bytes
+    size_t usedHeap  = (totalHeap > freeHeap) ? (totalHeap - freeHeap) : 0;
+
+    // Calculate USED percentage
+    float pctUsed = (totalHeap > 0)
+        ? (static_cast<float>(usedHeap) / static_cast<float>(totalHeap)) * 100.0f
+        : 0.0f;
+
+    // Format: "used / total bytes (xx.x% used)"
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "%u / %u bytes (%.1f%% used)",
+             static_cast<unsigned>(usedHeap),
+             static_cast<unsigned>(totalHeap),
+             pctUsed);
+
+    return String(buf);
+}
+
 
 // Returns file system stats: JSON string with used, total, free, pctUsed plus friendly labels
-// Pre-load with safe dummy data so early web clients don't crash
-String g_cachedFsStatsJson = "{\"usedBytes\":0,\"totalBytes\":0,\"freeBytes\":0,\"pctUsed\":0.0,\"usedLabel\":\"--\",\"freeLabel\":\"--\",\"totalLabel\":\"--\"}";
+String getFSStatsString() {
+  size_t total = 0;
+  size_t used  = 0;
 
-void updateFSStatsCache() {
-  if (!g_fileSystemReady) return;
+  // Simple, Arduino-style LittleFS API
+  total = LittleFS.totalBytes();
+  used  = LittleFS.usedBytes();
 
-  // Non-blocking (short) lock attempt. If the FS is busy appending a log, skip and try next time.
-  if (!takeFileSystemMutexWithRetry("[FSCache]", pdMS_TO_TICKS(100), 2)) {
-    return;
+  // If total is zero, the FS implementation didn't give us anything useful
+  if (total == 0) {
+    return String("FS: unknown");
   }
-
-  // Perform the heavy flash read
-  size_t total = LittleFS.totalBytes();
-  size_t used  = LittleFS.usedBytes();
-
-  // Release the flash mutex IMMEDIATELY so logging tasks can proceed
-  xSemaphoreGive(fileSystemMutex);
 
   size_t freeBytes = (total > used) ? (total - used) : 0;
   float pctUsed    = (total > 0) ? ((float)used / (float)total) * 100.0f : 0.0f;
+
+  auto formatBytes = [](size_t v) -> String {
+    const char* units[] = {"B","KB","MB","GB","TB"};
+    double val = (double)v;
+    int unit = 0;
+    while (val >= 1024.0 && unit < 4) {
+      val /= 1024.0;
+      unit++;
+    }
+    char buf[32];
+    if (val < 10.0 && unit > 0) {
+      snprintf(buf, sizeof(buf), "%.1f %s", val, units[unit]);
+    } else {
+      snprintf(buf, sizeof(buf), "%.0f %s", val, units[unit]);
+    }
+    return String(buf);
+  };
 
   String totalStr = formatBytes(total);
   String usedStr  = formatBytes(used);
   String freeStr  = formatBytes(freeBytes);
 
-  // Update the global RAM cache
-  g_cachedFsStatsJson = "{\"usedBytes\":" + String(used) +
+  // Proper JSON that the browser can parse
+  String out = "{\"usedBytes\":" + String(used) +
                ",\"totalBytes\":" + String(total) +
                ",\"freeBytes\":" + String(freeBytes) +
                ",\"pctUsed\":" + String(pctUsed, 1) +
                ",\"usedLabel\":\"" + usedStr + "\"" +
                ",\"freeLabel\":\"" + freeStr + "\"" +
                ",\"totalLabel\":\"" + totalStr + "\"}";
+
+  return out;
 }
 
-// The WebSocket transmitter will now call this, which returns instantly from RAM (0ms)
-String getFSStatsString() {
-  return g_cachedFsStatsJson;
-}
+

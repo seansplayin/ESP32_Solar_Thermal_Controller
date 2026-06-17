@@ -1,21 +1,20 @@
-// RTCManager.cpp
 #include "RTCManager.h"
 #include "Config.h" // Include this to use rtc, pinSDA, and pinSCL
 #include "Logging.h"
 #include "WebServerManager.h" // Include this to access ws
 #include "TimeSync.h"
 #include "PumpManager.h"
-#include "TemperatureLogging.h"
 #include <RTClib.h>
 #include <Wire.h>
 #include <Ticker.h>
-#include "AlarmManager.h"
-#include "DiagLog.h"
+#include "AlarmManager.h" 
 
 
 // RTC DS3231
 RTC_DS3231 rtc;
-
+//const int pinSDA = 20;
+//const int pinSCL = 21;
+//const int sqwPin = 47; // GPIO pin connected to DS3231 SQW
 DateTime CurrentTime; // This holds the current time updated periodically
 //Ticker dateTimeTickerObject; // This is the Ticker object
 
@@ -26,36 +25,17 @@ bool g_rtcOk = false;
 
 void markTimeValid()
 {
-    if (!g_timeValid) {
-        g_timeValid = true;
-        enableTemperatureLogging();
-    }
+    g_timeValid = true;
 }
 
-bool syncCurrentTimeFromRTCIfValid()
-{
-    if (!g_rtcOk) return false;
 
-    DateTime dt = rtc.now();
-    int year = dt.year();
-
-    if (year >= 2025 && year <= 2100) {
-        CurrentTime = dt;
-        markTimeValid();
-        return true;
-    }
-
-    return false;
-}
-
-void setupRTC() {
+void setupRTC() { 
     Wire.begin(pinSDA, pinSCL); // Initialize I2C
 
     if (!rtc.begin()) {
-        LOG_ERR("[RTC] Couldn't find RTC\n");
+        Serial.println("Couldn't find RTC");
 
         g_rtcOk = false;
-        g_timeValid = false;
         AlarmManager_set(ALM_RTC_MISSING, ALM_ALARM, "RTC not detected");
 
         // Keep running so web UI + Alarm Log still work
@@ -64,18 +44,6 @@ void setupRTC() {
 
     g_rtcOk = true;
     AlarmManager_clear(ALM_RTC_MISSING, "RTC detected");
-
-    // Try one immediate promotion from raw RTC -> CurrentTime.
-    // If this early read is not sane yet, later retry paths will promote it.
-    if (syncCurrentTimeFromRTCIfValid()) {
-        LOG_CAT(DBG_RTC,
-                "[RTC] Restored time from RTC at boot: %04d/%02d/%02d %02d:%02d:%02d\n",
-                CurrentTime.year(), CurrentTime.month(), CurrentTime.day(),
-                CurrentTime.hour(), CurrentTime.minute(), CurrentTime.second());
-    } else {
-        g_timeValid = false;
-        LOG_ERR("[RTC] RTC not sane yet at boot; will retry from runtime paths\n");
-    }
 }
 
 
@@ -92,10 +60,18 @@ DateTime getCurrentTimeAtomic() {
 }
 
 void printCurrentTime() {
-    LOG_CAT(DBG_RTC,
-            "[RTC] Current time: %04d/%02d/%02d %02d:%02d:%02d\n",
-            CurrentTime.year(), CurrentTime.month(), CurrentTime.day(),
-            CurrentTime.hour(), CurrentTime.minute(), CurrentTime.second());
+    Serial.print("Current time: ");
+    Serial.print(CurrentTime.year(), DEC);
+    Serial.print('/');
+    Serial.print(CurrentTime.month(), DEC);
+    Serial.print('/');
+    Serial.print(CurrentTime.day(), DEC);
+    Serial.print(' ');
+    Serial.print(CurrentTime.hour(), DEC);
+    Serial.print(':');
+    Serial.print(CurrentTime.minute(), DEC);
+    Serial.print(':');
+    Serial.println(CurrentTime.second(), DEC);
 }
 
 void adjustTime(const DateTime& dt) {
@@ -106,12 +82,12 @@ String getCurrentDateString() {
     char dateStr[11]; // Buffer for YYYY-MM-DD format
     sprintf(dateStr, "%04d-%02d-%02d", CurrentTime.year(), CurrentTime.month(), CurrentTime.day());
    return String(dateStr);
-}
+}// Confirmed this function properly reports date/time and is used in the pump on and off logs
 
 String getRtcTimeString() {
     char buffer[20];
-    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d",
-    CurrentTime.year(), CurrentTime.month(), CurrentTime.day(),
+    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", 
+    CurrentTime.year(), CurrentTime.month(), CurrentTime.day(), 
     CurrentTime.hour(), CurrentTime.minute(), CurrentTime.second());
     return String(buffer);
 }// Function to get the current year as an integer
@@ -128,15 +104,17 @@ String getCurrentDateStringMDY() {
 
 
 void broadcastDateTime() {
-    // One-shot helper for explicit sync events only
-    extern volatile bool g_sendDateTime;
-    g_sendDateTime = true;
+    char buffer[32]; // Format the current date and time into the buffer
+    sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d", 
+    CurrentTime.year(), CurrentTime.month(), CurrentTime.day(), 
+    CurrentTime.hour(), CurrentTime.minute(), CurrentTime.second());
+// Use ws to broadcast the buffer's content to all connected WebSocket clients
+//ws.textAll(buffer);
+    broadcastMessageOverWebSocket(buffer, "CurrentTime");
 }
 
 void refreshCurrentTime() {
     CurrentTime = rtc.now(); // Refresh the global CurrentTime variable
-
-    // IMPORTANT:
-    // Do NOT continuously flag DateTime for WS broadcast here.
-    // FirstWebpage now keeps time locally after initial sync.
+    broadcastDateTime(); // Formats time and then broadcasts through ws (websocket)
 }
+

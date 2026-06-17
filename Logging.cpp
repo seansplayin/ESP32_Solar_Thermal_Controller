@@ -1,4 +1,3 @@
-// Logging.cpp
 #include "Logging.h"
 #include "TimeSync.h"
 #include "RTCManager.h"
@@ -7,64 +6,11 @@
 #include <map>
 #include "Config.h"
 #include <LittleFS.h>
-#include <FS.h>
+#include <FS.h> 
 #include <RTClib.h>
 #include <stdlib.h>
 #include "FileSystemManager.h"
 #include "TaskManager.h"
-#include "DiagLog.h"
-#include "MemoryStats.h"
-#include <esp_heap_caps.h>
-#include "FileSystemManager.h"
-#include <LittleFS.h>
-
-static void appendMemMarkCsv(const char* tag) {
-  if (!tag) tag = "tag";
-  if (!g_fileSystemReady) return;
-  if (!fileSystemMutex) return;
-
-  if (xSemaphoreTake(fileSystemMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
-
-  File f = LittleFS.open("/mem_marks.csv", "a");
-  if (!f) { xSemaphoreGive(fileSystemMutex); return; }
-
-  const uint32_t ms = millis();
-
-  const uint32_t iTotal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const uint32_t iFree  = heap_caps_get_free_size (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const uint32_t iMin   = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const uint32_t iLfb   = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-
-  const uint32_t pTotal = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  const uint32_t pFree  = heap_caps_get_free_size (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  const uint32_t pMin   = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  const uint32_t pLfb   = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-  // ms,tag,iFree,iTotal,iMin,iLfb,pFree,pTotal,pMin,pLfb
-  f.printf("%lu,%s,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
-           (unsigned long)ms, tag,
-           (unsigned long)iFree, (unsigned long)iTotal, (unsigned long)iMin, (unsigned long)iLfb,
-           (unsigned long)pFree, (unsigned long)pTotal, (unsigned long)pMin, (unsigned long)pLfb);
-
-  f.close();
-  xSemaphoreGive(fileSystemMutex);
-}
-
-static void memMark(const char* tag) {
-  if (!tag) tag = "?";
-
-  LOG_CAT(DBG_MEM, "\n=== MEM MARK: %s ===\n", tag);
-
-  // Snapshot (free/total/min/lfb)
-  MemoryStats_printSnapshot(tag);
-
-  // EXACT UI wording (matches your webpage strings)
-  LOG_CAT(DBG_MEM, "[%s] Heap (Internal): %s\n", tag, getHeapInternalString().c_str());
-  LOG_CAT(DBG_MEM, "[%s] PSRAM:          %s\n", tag, getPsramString().c_str());
-
-  // Optional: persist so you don’t need Serial connected overnight
-  appendMemMarkCsv(tag);
-}
 
 extern DateTime CurrentTime;
 extern RTC_DS3231 rtc;  // Use the external 'rtc' declaration
@@ -72,992 +18,576 @@ volatile bool Elapsed_Day = false;
 extern void runHourlyHealthCheck();
 
 static int lastHourRan = -1;
-
-// ===== Periodic scheduling safety (RTC-based; no time(nullptr) dependency) =====
-// Small execution window so you don't miss events if the tick isn't exact.
-static const uint8_t kScheduleWindowSec = 2;
-
-// "once" guards
-static int g_lastturnOnAllPumpsFor10MinutesRan = -1;
-static int g_lastHealthHourRan = -1;         // 0..23
-static int g_lastFsCleanHourRan = -1;        // 0..23
-static int g_lastNtpSyncY = -1, g_lastNtpSyncM = -1, g_lastNtpSyncD = -1;
-static int g_lastElapsedDayY = -1, g_lastElapsedDayM = -1, g_lastElapsedDayD = -1;
-static int g_lastAggY = -1, g_lastAggM = -1, g_lastAggD = -1;
-
-// job bitmask (executed by the checkTimeAndAct worker)
-static volatile uint32_t g_periodicJobs = 0;
-
-enum : uint32_t {
-  JOB_NONE        = 0,
-  JOB_FS_CLEAN    = (1u << 0),
-  JOB_HEALTHCHECK = (1u << 1),
-  JOB_AGGREGATE   = (1u << 2),
-  JOB_turnOnAllPumpsFor10Minutes = (1u << 3),
-};
-
-static inline bool rtcTimeLooksValid(const DateTime& t) {
-  // Adjust if you want; your project already uses 2024-2099 gates elsewhere.
-  return (t.year() >= 2024 && t.year() <= 2099);
-}
-
-static inline bool withinWindow(const DateTime& t) {
-  return (t.second() <= kScheduleWindowSec);
-}
-
-static inline void scheduleJob(uint32_t jobBit) {
-  g_periodicJobs |= jobBit;
-}
-
-static uint32_t claimJobs() {
-  uint32_t jobs = g_periodicJobs;
-  g_periodicJobs = 0;
-  return jobs;
-}
-
 extern QueueHandle_t logQueue;
 
-// -----------------------------------------------------------------------------
-// Pump log RAM buffering
-// -----------------------------------------------------------------------------
-// Pump START/STOP events are control-history data. They must not be lost just
-// because a large TGZ download, file browser stream, or cleanup task is holding
-// the filesystem mutex.  Phase 1 behavior:
-//   * logPumpEvent() captures the event in RAM immediately.
-//   * TaskLogger flushes RAM events to /Pump_Logs every 10 minutes or when the
-//     buffer reaches a small threshold.
-//   * Web/runtime code can call flushPendingPumpLogEvents() before reading logs.
-//
-// This keeps pump control and runtime accounting independent from long FS work.
-static constexpr size_t PUMP_LOG_PENDING_CAPACITY = 512;
-static constexpr size_t PUMP_LOG_FLUSH_CHUNK      = 64;
-
-static LogEvent g_pendingPumpLogs[PUMP_LOG_PENDING_CAPACITY];
-static size_t   g_pendingPumpLogHead  = 0;
-static size_t   g_pendingPumpLogCount = 0;
-
-static SemaphoreHandle_t g_pendingPumpLogMutex = nullptr;
-static SemaphoreHandle_t g_pumpLogFlushMutex   = nullptr;
-static uint32_t          g_lastPumpLogFlushMs  = 0;
-
-static void ensurePumpLogBufferMutexes() {
-  if (!g_pendingPumpLogMutex) {
-    g_pendingPumpLogMutex = xSemaphoreCreateMutex();
-  }
-  if (!g_pumpLogFlushMutex) {
-    g_pumpLogFlushMutex = xSemaphoreCreateMutex();
-  }
+void logPumpEvent(uint8_t pumpIndex, bool isStart, const DateTime &ts) {
+  LogEvent ev{ pumpIndex, isStart, ts };
+  xQueueSend(logQueue, &ev, portMAX_DELAY);
 }
-
-static bool validPumpLogIndex(uint8_t pumpIndex) {
-  return pumpIndex < 10;
-}
-
-bool bufferPumpLogEvent(const LogEvent& ev, TickType_t waitTicks) {
-  if (!validPumpLogIndex(ev.pumpIndex)) {
-    LOG_ERR("[PumpLogBuffer] Invalid pump index %u; event ignored\n", (unsigned)ev.pumpIndex);
-    return true; // handled/ignored; do not keep retrying an invalid event
-  }
-
-  ensurePumpLogBufferMutexes();
-  if (!g_pendingPumpLogMutex) return false;
-
-  if (xSemaphoreTake(g_pendingPumpLogMutex, waitTicks) != pdTRUE) {
-    return false;
-  }
-
-  if (g_pendingPumpLogCount >= PUMP_LOG_PENDING_CAPACITY) {
-    xSemaphoreGive(g_pendingPumpLogMutex);
-    LOG_ERR("[PumpLogBuffer] RAM buffer FULL; pump event not buffered. pump=%u pending=%u\n",
-            (unsigned)(ev.pumpIndex + 1), (unsigned)g_pendingPumpLogCount);
-    return false;
-  }
-
-  size_t pos = (g_pendingPumpLogHead + g_pendingPumpLogCount) % PUMP_LOG_PENDING_CAPACITY;
-  g_pendingPumpLogs[pos] = ev;
-  g_pendingPumpLogCount++;
-
-  xSemaphoreGive(g_pendingPumpLogMutex);
-  return true;
-}
-
-size_t getPendingPumpLogEventCount() {
-  ensurePumpLogBufferMutexes();
-  if (!g_pendingPumpLogMutex) return 0;
-
-  size_t n = 0;
-  if (xSemaphoreTake(g_pendingPumpLogMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    n = g_pendingPumpLogCount;
-    xSemaphoreGive(g_pendingPumpLogMutex);
-  }
-  return n;
-}
-
-static void drainLegacyPumpLogQueueToRam() {
-  if (!logQueue) return;
-
-  LogEvent ev;
-  uint16_t drained = 0;
-  while (xQueueReceive(logQueue, &ev, 0) == pdTRUE) {
-    (void)bufferPumpLogEvent(ev, pdMS_TO_TICKS(5));
-    drained++;
-    if (drained >= 64) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-      drained = 0;
-    }
-  }
-}
-
-static size_t copyPendingPumpLogChunk(LogEvent* out, size_t maxEvents, size_t targetRemaining) {
-  if (!out || maxEvents == 0 || targetRemaining == 0) return 0;
-
-  ensurePumpLogBufferMutexes();
-  if (!g_pendingPumpLogMutex) return 0;
-
-  size_t copied = 0;
-  if (xSemaphoreTake(g_pendingPumpLogMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    copied = g_pendingPumpLogCount;
-    if (copied > maxEvents) copied = maxEvents;
-    if (copied > targetRemaining) copied = targetRemaining;
-
-    for (size_t i = 0; i < copied; i++) {
-      size_t pos = (g_pendingPumpLogHead + i) % PUMP_LOG_PENDING_CAPACITY;
-      out[i] = g_pendingPumpLogs[pos];
-    }
-    xSemaphoreGive(g_pendingPumpLogMutex);
-  }
-  return copied;
-}
-
-static void removeFlushedPumpLogEvents(size_t count) {
-  if (count == 0) return;
-
-  ensurePumpLogBufferMutexes();
-  if (!g_pendingPumpLogMutex) return;
-
-  if (xSemaphoreTake(g_pendingPumpLogMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (count > g_pendingPumpLogCount) count = g_pendingPumpLogCount;
-    g_pendingPumpLogHead = (g_pendingPumpLogHead + count) % PUMP_LOG_PENDING_CAPACITY;
-    g_pendingPumpLogCount -= count;
-    xSemaphoreGive(g_pendingPumpLogMutex);
-  }
-}
-
-static bool writePumpLogEventsToFs(const LogEvent* events,
-                                   size_t count,
-                                   size_t& successCount,
-                                   TickType_t mutexWaitTicks,
-                                   uint8_t retries) {
-  successCount = 0;
-  if (!events || count == 0) return true;
-
-  if (!g_fileSystemReady) {
-    return false;
-  }
-
-  if (!takeFileSystemMutexWithRetry("[PumpLogBuffer] flush", mutexWaitTicks, retries)) {
-    return false;
-  }
-
-  if (!LittleFS.exists("/Pump_Logs")) {
-    LittleFS.mkdir("/Pump_Logs");
-  }
-
-  bool ok = true;
-  for (size_t i = 0; i < count; i++) {
-    const LogEvent& ev = events[i];
-
-    if (!validPumpLogIndex(ev.pumpIndex)) {
-      successCount++;
-      continue;
-    }
-
-    String fn = "/Pump_Logs/pump" + String(ev.pumpIndex + 1) + "_Log.txt";
-    File f = LittleFS.open(fn, FILE_APPEND);
-    if (!f) {
-      LOG_ERR("[PumpLogBuffer] Failed to open '%s' for append\n", fn.c_str());
-      ok = false;
-      break;
-    }
-
-    f.printf("%s %04d-%02d-%02d %02d:%02d:%02d\n",
-             ev.isStart ? "START" : "STOP",
-             ev.ts.year(),  ev.ts.month(), ev.ts.day(),
-             ev.ts.hour(),  ev.ts.minute(), ev.ts.second());
-    f.close();
-    successCount++;
-
-    if ((i % 16) == 15) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
-  }
-
-  xSemaphoreGive(fileSystemMutex);
-  return ok;
-}
-
-bool flushPendingPumpLogEvents(TickType_t mutexWaitTicks, uint8_t retries) {
-  drainLegacyPumpLogQueueToRam();
-
-  ensurePumpLogBufferMutexes();
-  if (!g_pumpLogFlushMutex) return false;
-
-  if (xSemaphoreTake(g_pumpLogFlushMutex, pdMS_TO_TICKS(250)) != pdTRUE) {
-    return false; // another caller is already flushing
-  }
-
-  size_t target = getPendingPumpLogEventCount();
-  size_t remaining = target;
-  bool allOk = true;
-
-  LogEvent chunk[PUMP_LOG_FLUSH_CHUNK];
-
-  while (remaining > 0) {
-    size_t n = copyPendingPumpLogChunk(chunk, PUMP_LOG_FLUSH_CHUNK, remaining);
-    if (n == 0) break;
-
-    size_t success = 0;
-    bool ok = writePumpLogEventsToFs(chunk, n, success, mutexWaitTicks, retries);
-
-    if (success > 0) {
-      removeFlushedPumpLogEvents(success);
-      remaining = (success >= remaining) ? 0 : (remaining - success);
-    }
-
-    if (!ok || success < n) {
-      allOk = false;
-      break;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
-
-  if (allOk) {
-    g_lastPumpLogFlushMs = millis();
-  }
-
-  xSemaphoreGive(g_pumpLogFlushMutex);
-  return allOk;
-}
-
-void servicePumpLogBufferOnce(uint32_t flushIntervalMs, size_t flushCountThreshold) {
-  drainLegacyPumpLogQueueToRam();
-
-  size_t pending = getPendingPumpLogEventCount();
-  if (pending == 0) return;
-
-  uint32_t now = millis();
-  bool dueByTime = (g_lastPumpLogFlushMs == 0) || ((uint32_t)(now - g_lastPumpLogFlushMs) >= flushIntervalMs);
-  bool dueByCount = (pending >= flushCountThreshold);
-
-  if (dueByTime || dueByCount) {
-    if (!flushPendingPumpLogEvents(pdMS_TO_TICKS(2000), 3)) {
-      LOG_CAT(DBG_PUMPLOG,
-              "[PumpLogBuffer] Flush deferred; pending=%u FS may be busy\n",
-              (unsigned)getPendingPumpLogEventCount());
-    }
-  }
-}
-
-// 4 functions in this file that read/write to file system for Pump Logs:
-// logPumpEvent, aggregatePumptoDailyLogs, aggregateDailyToMonthlyLogs, aggregateMonthlyToYearlyLogs
+// 4 functions in this file that read/write to file system for Pump Logs: LogPumpEvent, aggregatePumptoDailyLogs, aggregateDailyToMonthlyLogs, aggregateMonthlyToYearlyLogs
 
 // Helper function to parse datetime strings
 DateTime parseDateTime(String datetimeStr);
 // Assuming parseDateTimeFromLog() and rtc.now() are properly defined elsewhere
 DateTime parseDateTimeFromLog(const String& datetimeStr);
 
-// New queue based Logging Topology for Pump Runtimes: checkTimeAndAct → setElapsed_Day / setperformLogAggregation → performLogAggregation.
-// Phase 1 update: logPumpEvent now captures the event in RAM immediately.
-// TaskLogger later flushes RAM events to /Pump_Logs so long TGZ/file-browser activity
-// cannot cause START/STOP events to be dropped.
-void logPumpEvent(uint8_t pumpIndex, bool isStart, const DateTime &ts) {
-  LogEvent ev{ pumpIndex, isStart, ts };
 
-  if (bufferPumpLogEvent(ev, pdMS_TO_TICKS(10))) {
-    return;
+// New queue based Logging Topology for Pump Runtimes: checkTimeAndAct → setElapsed_Day / setperformLogAggregation → performLogAggregation. queue is written to LittleFS File System using task "TaskLogger" in TaskManager.cpp file.
+
+// Log pump event (writer version — called from processLogQueue)
+void logPumpEvent(const LogEvent &ev) {
+  String filename = "/Pump_Logs/pump" + String(ev.pumpIndex + 1) + "_Log.txt";  // CHANGE: Updated to new dir
+
+  if (xSemaphoreTake(fileSystemMutex, portMAX_DELAY)) {
+    if (!LittleFS.exists("/Pump_Logs")) {  // CHANGE: Create dir if missing
+      LittleFS.mkdir("/Pump_Logs");
+    }
+
+    File file = LittleFS.open(filename, "a");
+    if (!file) {
+      Serial.println("Failed to open file: " + filename);
+      xSemaphoreGive(fileSystemMutex);
+      return;
+    }
+
+    char timestamp[20];
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d", ev.ts.year(), ev.ts.month(), ev.ts.day(), ev.ts.hour(), ev.ts.minute(), ev.ts.second());
+    file.print(ev.isStart ? "START " : "STOP ");
+    file.println(timestamp);
+
+    file.close();
+    xSemaphoreGive(fileSystemMutex);
   }
-
-  // Fallback only.  The normal path is the RAM buffer above.
-  if (logQueue && xQueueSend(logQueue, &ev, 0) == pdTRUE) {
-    return;
-  }
-
-  LOG_ERR("[PumpLogBuffer] FAILED to capture pump event. pump=%u state=%s\n",
-          (unsigned)(pumpIndex + 1), isStart ? "START" : "STOP");
 }
+
+// Process log queue
+void processLogQueue() {
+  LogEvent ev;
+  while (xQueueReceive(logQueue, &ev, 0) == pdTRUE) {
+    logPumpEvent(ev);
+  }
+}
+
 
 //********List files in the LittleFS********
 void listAllFiles() {
-  if (!takeFileSystemMutexWithRetry("[Logging] listAllFiles",
-                                    pdMS_TO_TICKS(2000), 3)) {
-    LOG_ERR("[Logging] Failed to lock FS mutex in listAllFiles\n");
-    return;
-  }
+    if (!takeFileSystemMutexWithRetry("[Logging] listAllFiles",
+                                      pdMS_TO_TICKS(2000), 3)) {
+        Serial.println("[Logging] Failed to lock FS mutex in listAllFiles");
+        return;
+    }
 
-  File root = LittleFS.open("/");
-  if (!root) {
-    LOG_ERR("[Logging] Failed to open LittleFS root\n");
+    File root = LittleFS.open("/");
+    if (!root) {
+        Serial.println("[Logging] Failed to open LittleFS root");
+        xSemaphoreGive(fileSystemMutex);
+        return;
+    }
+
+    File file = root.openNextFile();
+    Serial.println("Files stored in LittleFS:");
+    while (file) {
+        Serial.println(file.name());
+        file = root.openNextFile();
+    }
+
     xSemaphoreGive(fileSystemMutex);
-    return;
-  }
-
-  File file = root.openNextFile();
-  LOG_CAT(DBG_FS, "Files stored in LittleFS:\n");
-  while (file) {
-    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD: Give network stack time to breathe
-    LOG_CAT(DBG_FS, "%s\n", file.name());
-    file = root.openNextFile();
-  }
-
-  xSemaphoreGive(fileSystemMutex);
 }
+
+
 
 //********Read Files in the LittleFS********
 void readAndPrintLogFile(const String& filename) {
-  String fullPath = "/Pump_Logs/" + filename; // CHANGE: Updated to new dir
+    String fullPath = "/Pump_Logs/" + filename; // CHANGE: Updated to new dir
 
-  if (!takeFileSystemMutexWithRetry("[Logging] readAndPrintLogFile",
-                                    pdMS_TO_TICKS(2000), 3)) {
-    LOG_ERR("[Logging] Failed to lock FS mutex in readAndPrintLogFile\n");
-    return;
-  }
+    if (!takeFileSystemMutexWithRetry("[Logging] readAndPrintLogFile",
+                                      pdMS_TO_TICKS(2000), 3)) {
+        Serial.println("[Logging] Failed to lock FS mutex in readAndPrintLogFile");
+        return;
+    }
 
-  File logFile = LittleFS.open(fullPath, "r");
-  if (!logFile) {
-    LOG_ERR("Failed to open %s for reading\n", fullPath.c_str());
+    File logFile = LittleFS.open(fullPath, "r");
+    if (!logFile) {
+        Serial.println("Failed to open " + fullPath + " for reading");
+        xSemaphoreGive(fileSystemMutex);
+        return;
+    }
+
+    Serial.println("Contents of " + fullPath + ":");
+    while (logFile.available()) {
+        Serial.println(logFile.readStringUntil('\n'));
+    }
+    logFile.close();
+
     xSemaphoreGive(fileSystemMutex);
-    return;
-  }
-
-  LOG_CAT(DBG_PUMPLOG, "Contents of %s:\n", fullPath.c_str());
-  while (logFile.available()) {
-    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-    String line = logFile.readStringUntil('\n');
-    LOG_CAT(DBG_PUMPLOG, "%s\n", line.c_str());
-  }
-  logFile.close();
-
-  xSemaphoreGive(fileSystemMutex);
 }
+
+
 
 //********This section is for managing the logs********
 unsigned long extractTimestamp(const String& line) {
-  // Example implementation, extract and convert the timestamp from the line
-  // Assume the timestamp is at the beginning of the line followed by a space
-  int index = line.indexOf(' ');
-  if (index != -1) {
-    String timestampStr = line.substring(0, index);
-    // Convert the extracted part of the line to an unsigned long
-    // This is just an example; the actual conversion depends on your timestamp format
-    return timestampStr.toInt();
-  }
-  return 0; // Return 0 or an appropriate error value if extraction fails
+// Example implementation, extract and convert the timestamp from the line
+// Assume the timestamp is at the beginning of the line followed by a space
+int index = line.indexOf(' ');
+if (index != -1) {
+String timestampStr = line.substring(0, index);
+// Convert the extracted part of the line to an unsigned long
+// This is just an example; the actual conversion depends on your timestamp format
+return timestampStr.toInt();
 }
+return 0; // Return 0 or an appropriate error value if extraction fails
+}
+
+
 
 // Helper function to get current month as a string (e.g., "January")
 String getCurrentMonthString() {
-  DateTime now = getCurrentTimeAtomic(); // Use cached atomic time
-  char monthName[12];
-  snprintf(monthName, sizeof(monthName), "%04d-%02d", now.year(), now.month());
-  return String(monthName);
+DateTime now = rtc.now(); // Assuming you have an RTC object named rtc
+char monthName[12];
+snprintf(monthName, sizeof(monthName), "%04d-%02d", now.year(), now.month());
+return String(monthName);
 }
 
+
+
 unsigned long extractRuntimeFromLogLine(String line) {
-  // Find the position of "Total Runtime: " in the line
-  int start = line.indexOf("Total Runtime: ") + 15;
-  if (start != -1) {
-    // Extract the substring from this position to the end, excluding " seconds"
-    int end = line.lastIndexOf(" seconds");
-    if (end > start) {
-      String runtimeStr = line.substring(start, end);
-      return runtimeStr.toInt(); // Convert this substring to an unsigned long and return
-    }
-  }
-  return 0; // If parsing fails, return 0
+// Find the position of "Total Runtime: " in the line
+int start = line.indexOf("Total Runtime: ") + 15;
+if (start != -1) {
+// Extract the substring from this position to the end, excluding " seconds"
+int end = line.lastIndexOf(" seconds");
+if (end > start) {
+String runtimeStr = line.substring(start, end);
+return runtimeStr.toInt(); // Convert this substring to an unsigned long and return
+}}
+return 0; // If parsing fails, return 0
 }
+
+
 
 // Helper function to parse datetime string and return a DateTime object
 DateTime parseDateTimeFromLog(const String& datetimeStr) {
-  // Parses datetime string in "YYYY-MM-DD HH:MM:SS" format and returns a DateTime object
-  int year = datetimeStr.substring(0, 4).toInt();
-  int month = datetimeStr.substring(5, 7).toInt();
-  int day = datetimeStr.substring(8, 10).toInt();
-  int hour = datetimeStr.substring(11, 13).toInt();
-  int minute = datetimeStr.substring(14, 16).toInt();
-  int second = datetimeStr.substring(17, 19).toInt();
-  return DateTime(year, month, day, hour, minute, second);
+// Parses datetime string in "YYYY-MM-DD HH:MM:SS" format and returns a DateTime object
+int year = datetimeStr.substring(0, 4).toInt();
+int month = datetimeStr.substring(5, 7).toInt();
+int day = datetimeStr.substring(8, 10).toInt();
+int hour = datetimeStr.substring(11, 13).toInt();
+int minute = datetimeStr.substring(14, 16).toInt();
+int second = datetimeStr.substring(17, 19).toInt();
+return DateTime(year, month, day, hour, minute, second);
 }
+
+
 
 unsigned long calculateTotalRuntime(const String& logFilename) {
-  if (!takeFileSystemMutexWithRetry("[Logging] calculateTotalRuntime",
-                                    pdMS_TO_TICKS(2000), 3)) {
-    LOG_ERR("[Logging] Failed to lock FS mutex in calculateTotalRuntime\n");
-    return 0;
-  }
-
-  File logFile = LittleFS.open(logFilename, "r");
-  if (!logFile) {
-    LOG_ERR("Failed to open log file for reading: %s\n", logFilename.c_str());
-    xSemaphoreGive(fileSystemMutex);
-    return 0;
-  }
-
-  unsigned long totalRuntime = 0;
-  DateTime lastStartTime;
-  bool isPumpRunning = false;
-
-  while (logFile.available()) {
-    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-    String line = logFile.readStringUntil('\n');
-    // Check for START or STOP events and parse the datetime
-    if (line.startsWith("START")) {
-      String timestampStr = line.substring(6); // Adjust based on your log format
-      lastStartTime = parseDateTimeFromLog(timestampStr);
-      isPumpRunning = true;
-    } else if (line.startsWith("STOP") && isPumpRunning) {
-      String timestampStr = line.substring(5); // Adjust based on your log format
-      DateTime stopTime = parseDateTimeFromLog(timestampStr);
-      totalRuntime += (stopTime.unixtime() - lastStartTime.unixtime());
-      isPumpRunning = false;
+    if (!takeFileSystemMutexWithRetry("[Logging] calculateTotalRuntime",
+                                      pdMS_TO_TICKS(2000), 3)) {
+        Serial.println("[Logging] Failed to lock FS mutex in calculateTotalRuntime");
+        return 0;
     }
-  }
-  logFile.close();
 
-  xSemaphoreGive(fileSystemMutex);
-  return totalRuntime;
+    File logFile = LittleFS.open(logFilename, "r");
+    if (!logFile) {
+        Serial.println("Failed to open log file for reading: " + logFilename);
+        xSemaphoreGive(fileSystemMutex);
+        return 0;
+    }
+
+    unsigned long totalRuntime = 0;
+    DateTime lastStartTime;
+    bool isPumpRunning = false;
+    while (logFile.available()) {
+        String line = logFile.readStringUntil('\n');
+        // Check for START or STOP events and parse the datetime
+        if (line.startsWith("START")) {
+            String timestampStr = line.substring(6); // Adjust based on your log format
+            lastStartTime = parseDateTimeFromLog(timestampStr);
+            isPumpRunning = true;
+        } else if (line.startsWith("STOP") && isPumpRunning) {
+            String timestampStr = line.substring(5); // Adjust based on your log format
+            DateTime stopTime = parseDateTimeFromLog(timestampStr);
+            totalRuntime += (stopTime.unixtime() - lastStartTime.unixtime());
+            isPumpRunning = false;
+        }
+    }
+    logFile.close();
+
+    xSemaphoreGive(fileSystemMutex);
+    return totalRuntime;
 }
+
+
+
 
 // Aggregate pump to daily logs
 void aggregatePumptoDailyLogs(int pumpIndex) {
-  memMark("AGG_pump2daily_start");
+    String logFilename      = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Log.txt";  // Updated path
+    String dailyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";  // Updated path
 
-  String logFilename      = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Log.txt";
-  String dailyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";
-
-  if (!takeFileSystemMutexWithRetry("[AGG] pump2daily", pdMS_TO_TICKS(2000), 3)) {
-    LOG_CAT(DBG_PUMPLOG, "[AGG] pump2daily: FS busy, skipping this run\n");
-    return;
-  }
-
-  // Ensure directory exists
-  if (!LittleFS.exists("/Pump_Logs")) {
-    LittleFS.mkdir("/Pump_Logs");
-  }
-
-  // Load existing daily runtimes
-  std::map<String, unsigned long> dailyRuntimeMap;
-  {
-    File dailyLogFile = LittleFS.open(dailyLogFilename, "r");
-    if (dailyLogFile) {
-      while (dailyLogFile.available()) {
-        vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-        String line = dailyLogFile.readStringUntil('\n');
-        line.trim();
-
-        int dateEnd = line.indexOf(" Total Runtime: ");
-        if (dateEnd == -1) continue;
-
-        String date = line.substring(0, dateEnd);
-
-        int runtimeKey = line.indexOf("Total Runtime: ");
-        if (runtimeKey == -1) continue;
-
-        int runtimePos = runtimeKey + 15;
-        int secondsPos = line.indexOf(" seconds", runtimePos);
-        if (secondsPos == -1) continue;
-
-        String runtimeStr = line.substring(runtimePos, secondsPos);
-        unsigned long runtimeVal = strtoul(runtimeStr.c_str(), NULL, 10);
-        dailyRuntimeMap[date] = runtimeVal;
+    if (xSemaphoreTake(fileSystemMutex, portMAX_DELAY)) {
+      if (!LittleFS.exists("/Pump_Logs")) {  // CHANGE: Create dir if missing
+        LittleFS.mkdir("/Pump_Logs");
       }
-      dailyLogFile.close();
-    }
-  }
 
-  File logFile = LittleFS.open(logFilename, "r");
-  if (!logFile) {
-    LOG_CAT(DBG_PUMPLOG, "No log file for pump %d\n", pumpIndex + 1);
-    xSemaphoreGive(fileSystemMutex);
-    memMark("AGG_pump2daily_end");
-    return;
-  }
-
-  DateTime lastStartTime;
-  bool isPumpRunning = false;
-
-  // Accumulate runtime from START→STOP, attributing to STOP date
-  while (logFile.available()) {
-    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-    String line = logFile.readStringUntil('\n');
-    line.trim();
-
-    if (line.startsWith("START ")) {
-      lastStartTime = parseDateTimeFromLog(line.substring(6));
-      isPumpRunning = true;
-    } else if (line.startsWith("STOP ") && isPumpRunning) {
-      DateTime stopTime = parseDateTimeFromLog(line.substring(5));
-      unsigned long runTime = stopTime.unixtime() - lastStartTime.unixtime();
-      String stopDate = line.substring(5, 15); // "YYYY-MM-DD"
-      dailyRuntimeMap[stopDate] += runTime;
-      isPumpRunning = false;
-    }
-  }
-  logFile.close();
-
-  // If still running at aggregation time, split across midnight
-  if (isPumpRunning) {
-    DateTime aggregationTime = CurrentTime;
-    DateTime dayBoundary(aggregationTime.year(), aggregationTime.month(),
-                         aggregationTime.day(), 0, 0, 0);
-
-    DateTime yesterday = dayBoundary - TimeSpan(1, 0, 0, 0);
-    char ybuf[11];
-    snprintf(ybuf, sizeof(ybuf), "%04d-%02d-%02d",
-             yesterday.year(), yesterday.month(), yesterday.day());
-    String yesterdayISO = String(ybuf);
-
-    unsigned long runTime = dayBoundary.unixtime() - lastStartTime.unixtime();
-    dailyRuntimeMap[yesterdayISO] += runTime;
-
-    File newLog = LittleFS.open(logFilename, "w");
-    if (newLog) {
-      char buffer[32];
-      snprintf(buffer, sizeof(buffer),
-               "START %04d-%02d-%02d %02d:%02d:%02d",
-               dayBoundary.year(), dayBoundary.month(), dayBoundary.day(),
-               dayBoundary.hour(), dayBoundary.minute(), dayBoundary.second());
-      newLog.println(buffer);
-      newLog.close();
-    }
-  } else {
-    // If pump not running, clear the log file
-    LittleFS.remove(logFilename);
-  }
-
-  // Rewrite daily log with updated runtimes
-  {
-    File dailyOut = LittleFS.open(dailyLogFilename, "w");
-    if (dailyOut) {
-      for (const auto& entry : dailyRuntimeMap) {
-        dailyOut.printf("%s Total Runtime: %lu seconds\n",
-                        entry.first.c_str(), entry.second);
+      // Load existing daily runtimes
+      std::map<String, unsigned long> dailyRuntimeMap;
+      {
+          File dailyLogFile = LittleFS.open(dailyLogFilename, "r");
+          if (dailyLogFile) {
+              while (dailyLogFile.available()) {
+                  String line = dailyLogFile.readStringUntil('\n');
+                  int dateEnd = line.indexOf(" Total Runtime: ");
+                  if (dateEnd != -1) {
+                      String date = line.substring(0, dateEnd);
+                      int runtimePos = line.indexOf("Total Runtime: ") + 15;
+                      int secondsPos = line.indexOf(" seconds", runtimePos);
+                      if (runtimePos != -1 && secondsPos != -1) {
+                          String runtimeStr  = line.substring(runtimePos, secondsPos);
+                          unsigned long runtimeVal = strtoul(runtimeStr.c_str(), NULL, 10);
+                          dailyRuntimeMap[date] = runtimeVal; // overwrite per date
+                      }
+                  }
+              }
+              dailyLogFile.close();
+          }
       }
-      dailyOut.close();
+
+      File logFile = LittleFS.open(logFilename, "r");
+      if (!logFile) {
+          Serial.println("No log file for pump " + String(pumpIndex + 1));
+          xSemaphoreGive(fileSystemMutex);
+          return; // No events to aggregate
+      }
+
+      DateTime lastStartTime;
+      bool isPumpRunning = false;
+
+      // Accumulate runtime from START→STOP, attributing to STOP date
+      while (logFile.available()) {
+          String line = logFile.readStringUntil('\n');
+          if (line.startsWith("START ")) {
+              lastStartTime = parseDateTimeFromLog(line.substring(6));
+              isPumpRunning = true;
+          } else if (line.startsWith("STOP ") && isPumpRunning) {
+              DateTime stopTime = parseDateTimeFromLog(line.substring(5));
+              unsigned long runTime = stopTime.unixtime() - lastStartTime.unixtime();
+              String stopDate = line.substring(5, 15); // "YYYY-MM-DD"
+              dailyRuntimeMap[stopDate] += runTime;
+              isPumpRunning = false;
+          }
+      }
+      logFile.close();
+
+      // If still running at aggregation time, split across midnight
+      if (isPumpRunning) {
+          DateTime aggregationTime = CurrentTime;
+          DateTime dayBoundary(aggregationTime.year(), aggregationTime.month(),
+                               aggregationTime.day(), 0, 0, 0);
+
+          DateTime yesterday = dayBoundary - TimeSpan(1, 0, 0, 0);
+          char yesterdayBuffer[11];
+          snprintf(yesterdayBuffer, sizeof(yesterdayBuffer), "%04d-%02d-%02d",
+                   yesterday.year(), yesterday.month(), yesterday.day());
+          String yesterdayDateISO = String(yesterdayBuffer);
+
+          unsigned long runTime = dayBoundary.unixtime() - lastStartTime.unixtime();
+          dailyRuntimeMap[yesterdayDateISO] += runTime;
+
+          File newLog = LittleFS.open(logFilename, "w");
+          if (newLog) {
+              char buffer[32];
+              snprintf(buffer, sizeof(buffer),
+                       "START %04d-%02d-%02d %02d:%02d:%02d",
+                       dayBoundary.year(), dayBoundary.month(), dayBoundary.day(),
+                       dayBoundary.hour(), dayBoundary.minute(), dayBoundary.second());
+              newLog.println(buffer);
+              newLog.close();
+          }
+      } else {
+          // If pump not running, clear the log file
+          LittleFS.remove(logFilename);
+      }
+
+      // Rewrite daily log with updated runtimes
+      {
+          File dailyLogFile = LittleFS.open(dailyLogFilename, "w");
+          if (dailyLogFile) {
+              for (const auto& entry : dailyRuntimeMap) {
+                  dailyLogFile.printf("%s Total Runtime: %lu seconds\n",
+                                      entry.first.c_str(), entry.second);
+              }
+              dailyLogFile.close();
+          }
+      }
+
+      Serial.println("Aggregation complete for pump " + String(pumpIndex + 1));
+
+      xSemaphoreGive(fileSystemMutex);
     }
-  }
-
-  LOG_CAT(DBG_PUMPLOG, "Aggregation complete for pump %d\n", pumpIndex + 1);
-
-  xSemaphoreGive(fileSystemMutex);
-  memMark("AGG_pump2daily_end");
 }
+
+
 
 unsigned long calculateTotalMonthlyRuntime(const String& dailyLogFilename) {
-  File dailyLogFile = LittleFS.open(dailyLogFilename, "r");
-  if (!dailyLogFile) {
-    LOG_ERR("Failed to open daily log file for reading: %s\n", dailyLogFilename.c_str());
-    return 0;
-  }
-  unsigned long totalMonthlyRuntime = 0;
-  while (dailyLogFile.available()) {
-    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-    String line = dailyLogFile.readStringUntil('\n');
-    // Assuming the line format is "YYYY-MM-DD Total Runtime: XXX seconds"
-    int start = line.indexOf("Total Runtime: ") + 15;
-    int end = line.lastIndexOf(" seconds");
-    if (start != -1 && end != -1 && end > start) {
-      String runtimeStr = line.substring(start, end);
-      totalMonthlyRuntime += runtimeStr.toInt();
-    }
-  }
-  dailyLogFile.close();
-  return totalMonthlyRuntime;
+File dailyLogFile = LittleFS.open(dailyLogFilename, "r");
+if (!dailyLogFile) {
+Serial.println("Failed to open daily log file for reading: " + dailyLogFilename);
+return 0;
+}
+unsigned long totalMonthlyRuntime = 0;
+while (dailyLogFile.available()) {
+String line = dailyLogFile.readStringUntil('\n');
+// Assuming the line format is "YYYY-MM-DD Total Runtime: XXX seconds"
+int start = line.indexOf("Total Runtime: ") + 15;
+int end = line.lastIndexOf(" seconds");
+if (start != -1 && end != -1 && end > start) {
+String runtimeStr = line.substring(start, end);
+totalMonthlyRuntime += runtimeStr.toInt();
+}}
+dailyLogFile.close();
+return totalMonthlyRuntime;
 }
 
-void aggregateDailyToMonthlyLogs(int pumpIndex) {
-  memMark("AGG_daily2monthly_start");
-  String dailyLogFilename   = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";
-  String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";
+void aggregateDailyToMonthlyLogs(int pumpIndex)
+{
+    String dailyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";  // Updated path
+    String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";  // Updated path
 
-  // 1) Sum daily logs into totalMonthlyRuntime
-  unsigned long totalMonthlyRuntime = calculateTotalMonthlyRuntime(dailyLogFilename);
+    // 1) Sum daily logs into totalMonthlyRuntime
+    unsigned long totalMonthlyRuntime = calculateTotalMonthlyRuntime(dailyLogFilename);
 
-  // 2) Figure out which month to label: *last* month, not current
-  DateTime now = getCurrentTimeAtomic(); // Use cached atomic time
-  int year  = now.year();
-  int month = now.month() - 1;
-  if (month < 1) {
-    month = 12;
-    year--;
-  }
+    // 2) Figure out which month to label: *last* month, not current
+    DateTime now = rtc.now();
+    int year  = now.year();
+    int month = now.month() - 1; 
+    if (month < 1) {
+        month = 12;
+        year--;
+    }
 
-  // Build the "YYYY-MM" string for last month
-  char prevMonthStr[8];
-  snprintf(prevMonthStr, sizeof(prevMonthStr), "%04d-%02d", year, month);
-  String previousMonth = String(prevMonthStr);
+    // Build the "YYYY-MM" string for last month
+    char prevMonthStr[8];
+    snprintf(prevMonthStr, sizeof(prevMonthStr), "%04d-%02d", year, month);
+    String previousMonth = String(prevMonthStr);
 
-  // 3) Read existing monthly file for that pump
-  bool monthExists = false;
-  unsigned long existingRuntime = 0;
-  String updatedContents;
+    // 3) Read existing monthly file for that pump
+    bool monthExists = false;
+    unsigned long existingRuntime = 0;
+    String updatedContents;
 
-  if (LittleFS.exists(monthlyLogFilename)) {
-    File monthlyLogFile = LittleFS.open(monthlyLogFilename, "r");
-    while (monthlyLogFile.available()) {
-      vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-      String line = monthlyLogFile.readStringUntil('\n');
-      if (line.startsWith(previousMonth)) {
-        // parse existing line to get the old runtime
-        int startPos = line.indexOf("Total Runtime: ") + 15;
-        int endPos   = line.indexOf(" seconds", startPos);
-        if (startPos > 0 && endPos > startPos) {
-          existingRuntime = line.substring(startPos, endPos).toInt();
+    if (LittleFS.exists(monthlyLogFilename)) {
+        File monthlyLogFile = LittleFS.open(monthlyLogFilename, "r");
+        while (monthlyLogFile.available()) {
+            String line = monthlyLogFile.readStringUntil('\n');
+            if (line.startsWith(previousMonth)) {
+                // parse existing line to get the old runtime
+                int startPos = line.indexOf("Total Runtime: ") + 15;
+                int endPos   = line.indexOf(" seconds", startPos);
+                if (startPos > 0 && endPos > startPos) {
+                    existingRuntime = line.substring(startPos, endPos).toInt();
+                }
+                monthExists = true;
+            } else {
+                updatedContents += line + "\n"; // keep other months
+            }
         }
-        monthExists = true;
-      } else {
-        updatedContents += line + "\n"; // keep other months
-      }
+        monthlyLogFile.close();
     }
-    monthlyLogFile.close();
-  }
 
-  // 4) Combine old + new runtime
-  if (monthExists) {
-    totalMonthlyRuntime += existingRuntime;
-  }
+    // 4) Combine old + new runtime
+    if (monthExists) {
+        totalMonthlyRuntime += existingRuntime;
+    }
 
-  // 5) Add or update the previousMonth line
-  updatedContents += previousMonth + " Total Runtime: " + String(totalMonthlyRuntime) + " seconds\n";
+    // 5) Add or update the previousMonth line
+    updatedContents += previousMonth + " Total Runtime: " + String(totalMonthlyRuntime) + " seconds\n";
 
-  // 6) Write it back
-  File monthlyLogFile = LittleFS.open(monthlyLogFilename, "w");
-  if (monthlyLogFile) {
-    monthlyLogFile.print(updatedContents);
-    monthlyLogFile.close();
-  } else {
-    LOG_ERR("Failed to open %s for writing\n", monthlyLogFilename.c_str());
-  }
+    // 6) Write it back
+    File monthlyLogFile = LittleFS.open(monthlyLogFilename, "w");
+    if (monthlyLogFile) {
+        monthlyLogFile.print(updatedContents);
+        monthlyLogFile.close();
+    }
+    else {
+        Serial.println("Failed to open " + monthlyLogFilename + " for writing");
+    }
 
-  // 7) Clear daily file
-  if (LittleFS.remove(dailyLogFilename)) {
-    LOG_CAT(DBG_PUMPLOG, "Daily log file cleared.\n");
-  } else {
-    LOG_ERR("Failed to clear daily log file.\n");
-    memMark("AGG_daily2monthly_end");
-  }
+    // 7) Clear daily file
+    if (LittleFS.remove(dailyLogFilename)) {
+        Serial.println("Daily log file cleared.");
+    } else {
+        Serial.println("Failed to clear daily log file.");
+    }
 }
+
+
+
 
 unsigned long calculateTotalYearlyRuntime(const String& yearlyLogFilename) {
-  File yearlyLogFile = LittleFS.open(yearlyLogFilename, "r");
-  if (!yearlyLogFile) {
-    LOG_ERR("Failed to open yearly log file for reading: %s\n", yearlyLogFilename.c_str());
-    return 0;
-  }
-  unsigned long totalYearlyRuntime = 0;
-  while (yearlyLogFile.available()) {
-    vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-    String line = yearlyLogFile.readStringUntil('\n');
-    // Use the existing `extractRuntimeFromLogLine` function
-    totalYearlyRuntime += extractRuntimeFromLogLine(line);
-  }
-  yearlyLogFile.close();
-  return totalYearlyRuntime;
+File yearlyLogFile = LittleFS.open(yearlyLogFilename, "r");
+if (!yearlyLogFile) {
+Serial.println("Failed to open yearly log file for reading: " + yearlyLogFilename);
+return 0;
+}
+unsigned long totalYearlyRuntime = 0;
+while (yearlyLogFile.available()) {
+String line = yearlyLogFile.readStringUntil('\n');
+// Use the existing `extractRuntimeFromLogLine` function
+totalYearlyRuntime += extractRuntimeFromLogLine(line);
+}
+yearlyLogFile.close();
+return totalYearlyRuntime;
 }
 
 void aggregateMonthlyToYearlyLogs(int pumpIndex) {
-  memMark("AGG_monthly2yearly_start");
+    // 1) Reintroduce these paths (the lines missing from your snippet):
+    String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";  // Updated path
+    String yearlyLogFilename  = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Yearly.txt";  // Updated path
 
-  String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";
-  String yearlyLogFilename  = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Yearly.txt";
+    // 2) Sum the monthly logs to get totalYearlyRuntime
+    unsigned long totalYearlyRuntime = calculateTotalYearlyRuntime(monthlyLogFilename);
 
-  // Sum the monthly logs to get totalYearlyRuntime
-  unsigned long totalYearlyRuntime = calculateTotalYearlyRuntime(monthlyLogFilename);
-
-  // Decide whether we label the currentYear or (currentYear - 1) if month == 1
-  DateTime now = getCurrentTimeAtomic(); // Use cached atomic time
-  int year = now.year();
-  if (now.month() == 1) {
-    year = year - 1;
-  }
-
-  String labelYear = String(year);
-
-  bool yearExists = false;
-  unsigned long existingRuntime = 0;
-  String updatedContents;
-
-  // Read existing lines from the yearly file
-  File yearlyLogFile = LittleFS.open(yearlyLogFilename, "r");
-  if (yearlyLogFile) {
-    while (yearlyLogFile.available()) {
-      vTaskDelay(pdMS_TO_TICKS(1)); // YIELD
-      String line = yearlyLogFile.readStringUntil('\n');
-      if (line.startsWith(labelYear)) {
-        int start = line.indexOf("Total Runtime: ") + 15;
-        int end   = line.indexOf(" seconds", start);
-        if (start > 0 && end > start) {
-          existingRuntime = line.substring(start, end).toInt();
-        }
-        yearExists = true;
-      } else {
-        updatedContents += line + "\n";
-      }
+    // 3) Decide whether we label the currentYear or (currentYear - 1) if month == 1
+    DateTime now = rtc.now();  // or however you get the current RTC date/time
+    int year = now.year();
+    if (now.month() == 1) {
+        // It's January, so label *last* year (the one just ended)
+        year = year - 1;
     }
-    yearlyLogFile.close();
-  }
 
-  // Combine old + new runtime
-  if (yearExists) {
+    // Convert the final year into a string
+    String labelYear = String(year);
+
+    bool yearExists = false;
+    unsigned long existingRuntime = 0;
+    String updatedContents;
+
+    // 4) Read existing lines from the yearly file
+    File yearlyLogFile = LittleFS.open(yearlyLogFilename, "r");
+    if (yearlyLogFile) {
+        while (yearlyLogFile.available()) {
+            String line = yearlyLogFile.readStringUntil('\n');
+            if (line.startsWith(labelYear)) {
+                int start = line.indexOf("Total Runtime: ") + 15;
+                int end   = line.indexOf(" seconds", start);
+                if (start > 0 && end > start) {
+                    existingRuntime = line.substring(start, end).toInt();
+                }
+                yearExists = true;
+            } else {
+                // Keep other lines from older/future years
+                updatedContents += line + "\n";
+            }
+        }
+        yearlyLogFile.close();
+    }
+
+    // 5) Combine old + new runtime
     totalYearlyRuntime += existingRuntime;
-  }
 
-  // Add or update the line for labelYear
-  updatedContents += labelYear + " Total Runtime: " + String(totalYearlyRuntime) + " seconds\n";
+    // 6) Add or update the line for labelYear
+    // e.g. "2023 Total Runtime: 1234 seconds"
+    updatedContents += labelYear + " Total Runtime: " + String(totalYearlyRuntime) + " seconds\n";
 
-  // Overwrite the file
-  yearlyLogFile = LittleFS.open(yearlyLogFilename, "w");
-  if (!yearlyLogFile) {
-    LOG_ERR("Failed to open yearly log file for writing.\n");
-    return;
-  }
-  yearlyLogFile.print(updatedContents);
-  yearlyLogFile.close();
+    // 7) Overwrite the file
+    yearlyLogFile = LittleFS.open(yearlyLogFilename, "w");
+    if (!yearlyLogFile) {
+        Serial.println("Failed to open yearly log file for writing.");
+        return;
+    }
+    yearlyLogFile.print(updatedContents);
+    yearlyLogFile.close();
 
-  // Clear the monthly log file
-  if (LittleFS.remove(monthlyLogFilename)) {
-    LOG_CAT(DBG_PUMPLOG, "Cleared monthly log file.\n");
-  } else {
-    LOG_ERR("Failed to clear monthly log file.\n");
-  }
+    // 8) Optionally clear the monthly log file
+    if (LittleFS.remove(monthlyLogFilename)) {
+        Serial.println("Cleared monthly log file.");
+    } else {
+        Serial.println("Failed to clear monthly log file.");
+    }
 
-  LOG_CAT(DBG_PUMPLOG, "Aggregated monthly logs to yearly log for pump %d\n", pumpIndex + 1);
-  memMark("AGG_monthly2yearly_end");
+    Serial.println("Aggregated monthly logs to yearly log for pump " + String(pumpIndex + 1));
 }
+
+
+
 
 void performLogAggregation() {
-  // Make sure RAM-cached START/STOP events are on disk before aggregation reads /Pump_Logs.
-  (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(1000), 2);
-
-  // Aggregate daily logs for each pump
-  memMark("AGG_start");
-  for (int i = 0; i < 10; i++) {
-    aggregatePumptoDailyLogs(i);
-  }
-
-  String currentDate = getCurrentDateStringMDY();
-
-  // Extract month and day from the current date string
-  int month = currentDate.substring(0, 2).toInt();
-  int day   = currentDate.substring(3, 5).toInt();
-
-  // Check if it's the first day of any month
-  if (day == 1) {
-    for (int i = 0; i < 10; i++) {
-      aggregateDailyToMonthlyLogs(i);
-    }
-
-    // Additionally, check if it's the first day of the year (January 1st)
-    if (month == 1) {
-      for (int i = 0; i < 10; i++) {
-        aggregateMonthlyToYearlyLogs(i);
-        memMark("AGG_end");
-      }
-    }
-  }
+// Aggregate daily logs for each pump
+for (int i = 0; i < 10; i++) {
+aggregatePumptoDailyLogs(i);
 }
+String currentDate = getCurrentDateStringMDY();
+// Extract month and day from the current date string
+int month = currentDate.substring(0, 2).toInt();
+int day = currentDate.substring(3, 5).toInt();
+// Check if it's the first day of any month
+if (day == 1) {
+// It's the first day of a month, aggregate daily to monthly logs for each pump
+for (int i = 0; i < 10; i++) {
+aggregateDailyToMonthlyLogs(i);
+}
+// Additionally, check if it's the first day of the year (January 1st)
+if (month == 1) {
+// It's the first day of the year, aggregate monthly to yearly logs for each pump
+for (int i = 0; i < 10; i++) {
+aggregateMonthlyToYearlyLogs(i);
+}}}}
+
+
 
 void setElapsed_Day() {
-  // Only set once per calendar day (prevents spam if checkTimeAndAct hits this multiple times)
-  if (!rtcTimeLooksValid(CurrentTime)) return;
+if (!Elapsed_Day) { // Check if Elapsed_Day is false
+Elapsed_Day = true;
+Serial.println("Elapsed_Day flag set to true");
+} }
 
-  const int y = CurrentTime.year();
-  const int m = CurrentTime.month();
-  const int d = CurrentTime.day();
 
-  const bool alreadySetToday =
-    (g_lastElapsedDayY == y && g_lastElapsedDayM == m && g_lastElapsedDayD == d);
-
-  if (alreadySetToday) return;
-
-  Elapsed_Day = true;
-  g_lastElapsedDayY = y; g_lastElapsedDayM = m; g_lastElapsedDayD = d;
-
-  LOG_CAT(DBG_PUMPLOG, "Elapsed_Day flag set to true\n");
-}
 
 void setperformLogAggregation() {
-  if (!Elapsed_Day) return;
+if (Elapsed_Day) { // Check if Elapsed_Day is true
+performLogAggregation();
+Elapsed_Day = false;
+Serial.println("Log aggregation performed and Elapsed_Day flag reset");
+}}
 
-  if (!rtcTimeLooksValid(CurrentTime)) {
-    LOG_CAT(DBG_PUMPLOG, "[AGG] Skipping aggregation: RTC time not valid\n");
-    return;
-  }
 
-  if (!g_fileSystemReady) {
-    LOG_CAT(DBG_PUMPLOG, "[AGG] Skipping aggregation: file system not ready\n");
-    return;
-  }
-
-  const int y = CurrentTime.year();
-  const int m = CurrentTime.month();
-  const int d = CurrentTime.day();
-
-  const bool alreadyRanToday =
-    (g_lastAggY == y && g_lastAggM == m && g_lastAggD == d);
-
-  if (alreadyRanToday) {
-    // If we somehow got here again, clear Elapsed_Day so we don't keep attempting.
-    Elapsed_Day = false;
-    LOG_CAT(DBG_PUMPLOG, "[AGG] Aggregation already ran today; Elapsed_Day cleared\n");
-    return;
-  }
-
-  // Run it
-  performLogAggregation();
-
-  // Mark success + clear flag
-  g_lastAggY = y; g_lastAggM = m; g_lastAggD = d;
-  Elapsed_Day = false;
-
-  LOG_CAT(DBG_PUMPLOG, "Log aggregation performed and Elapsed_Day flag reset\n");
-}
 
 void maybeRunHealthCheckHourly() {
-  if (!rtcTimeLooksValid(CurrentTime)) return;
+  time_t now = time(nullptr);
+  if (now < 100000) return;
 
-  // example: run on the hour within a small window
-  if (CurrentTime.minute() == 0 && withinWindow(CurrentTime)) {
-    int h = CurrentTime.hour();
-    if (h != lastHourRan) {
-      lastHourRan = h;
+  struct tm t;
+  localtime_r(&now, &t);
+
+  // allow a small window so you don't miss it if the tick isn't exact
+  if (t.tm_min == 0 && t.tm_sec <= 2) {
+    if (t.tm_hour != lastHourRan) {
+      lastHourRan = t.tm_hour;
       runHourlyHealthCheck();
     }
   }
 }
+
+
 void checkTimeAndAct() {
-  // If RTC isn't valid yet, do not run time-based jobs
-  if (!rtcTimeLooksValid(CurrentTime)) return;
-
-  // -----------------------------
-  // 1) High-Frequency / Non-Job Updates
-  // -----------------------------
-  
-  // FS usage cache remains DISABLED for now.
-  // updateFSStatsCache() / LittleFS.usedBytes() has proven destabilizing.
-  /*
-  static int g_lastFsStatsMinute = -1;
-  int currentMin = CurrentTime.minute();
-  if (currentMin % 5 == 0 && currentMin != g_lastFsStatsMinute) {
-    g_lastFsStatsMinute = currentMin;
-    updateFSStatsCache();
+  if (CurrentTime.hour() == 23 && CurrentTime.minute() == 59) {
+    setElapsed_Day();  
+  } 
+  if (CurrentTime.hour() == 0 && CurrentTime.minute() == 0 && CurrentTime.second() == 1) {
+    setperformLogAggregation();   
   }
-  */
-
-  // Refresh HEAP and PSRAM caches from here, not from the WS transmitter.
-  // Stagger them so only one cache refresh runs at a time.
-  static int g_lastHeapStatsMinuteRan  = -1;
-  static int g_lastPsramStatsMinuteRan = -1;
-
-  int currentMin = CurrentTime.minute();
-
-  // Heap cache at :00, :05, :10, ...
-  if ((currentMin % 5) == 0 && currentMin != g_lastHeapStatsMinuteRan) {
-    g_lastHeapStatsMinuteRan = currentMin;
-    updateHeapStatsCache();
-  }
-
-  // PSRAM cache at :01, :06, :11, ...
-  if ((currentMin % 5) == 1 && currentMin != g_lastPsramStatsMinuteRan) {
-    g_lastPsramStatsMinuteRan = currentMin;
-    updatePsramStatsCache();
-  }
-
-  // -----------------------------
-  // 2) Schedule jobs (windowed)
-  // -----------------------------
-
-  // Set Elapsed_Day near end of day (allow window so we don't miss it)
-  if (CurrentTime.hour() == 23 && CurrentTime.minute() == 59 && withinWindow(CurrentTime)) {
-    setElapsed_Day(); // already "once per day" guarded internally
-  }
-
-  // Kick aggregation just after midnight (windowed)
-  // (We schedule it; worker executes it below)
-  if (CurrentTime.hour() == 0 && CurrentTime.minute() == 0 && withinWindow(CurrentTime)) {
-    scheduleJob(JOB_AGGREGATE);
-  }
-
-  // FS cleanup hourly at :30 (windowed + once-per-hour guard)
-  if (CurrentTime.minute() == 30 && withinWindow(CurrentTime)) {
-    int h = CurrentTime.hour();
-    if (h != g_lastFsCleanHourRan) {
-      g_lastFsCleanHourRan = h;
-      scheduleJob(JOB_FS_CLEAN);
-    }
-  }
-
-  // Healthcheck hourly at :35 (windowed + once-per-hour guard)
-  if (CurrentTime.minute() == 35 && withinWindow(CurrentTime)) {
-    int h = CurrentTime.hour();
-    if (h != g_lastHealthHourRan) {
-      g_lastHealthHourRan = h;
-      scheduleJob(JOB_HEALTHCHECK);
-    }
-  }
-
-/*
-  // turnOnAllPumpsFor10Minutes(); hourly at :40 (windowed + once-per-hour guard)
-  if (CurrentTime.minute() == 40 && withinWindow(CurrentTime)) {
-    int h = CurrentTime.hour();
-    if (h != g_lastturnOnAllPumpsFor10MinutesRan) {
-      g_lastturnOnAllPumpsFor10MinutesRan = h;
-      scheduleJob(JOB_turnOnAllPumpsFor10Minutes);
-    }
-  }
-*/
-
-  // Daily 3AM NTP sync (windowed + once-per-day guard)
-  if (CurrentTime.hour() == 3 && CurrentTime.minute() == 0 && withinWindow(CurrentTime)) {
-    if (g_lastNtpSyncY != CurrentTime.year() ||
-        g_lastNtpSyncM != CurrentTime.month() ||
-        g_lastNtpSyncD != CurrentTime.day()) {
-
-      g_lastNtpSyncY = CurrentTime.year();
-      g_lastNtpSyncM = CurrentTime.month();
-      g_lastNtpSyncD = CurrentTime.day();
-
-      LOG_CAT(DBG_TIMESYNC, "[TimeSync] 3AM daily sync window hit, calling initNTP()\n");
-      initNTP();
-    }
-  }
-
-  // -----------------------------
-  // 3) Execute scheduled jobs (single worker context)
-  // -----------------------------
-  uint32_t jobs = claimJobs();
-  if (!jobs) return;
-
-  if (jobs & JOB_AGGREGATE) {
-    // Only aggregates if Elapsed_Day true; function includes safety gates
-    setperformLogAggregation();
-  }
-
-  if (jobs & JOB_FS_CLEAN) {
-    if (!g_fileSystemReady) {
-      LOG_CAT(DBG_FS, "[FS.CleanupWorker] Skipping — g_fileSystemReady == false\n");
+  if (CurrentTime.minute() == 30 && CurrentTime.second() == 0) {  // Trigger at XX:30:00
+    if (thFileSystemCleanup != NULL) {  // Safety check
+      xTaskNotifyGive(thFileSystemCleanup);  // Trigger the cleanup task
     } else {
-      LOG_CAT(DBG_FS, "[FS.CleanupWorker] Running enforceTemperatureLogDiskLimit()\n");
-      enforceTemperatureLogDiskLimit();
-      LOG_CAT(DBG_FS, "[FS.CleanupWorker] Done enforceTemperatureLogDiskLimit()\n");
+      Serial.println("[Error] FileSystemCleanup task handle is NULL");
     }
   }
 
-  if (jobs & JOB_HEALTHCHECK) {
-    runHourlyHealthCheck();
+  if (CurrentTime.hour() == 0 && CurrentTime.minute() == 20 && CurrentTime.second() == 00) {
+    runHourlyHealthCheck();   
   }
 
-  if (jobs & JOB_turnOnAllPumpsFor10Minutes) {
-    turnOnAllPumpsFor10Minutes();
-  }
+
+
 }

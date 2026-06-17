@@ -1,4 +1,3 @@
-// TimeSync.cpp
 #include "TimeSync.h"
 #include "Logging.h"
 #include "RTCManager.h"
@@ -9,10 +8,6 @@
 #include <RTClib.h>
 #include "time.h"
 #include <Ticker.h>
-#include "DiagLog.h"
-#include "AlarmManager.h"
-
-
 Ticker ntpRetryTicker;
 extern DateTime CurrentTime;
 bool needToSyncTime = true; // Initially, we need to synchronize time
@@ -33,22 +28,14 @@ void checkAndSyncTime() {
     DateTime now = CurrentTime; // Assume CurrentTime is up to date
     static DateTime lastSyncDate;
 
-    // --- NEW: Handle the Ticker Retry Flag safely outside the hardware interrupt ---
-    if (isNtpSyncDue) {
-        isNtpSyncDue = false;
-        LOG_CAT(DBG_TIMESYNC, "[TimeSync] Ticker flag triggered, retrying NTP update now.\n");
-        tryNtpUpdate();
-        lastSyncDate = now;
-    }
-
     // 1) One-shot resync requested by web UI after TZ change
     if (g_ntpResyncRequested) {
         g_ntpResyncRequested = false;
-        LOG_CAT(DBG_TIMESYNC, "[TimeSync] TimeConfig changed, re-running initNTP()\n");
+        Serial.println("[TimeSync] TimeConfig changed, re-running initNTP()");
         initNTP();
         lastSyncDate = now;  // Avoid a duplicate sync at the same moment
         return;              // We already synced this second
-    } // <-- FIX: Added the missing bracket so the 3AM sync works again!
+    }
 
     // 2) Daily 3AM maintenance sync (unchanged behavior)
     if (now.hour() == 3 && now.minute() == 0 &&
@@ -56,27 +43,22 @@ void checkAndSyncTime() {
          lastSyncDate.month() != now.month() ||
          lastSyncDate.year()  != now.year())) {
 
-        LOG_CAT(DBG_TIMESYNC, "3AM, calling initNTP to initiate NTP time sync\n");
+        Serial.print("3AM, calling initNTP to initiate NTP time sync");
         initNTP();
         lastSyncDate = now;
+        //turnOnAllPumpsFor10Minutes();  // your existing test hook
     }
 }
 
 
 // this is called in setup to connect to the NTP server
 void initNTP() {
-        LOG_CAT(DBG_TIMESYNC, "Starting NTP time sync\n");
+    Serial.print("Starting NTP time sync ");
     // Offset 0 here because we use POSIX TZ rule via setenv("TZ", ...)
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
     tryNtpUpdate();
 }
 
-
-// Wrapper to safely trigger NTP retry from the main loop, avoiding I2C hardware timer crashes
-void flagNtpRetry() {
-    isNtpSyncDue = true;
-}
 
 void tryNtpUpdate() {
     // Use runtime-configured timezone rule from TimeConfig
@@ -84,45 +66,39 @@ void tryNtpUpdate() {
     setenv("TZ", tzRule.c_str(), 1);
     tzset();
 
-        LOG_CAT(DBG_TIMESYNC, "Attempting NTP time sync with TZ rule: %s\n", tzRule.c_str());
-
+    
+    Serial.print("Attempting NTP time sync with TZ rule: ");
+    Serial.println(tzRule);
+    
 
     struct tm timeinfo;
 
-    if (getLocalTime(&timeinfo)) {
-        LOG_CAT(DBG_TIMESYNC, "Time synchronized successfully.\n");
-        
-        // Clear any previous time sync alarms
-        AlarmManager_clear(ALM_TIME_SYNC_FAIL, "NTP Sync Restored");
+    if (getLocalTime(&timeinfo, 10000)) { // Try to get the time with a 10-second timeout
+        Serial.print("NTP Time synchronize Successful ");
+
+        Serial.printf("NTP Time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1,
+                      timeinfo.tm_mday, timeinfo.tm_hour,
+                      timeinfo.tm_min, timeinfo.tm_sec);
 
         // Adjust RTC with NTP time
         rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1,
                             timeinfo.tm_mday, timeinfo.tm_hour,
                             timeinfo.tm_min, timeinfo.tm_sec));
-        LOG_CAT(DBG_RTC, "RTC adjusted to NTP time.\n");
+        Serial.print("RTC adjusted to NTP time. ");
 
         // Update CurrentTime with the new RTC time
         CurrentTime = rtc.now();
-        if (CurrentTime.year() >= 2025 && CurrentTime.year() <= 2100) {
-            markTimeValid();
-        }
+        printCurrentRtcTime(); // Display the current RTC time
 
-        printCurrentRtcTime(); 
-        ntpRetryTicker.detach(); 
+        ntpRetryTicker.detach(); // Stop retrying since we've successfully synchronized time
     } else {
-        LOG_ERR("[TimeSync] NTP sync failed, will retry in 10 minutes...\n");
-        
-        // Log the failure to the Alarm Webpage
-        AlarmManager_set(ALM_TIME_SYNC_FAIL, ALM_WARN, "NTP Server Unreachable - Retrying");
-
+        Serial.println();
+        Serial.print(" NTP sync failed, will retry in 10 minutes... ");
+        Serial.println();
         CurrentTime = rtc.now();
-        if (CurrentTime.year() >= 2025 && CurrentTime.year() <= 2100) {
-            markTimeValid();
-        }
-
-        printCurrentRtcTime(); 
-        // Safely set a flag instead of calling I2C functions directly from the timer interrupt
-        ntpRetryTicker.once(600, flagNtpRetry); 
+        printCurrentRtcTime(); // Display the current RTC time
+        ntpRetryTicker.once(600, tryNtpUpdate); // Retry after 10 minutes
     }
 }
 
@@ -131,20 +107,26 @@ void tryNtpUpdate() {
 
 
 void printCurrentRtcTime() {
-LOG_CAT(DBG_RTC, " Current time: %04d/%02d/%02d %02d:%02d:%02d\n",
-        CurrentTime.year(), CurrentTime.month(), CurrentTime.day(),
-        CurrentTime.hour(), CurrentTime.minute(), CurrentTime.second());
+Serial.print(" Current time: ");
+Serial.print(CurrentTime.year(), DEC);
+Serial.print('/');
+Serial.print(CurrentTime.month(), DEC);
+Serial.print('/');
+Serial.print(CurrentTime.day(), DEC);
+Serial.print(" ");
+Serial.print(CurrentTime.hour(), DEC);
+Serial.print(':');
+Serial.print(CurrentTime.minute(), DEC);
+Serial.print(':');
+Serial.println(CurrentTime.second(), DEC);
 }
-
-
-
 void initializeTime() {
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
-LOG_ERR("[TimeSync] Failed to obtain time\n");
+struct tm timeinfo;
+if (!getLocalTime(&timeinfo)) {
+Serial.println ();
+Serial.print(" Failed to obtain time ");
+Serial.println ();
 } else {
-
-        // Optionally, log or process the obtained time
-        // LOG_CAT(DBG_TIMESYNC, "[TimeSync] Time obtained successfully\n");
-    }
-}
+// Optionally, log or process the obtained time
+// Serial.print("Time obtained successfully");
+}}

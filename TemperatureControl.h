@@ -1,15 +1,8 @@
-// TemperatureControl.h
 #ifndef TEMPERATURECONTROL_H
 #define TEMPERATURECONTROL_H
 #include "Config.h"
 #include "DS18B20.h"
 #include "Max31865-PT1000.h"
-
-// -----------------------------------------------------------------------
-// Mutex handles as extern to be accessible in other files - do not change
-// -----------------------------------------------------------------------
-extern SemaphoreHandle_t temperatureMutex;
-
 
 // Existing temperature variables
 extern float panelT;           

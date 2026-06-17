@@ -21,7 +21,6 @@ void broadcastCurrentTime();
 
 extern bool g_timeValid;
 void markTimeValid();
-bool syncCurrentTimeFromRTCIfValid();
 
 
 #endif // RTCMANAGER_H

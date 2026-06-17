@@ -1,9 +1,9 @@
-// PumpManager.cpp
 #include "PumpManager.h"
 #include "Config.h"
 #include "Logging.h"
 #include "WebServerManager.h"
 #include "TemperatureControl.h"
+#include "SerialPrint.h"
 #include <Arduino.h>
 #include <FreeRTOS.h>
 #include <semphr.h>
@@ -12,9 +12,7 @@
 #include "RTCManager.h"
 #include "FileSystemManager.h"
 #include "AlarmManager.h"
-#include "DiagLog.h"
 
-SemaphoreHandle_t pumpStateMutex = nullptr;
 
 bool previousDHWCallStatus = false;
 bool previousHeatingCallStatus = false;
@@ -42,32 +40,17 @@ int previousPumpModes[10];
 unsigned long lastBroadcastTime = 0;
 const unsigned long broadcastInterval = 10000; // 10 seconds
 
-
+String serialMessage = "";  // Define the global serial message variable
 Ticker broadcastPumpTicker; // Ticker for periodic pump state broadcasting
 Ticker pumpOffTicker;       // Ticker to handle the 10-minute timeout
 
 // Pump Modes and States
-// Fixed 10-slot storage. numPumps in Config.h controls the active/displayed count.
-int pumpModes[10] = {
-    PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO,
-    PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO
-};
-
-int pumpStates[10] = {
-    PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF,
-    PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF
-};
+int pumpModes[10] = {PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO, PUMP_AUTO};
+int pumpStates[10] = {PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF, PUMP_OFF};
 
 // Configure to style of relays used. (energized = on or energized = off)
-bool pumpOnStateHigh[10] = {
-    false, false, false, false, false,
-    false, false, false, false, false
-};
-
-bool pumpOffStateHigh[10] = {
-    true, true, true, true, true,
-    true, true, true, true, true
-};
+bool pumpOnStateHigh[10] = {false, false, false, false, false, false, false, false, false, false};
+bool pumpOffStateHigh[10] = {true, true, true, true, true, true, true, true, true, true};
 
 // External Variables
 extern int state_panel_lead;
@@ -89,6 +72,8 @@ extern int state_recirc_valve;
 // ------------------- FREEZE PROTECTION -------------------
 extern SystemConfig g_config;
 
+static constexpr float FREEZE_HYST_F = 2.0f;  // °F hysteresis for collector/circ “clear”
+
 static inline uint32_t minToMs(uint16_t minutes) {
   return (uint32_t)minutes * 60000UL;
 }
@@ -97,13 +82,31 @@ static uint32_t s_colBelowSinceMs  = 0;
 static uint32_t s_colRunUntilMs    = 0;
 static bool     s_colRunActive     = false;
 
-static uint32_t s_lineBelowSinceMs = 0;
-static uint32_t s_lineRunUntilMs   = 0;
-static bool     s_lineRunActive    = false;
+static uint32_t s_circBelowSinceMs = 0;
+static uint32_t s_circRunUntilMs   = 0;
+static bool     s_circRunActive    = false;
 
 static uint32_t s_freezeLeadLastChangeMs = 0;
 static uint32_t s_freezeLagLastChangeMs  = 0;
 static uint32_t s_freezeCircLastChangeMs = 0;
+
+
+// ------ Heat tape ineffective values come from Web Config (g_config) --------
+#define HEAT_TAPE_BAD_F     (g_config.heatTapeBadF)
+#define HEAT_TAPE_CLEAR_F   (g_config.heatTapeClearF)
+#define HEAT_TAPE_EVAL_MS      (minToMs(g_config.heatTapeEvalMin))
+
+static uint32_t s_htOnSinceMs   = 0;
+static bool     s_htAlarmed     = false;
+
+
+// ---------- Tank freeze values come from Web Config (g_config) ----------
+#define TANK_FREEZE_TEMP_F      (g_config.tankFreezeTempF)
+#define TANK_FREEZE_CLEAR_F     (g_config.tankFreezeClearF)
+#define TANK_FREEZE_CONFIRM_MS (minToMs(g_config.tankFreezeConfirmMin))
+
+static uint32_t s_tankBelowSinceMs = 0;
+static bool     s_tankRunActive    = false;
 
 
 
@@ -128,7 +131,24 @@ unsigned long lastStorageHeatChangeTime   = 0;
 unsigned long lastCircPumpChangeTime      = 0;
 unsigned long lastHeatTapeChangeTime      = 0;
 
+// External Mutex Handles
+extern SemaphoreHandle_t pumpStateMutex;
+extern SemaphoreHandle_t temperatureMutex;
 
+// Function to check if any pump state or mode has changed since the last broadcast
+bool anyPumpStateChanged() {
+    bool hasChanged = false;
+
+    for (int i = 0; i < 10; i++) {
+        if (pumpStates[i] != previousPumpStates[i] || pumpModes[i] != previousPumpModes[i]) {
+            hasChanged = true;
+            // Update previous states to current states
+            previousPumpStates[i] = pumpStates[i];
+            previousPumpModes[i] = pumpModes[i];
+        }
+    }
+    return hasChanged;
+}
 
 // Function Prototypes
 void PrintPumpStates();
@@ -150,24 +170,7 @@ void controlBoilerCirculatorPump();
 void controlRecirculationValve();
 void PumpControl();
 
-
-
-// Function to check if any pump state or mode has changed since the last broadcast
-bool anyPumpStateChanged() {
-  bool hasChanged = false;
-
-  for (int i = 0; i < 10; i++) {
-    if (pumpStates[i] != previousPumpStates[i] || pumpModes[i] != previousPumpModes[i]) {
-      hasChanged = true;
-      // Update previous states to current states
-      previousPumpStates[i] = pumpStates[i];
-      previousPumpModes[i] = pumpModes[i];
-    }
-  }
-  return hasChanged;
-}
-
-// ------------------- FREEZE PROTECTION HELPERS -------------------
+// ------------------- FREEZE PROTECTION HELPERS (NEW) -------------------
 static bool tempValidF(float v) {
   return !isnan(v) && v > -50.0f && v < 250.0f;
 }
@@ -186,55 +189,15 @@ static void forcePumpOnIfAuto(int pumpIndex,
   }
 }
 
-static float getMinTemp(const uint8_t* sensors, bool* anyValid) {
-  float minT = 999.0f;
-  *anyValid = false;
-  for (const uint8_t* s = sensors; *s; ++s) {
-    float t = getTempByIndex(*s);
-    if (tempValidF(t)) {
-      *anyValid = true;
-      minT = min(minT, t);
-    }
-  }
-  return minT;
-}
-
-static bool isAllWarm(const uint8_t* sensors, float clearTempF) {
-  bool allWarm = true;
-  for (const uint8_t* s = sensors; *s; ++s) {
-    float t = getTempByIndex(*s);
-    if (tempValidF(t)) {
-      allWarm &= (t >= clearTempF);
-    }
-  }
-  return allWarm;
-}
-
-static bool isAnyCold(const uint8_t* sensors, float freezeTempF) {
-  bool anyCold = false;
-  for (const uint8_t* s = sensors; *s; ++s) {
-    float t = getTempByIndex(*s);
-    if (tempValidF(t)) {
-      anyCold |= (t <= freezeTempF);
-    }
-  }
-  return anyCold;
-}
-
 // Returns true ONLY when we are actively overriding Lead+Lag (AUTO) for freeze protection.
-static bool updateCollectorFreezeProtect(uint32_t nowMs)
+static bool updateCollectorFreezeProtect(float cSupplyF, uint32_t nowMs)
 {
   const float freezeTempF = g_config.collectorFreezeTempF;
   const float clearTempF  = freezeTempF + FREEZE_HYST_F;
   const uint32_t confirmMs = minToMs(g_config.collectorFreezeConfirmMin);
   const uint32_t runMs     = minToMs(g_config.collectorFreezeRunMin);
 
-  bool anyValid = false;
-  float minT = getMinTemp(g_config.collectorFreezeSensors, &anyValid);
-  bool isCold = isAnyCold(g_config.collectorFreezeSensors, freezeTempF);
-  bool isWarmEnough = isAllWarm(g_config.collectorFreezeSensors, clearTempF);
-
-  if (!anyValid) {
+  if (!tempValidF(cSupplyF)) {
     s_colBelowSinceMs = 0;
     s_colRunActive    = false;
     s_colRunUntilMs   = 0;
@@ -242,7 +205,7 @@ static bool updateCollectorFreezeProtect(uint32_t nowMs)
     return false;
   }
 
-  if (isWarmEnough) {
+  if (cSupplyF >= clearTempF) {
     s_colBelowSinceMs = 0;
     s_colRunActive    = false;
     s_colRunUntilMs   = 0;
@@ -250,7 +213,7 @@ static bool updateCollectorFreezeProtect(uint32_t nowMs)
     return false;
   }
 
-  if (isCold) {
+  if (cSupplyF <= freezeTempF) {
     if (s_colBelowSinceMs == 0) s_colBelowSinceMs = nowMs;
 
     if (!s_colRunActive && (nowMs - s_colBelowSinceMs >= confirmMs)) {
@@ -258,15 +221,15 @@ static bool updateCollectorFreezeProtect(uint32_t nowMs)
       s_colRunUntilMs = nowMs + runMs;
 
       AlarmManager_event(ALM_COLLECTOR_FREEZE_PROTECT, ALM_WARN,
-        "Collector freeze cycle start (min=%.1fF)", (double)minT);
+        "Collector freeze cycle start (CSupply=%.1fF)", (double)cSupplyF);
     }
   }
 
   if (s_colRunActive && nowMs >= s_colRunUntilMs) {
-    if (isCold) {
+    if (cSupplyF <= freezeTempF) {
       s_colRunUntilMs = nowMs + runMs;
       AlarmManager_event(ALM_COLLECTOR_FREEZE_PROTECT, ALM_WARN,
-        "Collector freeze cycle restart (min=%.1fF)", (double)minT);
+        "Collector freeze cycle restart (CSupply=%.1fF)", (double)cSupplyF);
     } else {
       s_colRunActive = false;
     }
@@ -292,69 +255,185 @@ static bool updateCollectorFreezeProtect(uint32_t nowMs)
   return false;
 }
 
+
 // Returns true ONLY when we are actively overriding Circ Pump (AUTO) for freeze protection.
-static bool updateLineFreezeProtect(uint32_t nowMs)
+static bool updateCircFreezeProtect(float supplyF, float circReturnF, uint32_t nowMs)
 {
-  const float freezeTempF  = g_config.lineFreezeTempF;
+  const float freezeTempF  = g_config.circFreezeTempF;
   const float clearTempF   = freezeTempF + FREEZE_HYST_F;
-  const uint32_t confirmMs = minToMs(g_config.lineFreezeConfirmMin);
-  const uint32_t runMs     = minToMs(g_config.lineFreezeRunMin);
+  const uint32_t confirmMs = minToMs(g_config.circFreezeConfirmMin);
+  const uint32_t runMs     = minToMs(g_config.circFreezeRunMin);
 
-  bool anyValid = false;
-  float minT = getMinTemp(g_config.lineFreezeSensors, &anyValid);
-  bool isCold = isAnyCold(g_config.lineFreezeSensors, freezeTempF);
-  bool isWarmEnough = isAllWarm(g_config.lineFreezeSensors, clearTempF);
+  const bool supplyValid = tempValidF(supplyF);
+  const bool retValid    = tempValidF(circReturnF);
 
-  if (!anyValid) {
-    s_lineBelowSinceMs = 0;
-    s_lineRunActive    = false;
-    s_lineRunUntilMs   = 0;
-    AlarmManager_clear(ALM_LINE_FREEZE_PROTECT);
+  // If both invalid, don't keep stale state
+  if (!supplyValid && !retValid) {
+    s_circBelowSinceMs = 0;
+    s_circRunActive    = false;
+    s_circRunUntilMs   = 0;
+    AlarmManager_clear(ALM_CIRC_FREEZE_PROTECT);
     return false;
   }
 
+  // Determine “cold” using whichever sensors are valid
+  bool isCold = false;
+  float minT = 999.0f;
+
+  if (supplyValid) { isCold |= (supplyF <= freezeTempF);     minT = min(minT, supplyF); }
+  if (retValid)    { isCold |= (circReturnF <= freezeTempF); minT = min(minT, circReturnF); }
+
+  // Clear when ALL valid temps are safely warm
+  bool isWarmEnough = true;
+  if (supplyValid) isWarmEnough &= (supplyF >= clearTempF);
+  if (retValid)    isWarmEnough &= (circReturnF >= clearTempF);
+
   if (isWarmEnough) {
-    s_lineBelowSinceMs = 0;
-    s_lineRunActive    = false;
-    s_lineRunUntilMs   = 0;
-    AlarmManager_clear(ALM_LINE_FREEZE_PROTECT);
+    s_circBelowSinceMs = 0;
+    s_circRunActive    = false;
+    s_circRunUntilMs   = 0;
+    AlarmManager_clear(ALM_CIRC_FREEZE_PROTECT);
     return false;
   }
 
   if (isCold) {
-    if (s_lineBelowSinceMs == 0) s_lineBelowSinceMs = nowMs;
+    if (s_circBelowSinceMs == 0) s_circBelowSinceMs = nowMs;
 
-    if (!s_lineRunActive && (nowMs - s_lineBelowSinceMs >= confirmMs)) {
-      s_lineRunActive  = true;
-      s_lineRunUntilMs = nowMs + runMs;
+    if (!s_circRunActive && (nowMs - s_circBelowSinceMs >= confirmMs)) {
+      s_circRunActive  = true;
+      s_circRunUntilMs = nowMs + runMs;
 
-      AlarmManager_event(ALM_LINE_FREEZE_PROTECT, ALM_WARN,
-                         "Line freeze cycle start (min=%.1fF)", (double)minT);
+      AlarmManager_event(ALM_CIRC_FREEZE_PROTECT, ALM_WARN,
+                         "Circ freeze cycle start (min=%.1fF)", (double)minT);
     }
   }
 
-  if (s_lineRunActive && nowMs >= s_lineRunUntilMs) {
+  if (s_circRunActive && nowMs >= s_circRunUntilMs) {
     if (isCold) {
-      s_lineRunUntilMs = nowMs + runMs;
-      AlarmManager_event(ALM_LINE_FREEZE_PROTECT, ALM_WARN,
-                         "Line freeze cycle restart (min=%.1fF)", (double)minT);
+      s_circRunUntilMs = nowMs + runMs;
+      AlarmManager_event(ALM_CIRC_FREEZE_PROTECT, ALM_WARN,
+                         "Circ freeze cycle restart (min=%.1fF)", (double)minT);
     } else {
-      s_lineRunActive = false;
+      s_circRunActive = false;
     }
   }
 
   const bool circAuto = (pumpModes[3] == PUMP_AUTO);
 
-  if (s_lineRunActive && circAuto) {
-    AlarmManager_set(ALM_LINE_FREEZE_PROTECT, ALM_ALARM,
-                     "Line freeze protection active");
+  if (s_circRunActive && circAuto) {
+    AlarmManager_set(ALM_CIRC_FREEZE_PROTECT, ALM_ALARM,
+                     "Circ freeze protection active");
     forcePumpOnIfAuto(3, nowMs, CIRC_RELAY_CHANGE_INTERVAL, s_freezeCircLastChangeMs);
     return true;
   }
 
-  if (s_lineRunActive && !circAuto) {
-    AlarmManager_set(ALM_LINE_FREEZE_PROTECT, ALM_ALARM,
-                     "Line freeze protect blocked (Circ not AUTO)");
+  if (s_circRunActive && !circAuto) {
+    AlarmManager_set(ALM_CIRC_FREEZE_PROTECT, ALM_ALARM,
+                     "Circ freeze protect blocked (Circ not AUTO)");
+  }
+
+  return false;
+}
+
+
+// ------------------- HEAT TAPE INEFFECTIVE -------------------
+static void updateHeatTapeIneffective(float cSupplyF, uint32_t nowMs)
+{
+  const bool htOn = (pumpStates[2] == PUMP_ON);
+
+  const float badF   = g_config.heatTapeBadF;
+  const float clearF = g_config.heatTapeClearF;
+  const uint32_t evalMs = minToMs(g_config.heatTapeEvalMin);
+
+  if (!htOn || !tempValidF(cSupplyF)) {
+    s_htOnSinceMs = 0;
+    s_htAlarmed   = false;
+    AlarmManager_clear(ALM_HEAT_TAPE_INEFFECTIVE);
+    return;
+  }
+
+  if (s_htOnSinceMs == 0) {
+    s_htOnSinceMs = nowMs;
+    s_htAlarmed   = false;
+  }
+
+  if (!s_htAlarmed && (nowMs - s_htOnSinceMs >= evalMs)) {
+    if (cSupplyF <= badF) {
+      AlarmManager_set(ALM_HEAT_TAPE_INEFFECTIVE, ALM_ALARM,
+                       "Heat tape ineffective (CSupply still freezing)");
+      AlarmManager_event(ALM_HEAT_TAPE_INEFFECTIVE, ALM_ALARM,
+                         "Heat tape ON %lus, CSupply=%.1fF",
+                         (unsigned long)((nowMs - s_htOnSinceMs) / 1000UL),
+                         (double)cSupplyF);
+      s_htAlarmed = true;
+    }
+  }
+
+  if (s_htAlarmed && cSupplyF >= clearF) {
+    AlarmManager_clear(ALM_HEAT_TAPE_INEFFECTIVE, "Heat tape recovered");
+    s_htAlarmed   = false;
+    s_htOnSinceMs = nowMs;
+  }
+}
+
+
+// ------------------- TANK FREEZE PROTECTION  -------------------
+static bool updateTankFreezeProtect(float storageF, uint32_t nowMs)
+{
+  const float triggerF  = g_config.tankFreezeTempF;
+  const float clearF    = g_config.tankFreezeClearF;
+  const uint32_t confirmMs = minToMs(g_config.tankFreezeConfirmMin);
+
+  if (!tempValidF(storageF)) {
+    s_tankBelowSinceMs = 0;
+    s_tankRunActive    = false;
+    AlarmManager_clear(ALM_TANK_FREEZE_PROTECT);
+    return false;
+  }
+
+  if (s_tankRunActive) {
+    if (storageF >= clearF) {
+      s_tankRunActive = false;
+      s_tankBelowSinceMs = 0;
+      AlarmManager_clear(ALM_TANK_FREEZE_PROTECT, "Tank warmed above clear temp");
+      AlarmManager_event(ALM_TANK_FREEZE_PROTECT, ALM_WARN,
+                         "Tank freeze protect ended (storageT=%.1fF)", (double)storageF);
+      return false;
+    }
+
+    if (pumpModes[3] == PUMP_AUTO) {
+      AlarmManager_set(ALM_TANK_FREEZE_PROTECT, ALM_ALARM,
+                       "Tank freeze protection active");
+      forcePumpOnIfAuto(3, nowMs, CIRC_RELAY_CHANGE_INTERVAL, s_freezeCircLastChangeMs);
+      return true;
+    } else {
+      AlarmManager_set(ALM_TANK_FREEZE_PROTECT, ALM_ALARM,
+                       "Tank freeze protect blocked (Circ not AUTO)");
+      return false;
+    }
+  }
+
+  if (storageF <= triggerF) {
+    if (s_tankBelowSinceMs == 0) s_tankBelowSinceMs = nowMs;
+
+    if (nowMs - s_tankBelowSinceMs >= confirmMs) {
+      s_tankRunActive = true;
+      AlarmManager_event(ALM_TANK_FREEZE_PROTECT, ALM_WARN,
+                         "Tank freeze protect started (storageT=%.1fF)", (double)storageF);
+
+      if (pumpModes[3] == PUMP_AUTO) {
+        AlarmManager_set(ALM_TANK_FREEZE_PROTECT, ALM_ALARM,
+                         "Tank freeze protection active");
+        forcePumpOnIfAuto(3, nowMs, CIRC_RELAY_CHANGE_INTERVAL, s_freezeCircLastChangeMs);
+        return true;
+      } else {
+        AlarmManager_set(ALM_TANK_FREEZE_PROTECT, ALM_ALARM,
+                         "Tank freeze protect blocked (Circ not AUTO)");
+        return false;
+      }
+    }
+  } else {
+    s_tankBelowSinceMs = 0;
   }
 
   return false;
@@ -365,6 +444,7 @@ static bool updateLineFreezeProtect(uint32_t nowMs)
 void sendHeatingCallStatus(bool dhwCallActive, bool heatingCallActive) {
     // Determine the status strings
     String dhwStatus = dhwCallActive ? "ACTIVE" : "INACTIVE";
+
     String heatingStatus = heatingCallActive ? "ACTIVE" : "INACTIVE";
 
     // Construct the message
@@ -372,8 +452,8 @@ void sendHeatingCallStatus(bool dhwCallActive, bool heatingCallActive) {
     heatingCallData += "DHW:" + dhwStatus + ",";
     heatingCallData += "Heating:" + heatingStatus;
 
-    // Queue for the gatekeeper task
-    queueWsBroadcast(heatingCallData, "HeatingCalls");
+    // Send the message to all connected WebSocket clients
+    ws.textAll(heatingCallData);
 }
 
 
@@ -382,19 +462,16 @@ void sendHeatingCallStatus(bool dhwCallActive, bool heatingCallActive) {
 void setPumpMode(int pumpIndex, int mode) {
     // Validate pumpIndex
     if (pumpIndex < 0 || pumpIndex >= 10) {
-        LOG_ERR("[Pump] Invalid pump index in setPumpMode.\n");
+        Serial.println("Invalid pump index in setPumpMode.");
         return;
     }
 
     // Acquire the pumpStateMutex before modifying pumpModes
     if (xSemaphoreTake(pumpStateMutex, portMAX_DELAY)) {
         pumpModes[pumpIndex] = mode;
-
-        LOG_CAT(DBG_PUMP,
-                "[Pump] Pump %d mode set to %s\n",
-                pumpIndex + 1,
-                (mode == PUMP_AUTO ? "AUTO" : (mode == PUMP_ON ? "ON" : "OFF")));
-
+        Serial.println("Pump " + String(pumpIndex + 1) + " mode set to " + 
+                       (mode == PUMP_AUTO ? "AUTO" : (mode == PUMP_ON ? "ON" : "OFF")));
+        
         // Apply the mode immediately if not in AUTO
         if (mode == PUMP_ON) {
             setPumpState(pumpIndex, PUMP_ON);
@@ -402,82 +479,85 @@ void setPumpMode(int pumpIndex, int mode) {
             setPumpState(pumpIndex, PUMP_OFF);
         }
         // If mode is AUTO, the PumpControl function will handle it
-
+        
         xSemaphoreGive(pumpStateMutex);
     } else {
-        LOG_ERR("[Pump] Failed to take pumpStateMutex in setPumpMode.\n");
+        Serial.println("Failed to take pumpStateMutex in setPumpMode.");
     }
 }
-
-
-
-
 
 // ***** PrintPumpStates Function *****
 void PrintPumpStates() {
+    serialMessage = ""; // Reset the serial message
     for (int i = 0; i < 10; i++) {
-        const char* pumpState = (pumpStates[i] == PUMP_ON) ? "on" : "off";
-        const char* pumpMode  = (pumpModes[i] == PUMP_AUTO) ? "auto" :
-                                (pumpModes[i] == PUMP_ON)   ? "on"   : "off";
-
-        LOG_CAT(DBG_PUMP,
-                "[Pump] Pump %d. State: %s, Mode: %s\n",
-                i + 1,
-                pumpState,
-                pumpMode);
+        String pumpState = (pumpStates[i] == PUMP_ON) ? "on" : "off";
+        String pumpMode = (pumpModes[i] == PUMP_AUTO) ? "auto" :
+                          (pumpModes[i] == PUMP_ON) ? "on" : "off";
+        // Construct the serial message for each pump
+        serialMessage += "Pump " + String(i + 1) + ". State: " + pumpState +
+                         ", Mode: " + pumpMode + "\n";
     }
-}
-
-
-static volatile bool g_turnPumpsToAutoFlag = false;
-
-void flagPumpsBackToAuto() {
-    g_turnPumpsToAutoFlag = true;
+    // Call SerialPrint to print the serialMessage
+    SerialPrint(); // Assuming SerialPrint() prints the global serialMessage
 }
 
 // ***** Function to Turn All Pumps Back to "Auto" Mode After 10 Minutes *****
 void turnPumpsBackToAuto() {
-    for (int i = 0; i < numPumps; i++) {
-        setPumpMode(i, PUMP_AUTO); // Set each active pump back to "Auto" mode
+    for (int i = 0; i < 10; i++) {
+        setPumpMode(i, PUMP_AUTO); // Set each pump back to "Auto" mode
     }
-    LOG_CAT(DBG_PUMP, "[Pump] All active pumps returned to Auto mode.\n");
+    Serial.println("All pumps returned to Auto mode.");
 }
 
 // ***** Function to Turn All Pumps On for 10 Minutes *****
 void turnOnAllPumpsFor10Minutes() {
-    for (int i = 0; i < numPumps; i++) {
-        setPumpMode(i, PUMP_ON); // Turn each active pump on
+    for (int i = 0; i < 10; i++) {
+        setPumpMode(i, PUMP_ON); // Turn each pump on
     }
-    LOG_CAT(DBG_PUMP, "[Pump] All active pumps turned on for 10 minutes.\n");
-    // Safely set a flag instead of calling mutex-heavy functions directly from the timer interrupt
-    pumpOffTicker.once(600, flagPumpsBackToAuto);
+    Serial.println("All pumps turned on for 10 minutes.");
+    // Set a timer to turn the pumps back to "Auto" mode after 10 minutes (600 seconds)
+    pumpOffTicker.once(600, turnPumpsBackToAuto);
 }
 
 
 
 // ***** Broadcast Pump State Function *****  
 void broadcastPumpState(int pumpIndex) {
+    String message = "";
     if (pumpIndex == -1) {
-        // Serial diagnostics only
+        // Broadcast all pump states for WebSocket
+        for (int i = 0; i < 10; i++) {
+            String pumpState = (pumpStates[i] == PUMP_ON) ? "on" : "off";
+            String pumpMode = (pumpModes[i] == PUMP_AUTO) ? "auto" :
+                              (pumpModes[i] == PUMP_ON) ? "on" : "off";
+            // Prepare WebSocket message
+            String pumpMessage = "pump" + String(i + 1) + "State:" + pumpState +
+                                 ",pump" + String(i + 1) + "Mode:" + pumpMode;
+            message += pumpMessage;
+            if (i < 9) message += ","; // Add comma except for the last pump
+        }
+        // Use the new PrintPumpStates function to handle serial printing
         PrintPumpStates();
-    } else { // Log specific pump state only
+    } else { // Broadcast specific pump state for WebSocket
         if (pumpIndex < 0 || pumpIndex >= 10) {
-            LOG_ERR("[Pump] Invalid pump index in broadcastPumpState.\n");
+            // Prepare and set the serial message
+            serialMessage = "Invalid pump index in broadcastPumpState.\n";
+            SerialPrint(); // Print the serialMessage
             return;
         }
         String pumpState = (pumpStates[pumpIndex] == PUMP_ON) ? "on" : "off";
         String pumpMode = (pumpModes[pumpIndex] == PUMP_AUTO) ? "auto" :
                           (pumpModes[pumpIndex] == PUMP_ON) ? "on" : "off";
-
-        LOG_CAT(DBG_PUMP,
-                "[Pump] Pump %d. State: %s, Mode: %s\n",
-                pumpIndex + 1,
-                pumpState.c_str(),
-                pumpMode.c_str());
+        String pumpMessage = "pump" + String(pumpIndex + 1) + "State:" + pumpState +
+                             ",pump" + String(pumpIndex + 1) + "Mode:" + pumpMode;
+        message = pumpMessage; // For a specific pump, the WebSocket message is just about that pump
+        // Prepare and set the serial message for the specific pump
+        serialMessage = "Pump " + String(pumpIndex + 1) + ". State: " + pumpState +
+                         ", Mode: " + pumpMode + "\n";
+        //SerialPrint(); // Print the serialMessage
     }
-
-    // Let the gatekeeper send the consolidated PumpStatus JSON
-    g_sendPumpStatus = true;
+    // Send the compiled message to all WebSocket clients
+    broadcastMessageOverWebSocket(message, "PumpStates");
 }
 
 
@@ -504,7 +584,8 @@ void setupPumpBroadcasting() {
         if (anyPumpStateChanged()) {
             broadcastPumpState(-1); // Broadcast all pump states
         }
-        // sendHeatingCallStatus(); // now handled in PumpControl()
+        // Send heating call statuses
+       // sendHeatingCallStatus(); // now handled in PumpControl()
     }
 }
 
@@ -513,53 +594,37 @@ void setupPumpBroadcasting() {
 // ***** Set Pump State Function *****
 void setPumpState(int pumpIndex, int state) {
     int arrayIndex = pumpIndex; // Now zero-based index
-
     // Validate arrayIndex
     if (arrayIndex < 0 || arrayIndex >= 10) {
-        LOG_ERR("[Pump] Invalid pump index in setPumpState.\n");
+        Serial.println("Invalid pump index in setPumpState.");
         return;
     }
-
-    // Only START/STOP log real state edges.  A lot of code paths call
-    // setPumpState(PUMP_OFF) or setPumpState(PUMP_ON) as an "ensure" action
-    // when applying modes, refreshing UI state, or enforcing AUTO logic.
-    // Logging those non-edges creates duplicate STOP rows and can confuse
-    // runtime review.  We still refresh the physical relay output and
-    // broadcast status so the webpage stays current, but the pump runtime
-    // history only records actual OFF->ON and ON->OFF transitions.
-    const bool stateChanged = (pumpStates[arrayIndex] != state);
 
     // Determine the digital signal to write based on the relay style
     bool isActiveHigh = pumpOnStateHigh[arrayIndex];
     int signal = (state == PUMP_ON) ? (isActiveHigh ? HIGH : LOW) :
                                        (isActiveHigh ? LOW : HIGH);
-
-    // Refresh the physical output even when state did not change.  This is
-    // harmless and keeps apply-mode / recovery style calls deterministic.
+    // Update the physical state of the pump
     digitalWrite(pumpPins[arrayIndex], signal);
+    pumpStates[arrayIndex] = state;
 
-    if (stateChanged) {
-        pumpStates[arrayIndex] = state;
+    // Log the event
+    String event = "Pump " + String(pumpIndex + 1) + " " +
+                   (state == PUMP_ON ? "ON" : "OFF");
+    Serial.println(event);
 
-        LOG_CAT(DBG_PUMP, "[Pump] Pump %d %s\n",
-                pumpIndex + 1, (state == PUMP_ON ? "ON" : "OFF"));
+    logPumpEvent( pumpIndex, state == PUMP_ON, getCurrentTimeAtomic() );
+    //logPumpEvent(pumpIndex, state == PUMP_ON ? "START" : "STOP");
 
-        logPumpEvent(pumpIndex, state == PUMP_ON, getCurrentTimeAtomic());
-    } else {
-        LOG_CAT(DBG_PUMP, "[Pump] Pump %d already %s - no runtime log event\n",
-                pumpIndex + 1, (state == PUMP_ON ? "ON" : "OFF"));
-    }
-
-    // Broadcast the current state/mode even if this was an ensure-only call.
+    // Broadcast the new state
     broadcastPumpState(pumpIndex);
 }
-
 
 // ***** Toggle Pump State Function *****
 void togglePumpState(int pumpIndex) {
     // Validate pumpIndex
     if (pumpIndex < 0 || pumpIndex >= 10) {
-        LOG_ERR("[Pump] Invalid pump index in togglePumpState.\n");
+        Serial.println("Invalid pump index in togglePumpState.");
         return;
     }
 
@@ -570,7 +635,7 @@ void togglePumpState(int pumpIndex) {
         newState = (pumpStates[pumpIndex] == PUMP_ON) ? PUMP_OFF : PUMP_ON;
         xSemaphoreGive(pumpStateMutex);
     } else {
-        LOG_ERR("[Pump] Failed to take pumpStateMutex in togglePumpState.\n");
+        Serial.println("Failed to take pumpStateMutex in togglePumpState.");
         return;
     }
 
@@ -578,12 +643,11 @@ void togglePumpState(int pumpIndex) {
     setPumpState(pumpIndex, newState);
 }
 
-
 // ***** Apply Pump Mode Function *****
 void applyPumpMode(int pumpIndex) {
     // Validate pumpIndex
     if (pumpIndex < 0 || pumpIndex >= 10) {
-        LOG_ERR("[Pump] Invalid pump index in applyPumpMode.\n");
+        Serial.println("Invalid pump index in applyPumpMode.");
         return;
     }
 
@@ -591,26 +655,25 @@ void applyPumpMode(int pumpIndex) {
     if (xSemaphoreTake(pumpStateMutex, portMAX_DELAY)) {
         if (pumpModes[pumpIndex] == PUMP_AUTO) {
             // In AUTO mode, the PumpControl() function will handle the pump state based on conditions
-            LOG_CAT(DBG_PUMP, "[Pump] Pump %d is set to AUTO mode.\n", pumpIndex + 1);
+            Serial.println("Pump " + String(pumpIndex + 1) + " is set to AUTO mode.");
         } else if (pumpModes[pumpIndex] == PUMP_ON) {
             setPumpState(pumpIndex, PUMP_ON);
-            LOG_CAT(DBG_PUMP, "[Pump] Pump %d is set to ON.\n", pumpIndex + 1);
+            Serial.println("Pump " + String(pumpIndex + 1) + " is set to ON.");
         } else if (pumpModes[pumpIndex] == PUMP_OFF) {
             setPumpState(pumpIndex, PUMP_OFF);
-            LOG_CAT(DBG_PUMP, "[Pump] Pump %d is set to OFF.\n", pumpIndex + 1);
+            Serial.println("Pump " + String(pumpIndex + 1) + " is set to OFF.");
         } else {
-            LOG_ERR("[Pump] Invalid pump mode in applyPumpMode.\n");
+            Serial.println("Invalid pump mode in applyPumpMode.");
         }
         // Release the mutex after accessing pumpModes
         xSemaphoreGive(pumpStateMutex);
     } else {
-        LOG_ERR("[Pump] Failed to take pumpStateMutex in applyPumpMode.\n");
+        Serial.println("Failed to take pumpStateMutex in applyPumpMode.");
     }
 
     // Broadcasting the new mode state for the specific pump
     broadcastPumpState(pumpIndex);
 }
-
 
 // ***** Initialize Pumps Function *****
 void initializePumps() {
@@ -618,8 +681,6 @@ void initializePumps() {
   pinMode (DHW_HEATING_PIN, INPUT_PULLUP);     // Assuming active LOW
   pinMode (FURNACE_HEATING_PIN, INPUT_PULLUP); // Assuming active LOW
   
-
-   
     for (int i = 0; i < 10; i++) {
         pinMode(pumpPins[i], OUTPUT);
         digitalWrite(pumpPins[i], pumpOffStateHigh[i] ? HIGH : LOW);
@@ -627,12 +688,23 @@ void initializePumps() {
     }
 }
 
+/*
+void ALARM() {
+  if dhwT < Storage_Tank_Temp_Limit {
+    ALARM == ALARM_OFF
+  }
+  }
+  else {
+    ALARM == ALARM_ON
+  }
+  */
 // ***** Individual Pump Control Functions *****
+
 // Note: These functions assume that both temperatureMutex and pumpStateMutex are already held by PumpControl()
 
 void controlPanelLeadPump() {
     int pumpIndex = 0;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
 
@@ -641,33 +713,35 @@ void controlPanelLeadPump() {
             (currentMillis - lastChangeTime >= LEAD_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Panel Lead Pump ON (Manual)\n");
+            Serial.println("Panel Lead Pump turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) {  // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= LEAD_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Panel Lead Pump OFF (Manual)\n");
+            Serial.println("Panel Lead Pump turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else {  // Auto Mode
         if (panelT >= g_config.panelTminimumValue &&
-                (panelT > (storageT + g_config.panelOnDifferential))) {  // Turn ON Pump
+                (panelT > (supplyT + g_config.panelOnDifferential))) {  // Turn ON Pump
                 if (pumpStates[pumpIndex] == PUMP_OFF &&
                     (currentMillis - lastChangeTime >= LEAD_RELAY_CHANGE_INTERVAL)) {
                     setPumpState(pumpIndex, PUMP_ON);
                     lastChangeTime = currentMillis;
-                    LOG_CAT(DBG_PUMP,
-                            "[Pump] Panel Lead ON (AUTO) panelT>=min && panelT>(storageT+onDiff)\n");
+                    Serial.println("Panel Lead Pump turned ON (AUTO) panelT >= g_config.panelTminimumValue && panelT > (supplyT + g_config.panelOnDifferential)");
+                    //broadcastPumpState(pumpNumber);
                 }
-            } else if ((panelT < (storageT - g_config.panelOffDifferential) && (CSupplyT >= CreturnT)) ||
+            } else if (panelT < (supplyT + g_config.panelOffDifferential) ||
                        storageT >= g_config.storageHeatingLimit) {  // Turn OFF Pump
                 if (pumpStates[pumpIndex] == PUMP_ON &&
                     (currentMillis - lastChangeTime >= LEAD_RELAY_CHANGE_INTERVAL)) {
                     setPumpState(pumpIndex, PUMP_OFF);
                     lastChangeTime = currentMillis;
-                    LOG_CAT(DBG_PUMP,
-                            "[Pump] Panel Lead OFF (AUTO) panelT < (storageT - g_config.panelOffDifferential) && (CSupplyT >= CreturnT)) || storageT>=limit\n");
+                    Serial.println("Panel Lead Pump turned OFF (AUTO) (panelT < (supplyT + g_config.panelOffDifferential) || storageT >= g_config.storageHeatingLimit)");
+                    //broadcastPumpState(pumpNumber);
                 }
             }
      }
@@ -675,7 +749,7 @@ void controlPanelLeadPump() {
 
 void controlPanelLagPump() {
     int pumpIndex = 1;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
 
@@ -684,14 +758,16 @@ void controlPanelLagPump() {
             (currentMillis - lastChangeTime >= LAG_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Panel Lag Pump ON (Manual)\n");
+            Serial.println("Panel Lag Pump turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) {  // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= LAG_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Panel Lag Pump OFF (Manual)\n");
+            Serial.println("Panel Lag Pump turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else {  // Auto Mode
         if (CollectorTemperatureRise < g_config.panelOnDifferential) {  // Turn OFF Pump
@@ -699,14 +775,16 @@ void controlPanelLagPump() {
                 (currentMillis - lastChangeTime >= LAG_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_OFF);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Panel Lag OFF (AUTO) - Low Differential\n");
+                Serial.println("Panel Lag Pump turned OFF (AUTO) - Low Differential");
+                //broadcastPumpState(pumpNumber);
             }
         } else if (pumpStates[0] == PUMP_ON) {  // Lead pump is running; turn ON Lag pump
             if (pumpStates[pumpIndex] == PUMP_OFF &&
                 (currentMillis - lastChangeTime >= LAG_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_ON);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Panel Lag ON (AUTO) - Sufficient Differential\n");
+                Serial.println("Panel Lag Pump turned ON (AUTO) - Sufficient Differential");
+                //broadcastPumpState(pumpNumber);
             }
         }
     }
@@ -714,7 +792,7 @@ void controlPanelLagPump() {
 
 void controlHeatTape() {
     int pumpIndex = 2;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
 
@@ -723,14 +801,16 @@ void controlHeatTape() {
             (currentMillis - lastChangeTime >= HEAT_TAPE_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Heat Tape ON (Manual)\n");
+            Serial.println("Heat Tape turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) {  // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= HEAT_TAPE_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Heat Tape OFF (Manual)\n");
+            Serial.println("Heat Tape turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else {  // Auto Mode
         if (CSupplyT <= g_config.heatTapeOn) {
@@ -739,7 +819,8 @@ void controlHeatTape() {
                 (currentMillis - lastChangeTime >= HEAT_TAPE_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_ON);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Heat Tape ON (AUTO) - CSupplyT <= On\n");
+                Serial.println("Heat Tape turned ON (AUTO) - Supply Temp <= On Threshold");
+                //broadcastPumpState(pumpNumber);
             }
         } else if (CSupplyT >= g_config.heatTapeOff &&
                    pumpStates[pumpIndex] == PUMP_ON &&
@@ -747,14 +828,15 @@ void controlHeatTape() {
             // Turn OFF Heat Tape
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Heat Tape OFF (AUTO) - CSupplyT >= Off\n");
+            Serial.println("Heat Tape turned OFF (AUTO) - Supply Temp >= Off Threshold");
+            //broadcastPumpState(pumpNumber);
         }
     }
 }
 
 void controlCirculationPump() {
     int pumpIndex = 3;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
 
@@ -763,14 +845,16 @@ void controlCirculationPump() {
             (currentMillis - lastChangeTime >= CIRC_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Circulation Pump ON (Manual)\n");
+            Serial.println("Circulation Pump turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) {  // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= CIRC_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Circulation Pump OFF (Manual)\n");
+            Serial.println("Circulation Pump turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else {  // Auto Mode
         if (pumpStates[4] == PUMP_ON || pumpStates[5] == PUMP_ON) { // DHW or Storage Heating is ON
@@ -778,7 +862,8 @@ void controlCirculationPump() {
                 (currentMillis - lastChangeTime >= CIRC_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_OFF);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Circ OFF due to Heating/DHW Call (AUTO)\n");
+                Serial.println("Circulation Pump turned OFF due to Heating/DHW Call (AUTO)");
+                //broadcastPumpState(pumpNumber);
             }
         } else {  // Normal Circ Pump Auto Control based on temperature differential
             if (CirculationTemperatureDrop >= g_config.circPumpOn) {
@@ -786,14 +871,16 @@ void controlCirculationPump() {
                     (currentMillis - lastChangeTime >= CIRC_RELAY_CHANGE_INTERVAL)) {
                     setPumpState(pumpIndex, PUMP_ON);
                     lastChangeTime = currentMillis;
-                    LOG_CAT(DBG_PUMP, "[Pump] Circ ON (AUTO) - TempDrop >= On\n");
+                    Serial.println("Circulation Pump turned ON (AUTO) - Temp Drop >= On Threshold");
+                    //broadcastPumpState(pumpNumber);
                 }
             } else if (CirculationTemperatureDrop <= g_config.circPumpOff) {
                 if (pumpStates[pumpIndex] == PUMP_ON &&
                     (currentMillis - lastChangeTime >= CIRC_RELAY_CHANGE_INTERVAL)) {
                     setPumpState(pumpIndex, PUMP_OFF);
                     lastChangeTime = currentMillis;
-                    LOG_CAT(DBG_PUMP, "[Pump] Circ OFF (AUTO) - TempDrop <= Off\n");
+                    Serial.println("Circulation Pump turned OFF (AUTO) - Temp Drop <= Off Threshold");
+                    //broadcastPumpState(pumpNumber);
                 }
             }
         }
@@ -802,46 +889,51 @@ void controlCirculationPump() {
 
 void controlDHWPump() {
     int pumpIndex = 4;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
     int DHW_Heating_Call = digitalRead(DHW_HEATING_PIN); // LOW when active
+    
 
     if (pumpModes[pumpIndex] == PUMP_ON) {  // Manual ON
         if (pumpStates[pumpIndex] == PUMP_OFF &&
             (currentMillis - lastChangeTime >= DHW_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] DHW Pump ON (Manual)\n");
+            Serial.println("DHW Pump turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) {  // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= DHW_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] DHW Pump OFF (Manual)\n");
+            Serial.println("DHW Pump turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else {  // Auto Mode
         if (DHW_Heating_Call == LOW) {  // Turn ON Pump
             if (pumpStates[pumpIndex] == PUMP_OFF &&
-                ((currentMillis - lastChangeTime >= DHW_RELAY_CHANGE_INTERVAL) || lastChangeTime == 0)) {
+                ((currentMillis - lastChangeTime >= DHW_RELAY_CHANGE_INTERVAL) || lastChangeTime == 0)) { 
                 setPumpState(pumpIndex, PUMP_ON);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] DHW Pump ON (AUTO) - Call Active (pin LOW)\n");
+                Serial.println("DHW Pump turned ON (AUTO) - Heating Call Active (pin LOW)");
+                //broadcastPumpState(pumpNumber);
             }
         } else if (DHW_Heating_Call == HIGH &&
                    pumpStates[pumpIndex] == PUMP_ON &&
                    (currentMillis - lastChangeTime >= DHW_RELAY_CHANGE_INTERVAL)) { // Turn OFF Pump
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] DHW Pump OFF (AUTO) - Call Inactive (pin HIGH)\n");
+            Serial.println("DHW Pump turned OFF (AUTO) - Heating Call Inactive (pin HIGH)");
+            //broadcastPumpState(pumpNumber);
         }
     }
 }
 
 void controlStorageHeatPump() {
     int pumpIndex = 5;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
     int Furnace_Heating_Call = digitalRead(FURNACE_HEATING_PIN); // LOW when active
@@ -851,36 +943,41 @@ void controlStorageHeatPump() {
             (currentMillis - lastChangeTime >= HEATING_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Storage Heat Pump ON (Manual)\n");
+            Serial.println("Storage Heat Pump turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) { // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= HEATING_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Storage Heat Pump OFF (Manual)\n");
+            Serial.println("Storage Heat Pump turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else { // Auto Mode
         if (pumpStates[4] == PUMP_OFF) { // DHW Pump is OFF
             if (Furnace_Heating_Call == LOW) {  // Turn ON Pump
                 if (pumpStates[pumpIndex] == PUMP_OFF &&
-                   ((currentMillis - lastChangeTime >= HEATING_RELAY_CHANGE_INTERVAL) || lastChangeTime == 0)) {
+                   ((currentMillis - lastChangeTime >= HEATING_RELAY_CHANGE_INTERVAL) || lastChangeTime == 0)) { 
                     setPumpState(pumpIndex, PUMP_ON);
                     lastChangeTime = currentMillis;
-                    LOG_CAT(DBG_PUMP, "[Pump] Storage Heat Pump ON (AUTO) - Call Active (pin LOW)\n");
+                    Serial.println("Storage Heat Pump turned ON (AUTO) - Heating Call Active (pin LOW)");
+                    //broadcastPumpState(pumpNumber);
                 }
             } else if (pumpStates[pumpIndex] == PUMP_ON &&
                        (currentMillis - lastChangeTime >= HEATING_RELAY_CHANGE_INTERVAL)) { // Turn OFF Pump
                 setPumpState(pumpIndex, PUMP_OFF);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Storage Heat Pump OFF (AUTO) - Call Inactive (pin HIGH)\n");
+                Serial.println("Storage Heat Pump turned OFF (AUTO) - Heating Call Inactive (pin HIGH)");
+                //broadcastPumpState(pumpNumber);
             }
         } else { // DHW Pump is ON; ensure Storage Heat Pump is OFF
             if (pumpStates[pumpIndex] == PUMP_ON &&
                 (currentMillis - lastChangeTime >= HEATING_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_OFF);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Storage Heat Pump OFF due to DHW ON\n");
+                Serial.println("Storage Heat Pump turned OFF due to DHW ON");
+                //broadcastPumpState(pumpNumber);
             }
         }
     }
@@ -888,7 +985,7 @@ void controlStorageHeatPump() {
 
 void controlBoilerCirculatorPump() {
     int pumpIndex = 6;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
 
@@ -906,14 +1003,16 @@ void controlBoilerCirculatorPump() {
             (currentMillis - lastChangeTime >= BOILER_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Boiler Circulator ON (Manual)\n");
+            Serial.println("Boiler Circulator turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) { // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= BOILER_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Boiler Circulator OFF (Manual)\n");
+            Serial.println("Boiler Circulator turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else { // Auto Mode
         if (heatingCallActive && tempBelowOnThreshold) {
@@ -922,7 +1021,8 @@ void controlBoilerCirculatorPump() {
                 (currentMillis - lastChangeTime >= BOILER_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_ON);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Boiler Circ ON (AUTO) storageT < boilerCircOn\n");
+                Serial.println("Boiler Circulator turned ON (AUTO) storageT <  g_config.boilerCircOn");
+                //broadcastPumpState(pumpNumber);
             }
         } else if ((!heatingCallActive || tempAboveOffThreshold) &&
                    pumpStates[pumpIndex] == PUMP_ON &&
@@ -930,14 +1030,15 @@ void controlBoilerCirculatorPump() {
             // Turn OFF Pump
             setPumpState(pumpIndex, PUMP_OFF);
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Boiler Circ OFF (AUTO)\n");
+            Serial.println("Boiler Circulator turned OFF (AUTO)");
+            //broadcastPumpState(pumpNumber);
         }
     }
 }
 
 void controlRecirculationValve() {
     int pumpIndex = 7;
-    //int pumpNumber = pumpIndex + 1;
+    int pumpNumber = pumpIndex + 1;
     static unsigned long lastChangeTime = 0;
     unsigned long currentMillis = millis();
 
@@ -946,14 +1047,16 @@ void controlRecirculationValve() {
             (currentMillis - lastChangeTime >= RECIRC_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_ON); // Valve Closed
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Recirculation Valve ON (Manual)\n");
+            Serial.println("Recirculation Valve turned ON (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else if (pumpModes[pumpIndex] == PUMP_OFF) { // Manual OFF
         if (pumpStates[pumpIndex] == PUMP_ON &&
             (currentMillis - lastChangeTime >= RECIRC_RELAY_CHANGE_INTERVAL)) {
             setPumpState(pumpIndex, PUMP_OFF); // Valve Open
             lastChangeTime = currentMillis;
-            LOG_CAT(DBG_PUMP, "[Pump] Recirculation Valve OFF (Manual)\n");
+            Serial.println("Recirculation Valve turned OFF (Manual)");
+            //broadcastPumpState(pumpNumber);
         }
     } else { // Auto Mode
         if (pumpStates[6] == PUMP_ON && (DhwReturnT > storageT || HeatingReturnT > storageT)) {
@@ -962,14 +1065,16 @@ void controlRecirculationValve() {
                 (currentMillis - lastChangeTime >= RECIRC_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_ON);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Recirc Valve ON (AUTO) return > storage\n");
+                Serial.println("Recirculation Valve turned ON (AUTO) DhwReturnT > storageT or HeatingReturnT > storageT");
+                //broadcastPumpState(pumpNumber);
             }
         } else { // Turn OFF Valve (Open)
             if (pumpStates[pumpIndex] == PUMP_ON &&
                 (currentMillis - lastChangeTime >= RECIRC_RELAY_CHANGE_INTERVAL)) {
                 setPumpState(pumpIndex, PUMP_OFF);
                 lastChangeTime = currentMillis;
-                LOG_CAT(DBG_PUMP, "[Pump] Recirc Valve OFF (AUTO)\n");
+                Serial.println("Recirculation Valve turned OFF (AUTO)");
+                //broadcastPumpState(pumpNumber);
             }
         }
     }
@@ -978,15 +1083,9 @@ void controlRecirculationValve() {
 void PumpControl() {
   esp_task_wdt_reset();
 
-  // Check for the 10-minute timer flag safely outside the interrupt
-  if (g_turnPumpsToAutoFlag) {
-      g_turnPumpsToAutoFlag = false;
-      turnPumpsBackToAuto();
-  }
-
   // 1) Lock temperature first (consistent ordering)
   if (!xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
-    LOG_ERR("[Pump] Failed to take temperatureMutex in PumpControl.\n");
+    Serial.println("Failed to take temperatureMutex in PumpControl.");
     return;
   }
   esp_task_wdt_reset();
@@ -994,7 +1093,7 @@ void PumpControl() {
   // 2) Then lock pump state
   if (!xSemaphoreTake(pumpStateMutex, portMAX_DELAY)) {
     xSemaphoreGive(temperatureMutex);
-    LOG_ERR("[Pump] Failed to take pumpStateMutex in PumpControl.\n");
+    Serial.println("Failed to take pumpStateMutex in PumpControl.");
     return;
   }
   esp_task_wdt_reset();
@@ -1012,16 +1111,21 @@ void PumpControl() {
   // 4) Freeze protection
   const uint32_t nowMs = (uint32_t)millis();
 
-  const bool collectorOverride = updateCollectorFreezeProtect(nowMs);
-  const bool lineOverride      = updateLineFreezeProtect(nowMs);
+  const bool collectorOverride = updateCollectorFreezeProtect(CSupplyT, nowMs);
+  const bool tankOverride      = updateTankFreezeProtect(storageT, nowMs);
+
+  const bool circOverride = tankOverride
+                              ? true
+                              : updateCircFreezeProtect(supplyT, CircReturnT, nowMs);
 
   // 5) Normal control (skipped if freeze override owns it)
   if (!collectorOverride) controlPanelLeadPump();
   if (!collectorOverride) controlPanelLagPump();
 
   controlHeatTape();
+  updateHeatTapeIneffective(CSupplyT, nowMs);
 
-  if (!lineOverride) controlCirculationPump();
+  if (!circOverride) controlCirculationPump();
 
   controlDHWPump();
   controlStorageHeatPump();
@@ -1034,3 +1138,106 @@ void PumpControl() {
 
   esp_task_wdt_reset();
 }
+
+
+
+
+/*
+void PumpControl() {
+    // 0) Early keep‐alive in case TaskPumpControl registered WDT at startup
+    esp_task_wdt_reset();
+    
+
+    // 1) Acquire temperature mutex
+    if (xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
+        esp_task_wdt_reset();
+        
+
+        // 2) Acquire pump state mutex
+        if (xSemaphoreTake(pumpStateMutex, portMAX_DELAY)) {
+            esp_task_wdt_reset();
+            
+
+            // 3) Read the heating call pins
+            int DHW_Heating_Call     = digitalRead(DHW_HEATING_PIN);         // LOW when active
+            int Furnace_Heating_Call = digitalRead(FURNACE_HEATING_PIN);     // LOW when active
+            esp_task_wdt_reset();
+            
+
+            bool currentDHWCallStatus     = (DHW_Heating_Call == LOW);
+            bool currentHeatingCallStatus = (Furnace_Heating_Call == LOW);
+
+            // 4) If changed, send new status
+            if (currentDHWCallStatus != previousDHWCallStatus ||
+                currentHeatingCallStatus != previousHeatingCallStatus) {
+                previousDHWCallStatus     = currentDHWCallStatus;
+                previousHeatingCallStatus = currentHeatingCallStatus;
+
+                esp_task_wdt_reset();
+                sendHeatingCallStatus(currentDHWCallStatus, currentHeatingCallStatus);
+                esp_task_wdt_reset();
+                
+            }
+
+            // 5) Control each pump—reset WDT around each in case they do I/O or delays
+            esp_task_wdt_reset();
+            controlPanelLeadPump();
+            esp_task_wdt_reset();
+            
+
+            esp_task_wdt_reset();
+            controlPanelLagPump();
+            esp_task_wdt_reset();
+            
+
+            esp_task_wdt_reset();
+            controlHeatTape();
+            esp_task_wdt_reset();
+            
+
+            esp_task_wdt_reset();
+            controlCirculationPump();
+            esp_task_wdt_reset();
+            
+
+            esp_task_wdt_reset();
+            controlDHWPump();
+            esp_task_wdt_reset();
+            
+
+            esp_task_wdt_reset();
+            controlStorageHeatPump();
+            esp_task_wdt_reset();
+            
+
+            esp_task_wdt_reset();
+            controlBoilerCirculatorPump();
+            esp_task_wdt_reset();
+            
+
+            esp_task_wdt_reset();
+            controlRecirculationValve();
+            esp_task_wdt_reset();
+            
+
+            // 6) Release pumpStateMutex
+            xSemaphoreGive(pumpStateMutex);
+            esp_task_wdt_reset();
+            
+        } else {
+            Serial.println("Failed to take pumpStateMutex in PumpControl.");
+            esp_task_wdt_reset();
+            
+        }
+
+        // 7) Release temperatureMutex
+        xSemaphoreGive(temperatureMutex);
+        esp_task_wdt_reset();
+        
+    } else {
+        Serial.println("Failed to take temperatureMutex in PumpControl.");
+        esp_task_wdt_reset();
+        
+    }
+}
+*/

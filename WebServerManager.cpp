@@ -1,4 +1,3 @@
-// WebServerManager.cpp
 #include "WebServerManager.h"
 #include "Logging.h"
 #include "Config.h"
@@ -9,24 +8,16 @@
 #include "SecondWebpage.h"
 #include "ThirdWebpage.h"
 #include <ArduinoJson.h> 
-#include <string.h>
 #include <RTClib.h>
 #include "uptime_formatter.h"
 #include "TemperatureControl.h" 
 #include "esp_task_wdt.h" 
 #include "FileSystemManager.h"
-#include "MemoryStats.h"
 #include <esp_heap_caps.h> 
 #include "TimeSync.h"   
 #include "AlarmManager.h"
 #include "AlarmWebpage.h"
-#include "TarGZ.h"
-#include "DiagLog.h"
-#include "NetworkManager.h"
-#include "DS18B20.h"
-
-
-
+extern AsyncWebSocket ws;
 
 //  required for user changable perameters 
 extern SystemConfig g_config;
@@ -34,173 +25,14 @@ extern SystemConfig g_config;
 // ---- new: time configuration (timezone + DST) ----
 extern TimeConfig g_timeConfig;
 
-// --- Gatekeeper Global Flags ---
-volatile bool g_sendPumpStatus = false;
-volatile bool g_sendAlarmState = false;
-volatile bool g_sendConfig = false;
-volatile bool g_sendTimeConfig = false;
-volatile bool g_sendTemperatures = false;
-volatile bool g_sendDateTime = false;
-
-String g_tempWsPayload = "";
-SemaphoreHandle_t g_tempWsPayloadMutex = NULL;
-
-// Real outbound WS queue (broadcast + one-client)
-static SemaphoreHandle_t g_queuedWsMutex = NULL;
-
-
-
-struct QueuedWsMessage {
-  uint32_t clientId;   // 0 = broadcast
-  uint8_t  retryCount; // small retry budget for one-client init messages
-  String   message;
-  String   messageType;
-};
-
-static constexpr size_t WS_OUTBOUND_QUEUE_LEN = 24;
-static QueuedWsMessage g_wsOutboundQueue[WS_OUTBOUND_QUEUE_LEN];
-static size_t g_wsOutboundHead = 0;
-static size_t g_wsOutboundTail = 0;
-static size_t g_wsOutboundCount = 0;
-
-// WS backpressure cooldown
-static volatile uint32_t g_wsBackpressureUntilMs = 0;
-static volatile uint32_t g_wsLastWritableMs      = 0;
-
-// Staged initAll state (one client at a time by design for this A/B test)
-static volatile uint32_t g_initAllClientId = 0;
-static volatile uint8_t  g_initAllStep     = 0;
-static volatile uint32_t g_initAllNextMs   = 0;
-static constexpr uint32_t WS_INITALL_STEP_MS = 250UL;
-
-static bool hasWritableWSClient() {
-  for (auto &client : ws.getClients()) {
-    if (client.status() != WS_CONNECTED) continue;
-    if (client.queueIsFull()) continue;
-    if (!client.canSend()) continue;
-    return true;
-  }
-  return false;
-}
-
-static bool wsInCooldown() {
-  return ((int32_t)(millis() - g_wsBackpressureUntilMs) < 0);
-}
-
-static bool ensureQueuedWsMutex() {
-  if (g_queuedWsMutex == NULL) {
-    g_queuedWsMutex = xSemaphoreCreateMutex();
-  }
-  return (g_queuedWsMutex != NULL);
-}
-
-static bool hasQueuedWsMessages() {
-  if (!ensureQueuedWsMutex()) return false;
-
-  bool hasMessages = false;
-  if (xSemaphoreTake(g_queuedWsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    hasMessages = (g_wsOutboundCount > 0);
-    xSemaphoreGive(g_queuedWsMutex);
-  }
-  return hasMessages;
-}
-
-static AsyncWebSocketClient* findWsClientById(uint32_t clientId) {
-  if (clientId == 0) return nullptr;
-
-  for (auto &client : ws.getClients()) {
-    if (client.id() == clientId && client.status() == WS_CONNECTED) {
-      return &client;
-    }
-  }
-  return nullptr;
-}
-
-static bool enqueueWsMessage(uint32_t clientId,
-                             const String& message,
-                             const String& messageType,
-                             uint8_t retryCount = 0) {
-  if (message.length() == 0) return false;
-  if (!ensureQueuedWsMutex()) return false;
-
-  if (xSemaphoreTake(g_queuedWsMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-    return false;
-  }
-
-  if (g_wsOutboundCount >= WS_OUTBOUND_QUEUE_LEN) {
-    LOG_CAT(DBG_WEB,
-            "[WS] Outbound queue full, dropping type=%s len=%u\n",
-            messageType.c_str(), (unsigned)message.length());
-    xSemaphoreGive(g_queuedWsMutex);
-    return false;
-  }
-
-  QueuedWsMessage &slot = g_wsOutboundQueue[g_wsOutboundTail];
-  slot.clientId   = clientId;
-  slot.retryCount = retryCount;
-  slot.message    = message;
-  slot.messageType = messageType;
-
-  g_wsOutboundTail = (g_wsOutboundTail + 1) % WS_OUTBOUND_QUEUE_LEN;
-  g_wsOutboundCount++;
-
-  xSemaphoreGive(g_queuedWsMutex);
-  return true;
-}
-
-static bool dequeueWsMessage(QueuedWsMessage& out) {
-  if (!ensureQueuedWsMutex()) return false;
-
-  if (xSemaphoreTake(g_queuedWsMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-    return false;
-  }
-
-  if (g_wsOutboundCount == 0) {
-    xSemaphoreGive(g_queuedWsMutex);
-    return false;
-  }
-
-  out = g_wsOutboundQueue[g_wsOutboundHead];
-  g_wsOutboundQueue[g_wsOutboundHead].message = "";
-  g_wsOutboundQueue[g_wsOutboundHead].messageType = "";
-
-  g_wsOutboundHead = (g_wsOutboundHead + 1) % WS_OUTBOUND_QUEUE_LEN;
-  g_wsOutboundCount--;
-
-  xSemaphoreGive(g_queuedWsMutex);
-  return true;
-}
-
-static void queueWsClient(AsyncWebSocketClient* client,
-                          const String& message,
-                          const String& messageType) {
-  if (!client) return;
-  if (client->status() != WS_CONNECTED) return;
-
-  enqueueWsMessage(client->id(), message, messageType, 0);
-}
-
-static void queueWsToClientOrBroadcast(AsyncWebSocketClient* client,
-                                       const String& message,
-                                       const String& messageType) {
-  if (client) {
-    queueWsClient(client, message, messageType);
-  } else {
-    enqueueWsMessage(0, message, messageType, 0);
-  }
-}
-
-void queueWsBroadcast(const String& message, const String& messageType) {
-  enqueueWsMessage(0, message, messageType, 0);
-}
-
 // Global flag to indicate that pump runtime data needs to be updated
 volatile bool needToUpdatePumpRuntimes = false;
 extern TaskHandle_t thUpdatePumpRuntimes;
 
 // Extern declarations for global variables
-//extern int pumpStates[10];
-//extern int pumpModes[10];
+extern int pumpStates[10];
+extern int pumpModes[10];
+
 extern float panelT;           
 extern float CSupplyT;         
 extern float storageT;         
@@ -215,45 +47,12 @@ extern float HeatingReturnT;
 extern float dhwT;             
 extern float PotHeatXinletT;   
 extern float PotHeatXoutletT;  
+
 extern DateTime CurrentTime; // Assuming this is declared elsewhere
-extern bool g_fileSystemReady;
-
-
-// Temperature broadcast task telemetry (defined in TaskManager.cpp)
-extern volatile uint32_t g_tempBcastCalled;
-extern volatile uint32_t g_tempBcastSkipped;
-
-static SemaphoreHandle_t g_logDataMutex = nullptr;
-
-static bool takeLogDataMutex(TickType_t waitTicks) {
-  if (!g_logDataMutex) {
-    g_logDataMutex = xSemaphoreCreateMutex();
-  }
-  if (!g_logDataMutex) return false;
-  return (xSemaphoreTake(g_logDataMutex, waitTicks) == pdTRUE);
-}
-
-static void giveLogDataMutex() {
-  if (g_logDataMutex) xSemaphoreGive(g_logDataMutex);
-}
-
-static bool takeFsMutex(TickType_t waitTicks) {
-  if (!g_fileSystemReady || !fileSystemMutex) return false;
-  return (xSemaphoreTake(fileSystemMutex, waitTicks) == pdTRUE);
-}
-
-static void giveFsMutex() {
-  if (fileSystemMutex) xSemaphoreGive(fileSystemMutex);
-}
 
 static String validateTemp(float v) {
   if (isnan(v)) return "N/A";
   return String(v, 1);
-}
-
-static String formatReadAgeSeconds(uint32_t lastGoodMs) {
-  if (lastGoodMs == 0) return "N/A";
-  return String((uint32_t)((millis() - lastGoodMs) / 1000UL));
 }
 
 static String wsBytesToString(const uint8_t* data, size_t len) {
@@ -264,94 +63,7 @@ static String wsBytesToString(const uint8_t* data, size_t len) {
   return s;
 }
 
-// [ADD] Accept both comma and pipe as separators (backward compatible)
-static int findNextListSep(const String& s, int start) {
-  int c = s.indexOf(',', start);
-  int p = s.indexOf('|', start);
-  if (c == -1) return p;
-  if (p == -1) return c;
-  return (c < p) ? c : p;
-}
 
-
-
-// --- Robust parsing helpers for setConfig: ---
-// Returns the next "key=value" pair starting at 'start'.
-// If a value contains commas, this merges tokens until the next token contains '='.
-// Updates 'start' to the beginning of the next pair (or payload.length()).
-static String nextConfigPairMerged(const String& payload, int& start) {
-  const int n = payload.length();
-  // skip leading commas/spaces
-  while (start < n && (payload[start] == ',' || payload[start] == ' ')) start++;
-
-  String pair;
-  int i = start;
-
-  while (i <= n) {
-    int comma = payload.indexOf(',', i);
-    int end   = (comma == -1) ? n : comma;
-
-    String tok = payload.substring(i, end);
-    tok.trim();
-
-    if (tok.length() > 0) {
-      if (pair.length() == 0) {
-        pair = tok;
-      } else {
-        // If the token looks like the start of a new pair, stop and leave start at token begin
-        if (tok.indexOf('=') != -1) {
-          start = i;   // next call will start here
-          return pair;
-        }
-        // Otherwise it was part of the previous value (old comma-list case)
-        pair += ",";
-        pair += tok;
-      }
-    }
-
-    if (comma == -1) {
-      start = n;
-      return pair;
-    }
-    i = comma + 1;
-  }
-
-  start = n;
-  return pair;
-}
-
-// Parse a list like "2|5|6" (or "2,5,6") into a uint8_t[] terminated with 0.
-// outMax is the total size of the out buffer (including terminator slot).
-static void parseU8List_PipeOrComma(const String& val, uint8_t* out, size_t outMax) {
-  if (!out || outMax < 2) return;
-
-  int j = 0;
-  int pos = 0;
-  const int n = val.length();
-
-  while (pos < n && j < (int)(outMax - 1)) {
-    // find next delimiter: either '|' or ','
-    int p = val.indexOf('|', pos);
-    int c = val.indexOf(',', pos);
-
-    int cut;
-    if (p == -1) cut = c;
-    else if (c == -1) cut = p;
-    else cut = (p < c) ? p : c;
-
-    String token = (cut == -1) ? val.substring(pos) : val.substring(pos, cut);
-    token.trim();
-
-    if (token.length() > 0) {
-      out[j++] = (uint8_t) token.toInt();
-    }
-
-    if (cut == -1) break;
-    pos = cut + 1;
-  }
-
-  out[j] = 0; // terminator
-}
 
 
 // Initialize the server and WebSocket
@@ -375,20 +87,6 @@ static void ensurePumpRuntimeJsonMutex() {
 }
 
 
-static uint16_t clampU16(long v, uint16_t lo, uint16_t hi) {
-  if (v < (long)lo) return lo;
-  if (v > (long)hi) return hi;
-  return (uint16_t)v;
-}
-
-static float clampF(float v, float lo, float hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
-
-
-
 // Function prototypes
 void startServer();
 void initWebSocket();
@@ -396,25 +94,17 @@ void handleWebSocketEvent(AsyncWebSocket* server, AsyncWebSocketClient* client, 
                           void* arg, uint8_t* data, size_t len);
 void handleWebSocketMessage(void* arg, uint8_t* data, size_t len);
 void handleSetPumpMode(String message);
+void handleRequestLogData(String message);
 void sendPumpStatuses(AsyncWebSocketClient* client);
 void sendTemperatures(AsyncWebSocketClient* client);
-void sendTemperatureSourceMap(AsyncWebSocketClient* client);
 String getFormattedTime();
 String getFormattedDate();
 void sendDateTime(AsyncWebSocketClient* client);
 void sendUptime(AsyncWebSocketClient* client);
-String getFSStatsString();
-void sendSystemStats(AsyncWebSocketClient* client); 
-bool safeHasValue(float temp);
-void sendConfigurationValues(AsyncWebSocketClient* client);
-void sendTimeConfig(AsyncWebSocketClient* client);
-String wsBytesToString(const uint8_t* data, size_t len);
-void handleWebSocketMessage(void* arg, uint8_t* data, size_t len);
-
 void sendAllData(AsyncWebSocketClient* client);
 void sendSystemStats(AsyncWebSocketClient* client); 
 void broadcastMessageOverWebSocket(const String& message, const String& messageType);
-
+void sendTimeConfig(AsyncWebSocketClient* client);
 DateTime parseDateTimeFromLogFile(const String& datetimeStr);
 unsigned long calculateTotalLogRuntime(const String& logFilename);
 String prepareLogData(int pumpIndex, String timeframe);
@@ -427,151 +117,24 @@ unsigned long aggregateYearlyLogsReport(int pumpIndex, DateTime currentTime);
 unsigned long aggregatePreviousYearlyLogsReport(int pumpIndex, DateTime currentTime);
 unsigned long aggregateDecadeLogsReport(int pumpIndex, DateTime currentTime);
 void setupRoutes();
+void setupLogDataRoute();
 void updateAllRuntimes();
 void refreshRuntimeCache();
 
 static void sendAlarmStateWs(uint32_t n);
 static void onAlarmStateChanged(uint32_t activeCount);
-static void startInitAllForClient(AsyncWebSocketClient* client);
-static bool processInitAllStep(uint32_t now);
-static void delayedControllerRebootTask(void* pvParameters);
-
-static void delayedControllerRebootTask(void* pvParameters) {
-  (void)pvParameters;
-
-  // Give the HTTP response time to leave the controller before restarting, then
-  // flush RAM-cached pump START/STOP events so runtime history survives the reboot.
-  vTaskDelay(pdMS_TO_TICKS(500));
-  (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(3000), 3);
-  vTaskDelay(pdMS_TO_TICKS(250));
-  ESP.restart();
-
-  vTaskDelete(NULL);
-}
-
-static void startInitAllForClient(AsyncWebSocketClient* client) {
-  if (!client) return;
-  if (client->status() != WS_CONNECTED) return;
-
-  g_initAllClientId = client->id();
-  g_initAllStep     = 1;
-  g_initAllNextMs   = millis();
-
-  LOG_CAT(DBG_WEB, "[WS] initAll scheduled for client id=%u\n",
-          (unsigned)g_initAllClientId);
-}
-
-static bool processInitAllStep(uint32_t now) {
-  if (g_initAllClientId == 0 || g_initAllStep == 0) return false;
-
-  // Keep the queue shallow: only schedule the next init step when the
-  // outbound queue is currently empty.
-  if (hasQueuedWsMessages()) return false;
-
-  if ((int32_t)(now - g_initAllNextMs) < 0) return false;
-
-  AsyncWebSocketClient* client = findWsClientById(g_initAllClientId);
-  if (client == nullptr) {
-    LOG_CAT(DBG_WEB,
-            "[WS] initAll cancelled; client id=%u no longer connected\n",
-            (unsigned)g_initAllClientId);
-    g_initAllClientId = 0;
-    g_initAllStep = 0;
-    g_initAllNextMs = 0;
-    return false;
-  }
-
-  switch (g_initAllStep) {
-    case 1:
-      sendPumpStatuses(client);
-      break;
-
-    case 2: {
-      String heatingCallData = "HeatingCalls:";
-      heatingCallData += "DHW:";
-      heatingCallData += (digitalRead(DHW_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
-      heatingCallData += ",Heating:";
-      heatingCallData += (digitalRead(FURNACE_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
-      queueWsClient(client, heatingCallData, "HeatingCalls");
-      break;
-    }
-
-    case 3: {
-      uint32_t n = AlarmManager_activeCount();
-      queueWsClient(
-        client,
-        (n > 0) ? ("AlarmState:ALARM,count=" + String(n))
-                :  "AlarmState:OK,count=0",
-        "AlarmState"
-      );
-      break;
-    }
-
-    case 4:
-      sendConfigurationValues(client);
-      break;
-
-    case 5:
-      sendTimeConfig(client);
-      break;
-
-    case 6:
-      sendDateTime(client);
-      break;
-
-    case 7:
-      sendUptime(client);
-      break;
-
-    case 8:
-      sendSystemStats(client);
-      break;
-
-    case 9:
-      sendTemperatureSourceMap(client);
-      break;
-
-    case 10:
-      sendTemperatures(client);
-      break;
-
-    default:
-      g_initAllClientId = 0;
-      g_initAllStep = 0;
-      g_initAllNextMs = 0;
-      return false;
-  }
-
-  LOG_CAT(DBG_WEB,
-          "[WS] initAll step %u queued for client id=%u\n",
-          (unsigned)g_initAllStep,
-          (unsigned)g_initAllClientId);
-
-  if (g_initAllStep >= 10) {
-    g_initAllClientId = 0;
-    g_initAllStep = 0;
-    g_initAllNextMs = 0;
-  } else {
-    g_initAllStep++;
-    g_initAllNextMs = now + WS_INITALL_STEP_MS;
-  }
-
-  // FIX 2: Hard throttle to give AsyncTCP time to free memory between init steps
-  vTaskDelay(pdMS_TO_TICKS(50));
-  return true;
-}
 
 static void sendAlarmStateWs(uint32_t n) {
   if (n > 0) {
-    queueWsBroadcast("AlarmState:ALARM,count=" + String(n), "AlarmState");
+    ws.textAll("AlarmState:ALARM,count=" + String(n));
   } else {
-    queueWsBroadcast("AlarmState:OK,count=0", "AlarmState");
+    ws.textAll("AlarmState:OK,count=0");
   }
 }
 
 static void onAlarmStateChanged(uint32_t activeCount) {
-  (void)activeCount;
-  g_sendAlarmState = true;
+  // Called by AlarmManager when active count changes (set/clear)
+  sendAlarmStateWs(activeCount);
 }
 
 void broadcastAlarmStateOverWebSocket() {
@@ -581,7 +144,8 @@ void broadcastAlarmStateOverWebSocket() {
 
 
 void sendConfigurationValues(AsyncWebSocketClient* client) {
-    if (client && client->status() != WS_CONNECTED) {
+    if (client && client->queueIsFull()) {
+        Serial.println("[Warning] Client queue is full, skipping configuration data transmission.");
         return;
     }
 
@@ -603,7 +167,7 @@ void sendConfigurationValues(AsyncWebSocketClient* client) {
     configData += ",Boiler_Circ_Off:" + validateConfigValue(g_config.boilerCircOff);
     configData += ",StorageHeatingLimit:" + validateConfigValue(g_config.storageHeatingLimit);
     configData += ",Circ_Pump_On:" + validateConfigValue(g_config.circPumpOn);
-    configData += ",Circ_Pump_Off:" + validateConfigValue(g_config.circPumpOff);
+        configData += ",Circ_Pump_Off:" + validateConfigValue(g_config.circPumpOff);
     configData += ",Heat_Tape_On:" + validateConfigValue(g_config.heatTapeOn);
     configData += ",Heat_Tape_Off:" + validateConfigValue(g_config.heatTapeOff);
 
@@ -612,35 +176,31 @@ void sendConfigurationValues(AsyncWebSocketClient* client) {
     configData += ",collectorFreezeConfirmMin:" + String((uint32_t)g_config.collectorFreezeConfirmMin);
     configData += ",collectorFreezeRunMin:" + String((uint32_t)g_config.collectorFreezeRunMin);
 
-    configData += ",lineFreezeTempF:" + validateConfigValue(g_config.lineFreezeTempF);
-    configData += ",lineFreezeConfirmMin:" + String((uint32_t)g_config.lineFreezeConfirmMin);
-    configData += ",lineFreezeRunMin:" + String((uint32_t)g_config.lineFreezeRunMin);
+    configData += ",circFreezeTempF:" + validateConfigValue(g_config.circFreezeTempF);
+    configData += ",circFreezeConfirmMin:" + String((uint32_t)g_config.circFreezeConfirmMin);
+    configData += ",circFreezeRunMin:" + String((uint32_t)g_config.circFreezeRunMin);
 
-    // Sensors
-    configData += ",collectorFreezeSensors:";
-    bool first = true;
-    for (uint8_t* s = g_config.collectorFreezeSensors; *s; s++) {
-      if (!first) configData += "|";
-      configData += String(*s);
-      first = false;
-    }
+    configData += ",heatTapeBadF:" + validateConfigValue(g_config.heatTapeBadF);
+    configData += ",heatTapeClearF:" + validateConfigValue(g_config.heatTapeClearF);
+    configData += ",heatTapeEvalMin:" + String((uint32_t)g_config.heatTapeEvalMin);
 
-    configData += ",lineFreezeSensors:";
-    first = true;
-    for (uint8_t* s = g_config.lineFreezeSensors; *s; s++) {
-      if (!first) configData += "|";
-      configData += String(*s);
-      first = false;
-    }
-
+    configData += ",tankFreezeTempF:" + validateConfigValue(g_config.tankFreezeTempF);
+    configData += ",tankFreezeClearF:" + validateConfigValue(g_config.tankFreezeClearF);
+    configData += ",tankFreezeConfirmMin:" + String((uint32_t)g_config.tankFreezeConfirmMin);
     // ---------------------------------------------------
 
-    queueWsToClientOrBroadcast(client, configData, "Configuration");
+    if (client) {
+        client->text(configData);
+    } else {
+
+        ws.textAll(configData);
+    }
 }
 
 // ---- TimeConfig sender (new) ----
 void sendTimeConfig(AsyncWebSocketClient* client) {
-    if (client && client->status() != WS_CONNECTED) {
+    if (client && client->queueIsFull()) {
+        Serial.println("[Warning] Client queue is full, skipping time config transmission.");
         return;
     }
 
@@ -648,14 +208,13 @@ void sendTimeConfig(AsyncWebSocketClient* client) {
     msg += "timeZoneId=" + g_timeConfig.timeZoneId;
     msg += ",dstEnabled=" + String(g_timeConfig.dstEnabled ? 1 : 0);
 
-    queueWsToClientOrBroadcast(client, msg, "TimeConfig");
+    if (client) {
+        client->text(msg);
+    } else {
+        ws.textAll(msg);
+    }
 }
 
-void serveStaticAssets(AsyncWebServer& server) {
-  server.serveStatic("/static/", LittleFS, "/static/");
-  // optional caching:
-  // server.serveStatic("/static/", LittleFS, "/static/").setCacheControl("max-age=86400");
-}
 
 void serveFavicon(AsyncWebServer& server) {
     // We have access to LittleFS here
@@ -664,15 +223,13 @@ void serveFavicon(AsyncWebServer& server) {
 
 // Start the server
 void startServer() {
-    serveStaticAssets(server);
     serveFavicon(server);     // sets up the route
-    initWebSocket();          // Initialize WebSocket
-    setupRoutes();            // Setup additional routes
+    initWebSocket(); // Initialize WebSocket
+    setupRoutes();   // Setup additional routes for listing and downloading files
     ensurePumpRuntimeJsonMutex();
     AlarmManager_setStateChangedCallback(onAlarmStateChanged);
-    server.begin();           // Start the server
+    server.begin();  // Start the server
 }
-
 
 // Initialize the WebSocket
 void initWebSocket() {
@@ -681,18 +238,20 @@ void initWebSocket() {
 }
 
 void setAllPumpsMode(int mode) {
-    for (int i = 0; i < numPumps; i++) {
+    // Set all pumps to the specified mode
+    for (int i = 0; i < 10; i++) {
         pumpModes[i] = mode;
     }
 
+    // Log the action
     if (mode == PUMP_AUTO) {
-        LOG_CAT(DBG_PUMP, "All pumps set to AUTO via web button.\n");
+        Serial.println("All pumps set to AUTO via web button.");
     } else if (mode == PUMP_OFF) {
-        LOG_CAT(DBG_PUMP, "All pumps turned OFF via web button.\n");
+        Serial.println("All pumps turned OFF via web button.");
     }
 
-    // Gatekeeper-only: do NOT directly broadcast here
-    g_sendPumpStatus = true;
+    // Notify clients of the updated pump statuses
+    sendPumpStatuses(nullptr);
 }
 
 // Handle WebSocket events
@@ -703,27 +262,15 @@ void handleWebSocketEvent(AsyncWebSocket* server,
                           uint8_t* data,
                           size_t len)
 {
-    if (type == WS_EVT_CONNECT) {
-    LOG_CAT(DBG_WEB, "WebSocket client connected (id=%u)\n", client ? client->id() : 0);
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("WebSocket client connected (id=%u)\n", client ? client->id() : 0);
     return;
   }
 
   if (type == WS_EVT_DISCONNECT) {
-    LOG_CAT(DBG_WEB, "WebSocket client disconnected (id=%u)\n", client ? client->id() : 0);
-
-    if (client && g_initAllClientId == client->id()) {
-      g_initAllClientId = 0;
-      g_initAllStep = 0;
-      g_initAllNextMs = 0;
-      LOG_CAT(DBG_WEB, "[WS] initAll cancelled on disconnect for id=%u\n", client->id());
-    }
-    
-    // Log the client disconnect to the Alarm History
-    AlarmManager_event(ALM_WS_DISCONNECT, ALM_INFO, "WS Client ID %u Disconnected", client ? client->id() : 0);
-    
+    Serial.printf("WebSocket client disconnected (id=%u)\n", client ? client->id() : 0);
     return;
   }
-
 
   if (type != WS_EVT_DATA) return;
 
@@ -738,98 +285,31 @@ void handleWebSocketEvent(AsyncWebSocket* server,
   String msg = wsBytesToString(data, len);
 
   // Identify which page connected (your new "hello:" handshake)
-    if (msg.startsWith("hello:")) {
-    LOG_CAT(DBG_WEB, "[WS hello] id=%u msg=%s\n", client ? client->id() : 0, msg.c_str());
+  if (msg.startsWith("hello:")) {
+    Serial.printf("[WS hello] id=%u msg=%s\n", client ? client->id() : 0, msg.c_str());
     return;  // IMPORTANT: don't pass hello into the generic message handler
   }
 
-
-  // Legacy init (kept tiny on purpose)
+  // FirstWebpage sends "init" after it opens
   if (msg == "init") {
-    if (client) {
-      sendPumpStatuses(client);
-      sendDateTime(client);
-      sendUptime(client);
-    }
-    return;
-  }
+    // Restore what you used to do on WS connect
+    int dhwCall  = (digitalRead(DHW_HEATING_PIN) == LOW);
+    int heatCall = (digitalRead(FURNACE_HEATING_PIN) == LOW);
+    sendHeatingCallStatus(dhwCall, heatCall);
 
-  // Consolidated FirstWebpage startup:
-  // browser sends one init request; server now schedules the full response
-  // set in paced steps instead of queueing everything immediately.
-  if (msg == "initAll") {
-    if (client) {
-      startInitAllForClient(client);
-    }
-    return;
-  }
-
-  if (msg == "initPumpStatus") {
-    if (client) {
-      sendPumpStatuses(client);
-    }
-    return;
-  }
-
-  if (msg == "initHeatingCalls") {
-    if (client) {
-      String heatingCallData = "HeatingCalls:";
-      heatingCallData += "DHW:";
-      heatingCallData += (digitalRead(DHW_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
-      heatingCallData += ",Heating:";
-      heatingCallData += (digitalRead(FURNACE_HEATING_PIN) == LOW) ? "ACTIVE" : "INACTIVE";
-      queueWsClient(client, heatingCallData, "HeatingCalls");
-    }
-    return;
-  }
-
-  if (msg == "initTemperatures") {
-    if (client) {
-      sendTemperatureSourceMap(client);
-      sendTemperatures(client);
-    }
-    return;
-  }
-
-  if (msg == "initConfig") {
-    if (client) {
+        if (client && !client->queueIsFull()) {
+      sendAllData(client);
       sendConfigurationValues(client);
-    }
-    return;
-  }
-
-  if (msg == "initTimeConfig") {
-    if (client) {
       sendTimeConfig(client);
-    }
-    return;
-  }
-
-  if (msg == "initAlarmState") {
-    if (client) {
-      uint32_t n = AlarmManager_activeCount();
-      queueWsClient(
-        client,
-        (n > 0) ? ("AlarmState:ALARM,count=" + String(n))
-                :  "AlarmState:OK,count=0",
-        "AlarmState"
-      );
-    }
-    return;
-  }
-
-  if (msg == "initSystemStats") {
-    if (client) {
       sendSystemStats(client);
-    }
-    return;
-  }
 
-  if (msg == "initDateTime") {
-    if (client) {
-      sendDateTime(client);
+      uint32_t n = AlarmManager_activeCount();
+      client->text((n > 0)
+        ? ("AlarmState:ALARM,count=" + String(n))
+        :  "AlarmState:OK,count=0");
     }
     return;
+
   }
 
   if (msg == "getUptime") {
@@ -846,181 +326,208 @@ void handleWebSocketEvent(AsyncWebSocket* server,
 
 
 // Handle incoming WebSocket messages
-void handleWebSocketMessage(void* arg, uint8_t* data, size_t len) { 
+void handleWebSocketMessage(void* arg, uint8_t* data, size_t len) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
     if (info->opcode == WS_TEXT) {
         String message = wsBytesToString(data, len);
+        //Serial.print("Received WS message: ");
 
-        LOG_CAT(DBG_WEB, "[WS] Received message: %s\n", message.c_str());
+        //Serial.println(message);
 
         if (message == "ping") {
             return;
+        }        
+                else if (message.startsWith("requestLogData")) {
+            handleRequestLogData(message);
         } else if (message.startsWith("setPumpMode:")) {
             handleSetPumpMode(message);
         } else if (message.equals("setAllPumps:auto")) {
             setAllPumpsMode(PUMP_AUTO);
         } else if (message.equals("setAllPumps:off")) {
             setAllPumpsMode(PUMP_OFF);
-                } else if (message.equals("getFsStats")) {
+        } else if (message.equals("getFsStats")) {
             // Send the FS heap JSON back
             String json = getFSStatsString();
             // prefix so the client can handle it easily
-            queueWsBroadcast("FsStats:" + json, "FsStats");
-        } else if (message == "deleteTemperatureLogs") {
-               // dangerous: only use if you intentionally want to delete all logs
-                  bool ok = deleteTemperatureLogsRecursive("/Temperature_Logs");
-                   queueWsBroadcast(String("DeleteTempLogsResult:") + (ok ? "OK" : "FAIL"),
-                                    "DeleteTempLogsResult");
-        }                 else if (message.startsWith("setConfig:")) {
-                 String payload = message.substring(strlen("setConfig:"));
-                 // Format: setConfig:key=val,key=val,... (values may contain commas)
-                 int start = 0;
+            ws.textAll("FsStats:" + json);
+        } else if (message.equals("deleteTemperatureLogs")) {
+            // dangerous: only use if you intentionally want to delete all logs
+            bool ok = deleteTemperatureLogsRecursive("/Temperature_Logs");
+            ws.textAll(String("DeleteTempLogsResult:") + (ok ? "OK" : "FAIL"));
+                }else if (message.startsWith("setConfig:")) {
+                String payload = message.substring(strlen("setConfig:"));
+                  // Format: setConfig:key=val,key=val,...
+              int start = 0;
 
-                 while (start < payload.length()) {
+              auto clampU16 = [](long v, uint16_t lo, uint16_t hi)->uint16_t {
+                  if (v < (long)lo) return lo;
+                  if (v > (long)hi) return hi;
+                  return (uint16_t)v;
+              };
+              auto clampF = [](float v, float lo, float hi)->float {
+                  if (v < lo) return lo;
+                  if (v > hi) return hi;
+                  return v;
+              };
 
-                   String pair = nextConfigPairMerged(payload, start);
+                while (start < payload.length()) {
+
+                 int comma = payload.indexOf(',', start);
+                 String pair = (comma == -1)
+                            ? payload.substring(start)
+                            : payload.substring(start, comma);
+
                    pair.trim();
-                   if (pair.length() == 0) continue;
-
+                   if (pair.length() > 0) {
                    int eq = pair.indexOf('=');
-                   if (eq <= 0) continue;
+                        if (eq > 0) {
+                           String key = pair.substring(0, eq);
+                           String val = pair.substring(eq + 1);
+                           key.trim();
+                           val.trim();
+                           float f = val.toFloat();
+                            long  i = val.toInt();
+                              if (key == "panelTminimum") {
+                                 g_config.panelTminimumValue = f;
+                              } else if (key == "PanelOnDifferential") {
+                                 g_config.panelOnDifferential = f;
+                              } else if (key == "PanelLowDifferential") {
+                                 g_config.panelLowDifferential = f;
+                              } else if (key == "PanelOffDifferential") {
+                                 g_config.panelOffDifferential = f;
+                              } else if (key == "Boiler_Circ_On") {
+                                 g_config.boilerCircOn = f;
+                              } else if (key == "Boiler_Circ_Off") {
+                                 g_config.boilerCircOff = f;
+                              } else if (key == "StorageHeatingLimit") {
+                                 g_config.storageHeatingLimit = f;
+                              } else if (key == "Circ_Pump_On") {
+                                 g_config.circPumpOn = f;
+                              } else if (key == "Circ_Pump_Off") {
+                                 g_config.circPumpOff = f;
+                              } else if (key == "Heat_Tape_On") {
+                                 g_config.heatTapeOn = f;
+                                                            } else if (key == "Heat_Tape_Off") {
+                                 g_config.heatTapeOff = f;
 
-                   String key = pair.substring(0, eq);
-                   String val = pair.substring(eq + 1);
-                   key.trim();
-                   val.trim();
+                              } else if (key == "collectorFreezeTempF") {
+                                 g_config.collectorFreezeTempF = clampF(f, 20.0f, 80.0f);
+                              } else if (key == "collectorFreezeConfirmMin") {
+                                 g_config.collectorFreezeConfirmMin = clampU16(i, 1, 120);
+                              } else if (key == "collectorFreezeRunMin") {
+                                 g_config.collectorFreezeRunMin = clampU16(i, 1, 120);
 
-                   float f = val.toFloat();
-                   long  i = val.toInt();
+                              } else if (key == "circFreezeTempF") {
+                                 g_config.circFreezeTempF = clampF(f, 20.0f, 60.0f);
+                              } else if (key == "circFreezeConfirmMin") {
+                                 g_config.circFreezeConfirmMin = clampU16(i, 1, 120);
+                              } else if (key == "circFreezeRunMin") {
+                                 g_config.circFreezeRunMin = clampU16(i, 1, 120);
 
-                   if (key == "panelTminimum") {
-                     g_config.panelTminimumValue = f;
-                   } else if (key == "PanelOnDifferential") {
-                     g_config.panelOnDifferential = f;
-                   } else if (key == "PanelLowDifferential") {
-                     g_config.panelLowDifferential = f;
-                   } else if (key == "PanelOffDifferential") {
-                     g_config.panelOffDifferential = f;
-                   } else if (key == "Boiler_Circ_On") {
-                     g_config.boilerCircOn = f;
-                   } else if (key == "Boiler_Circ_Off") {
-                     g_config.boilerCircOff = f;
-                   } else if (key == "StorageHeatingLimit") {
-                     g_config.storageHeatingLimit = f;
-                   } else if (key == "Circ_Pump_On") {
-                     g_config.circPumpOn = f;
-                   } else if (key == "Circ_Pump_Off") {
-                     g_config.circPumpOff = f;
-                   } else if (key == "Heat_Tape_On") {
-                     g_config.heatTapeOn = f;
-                   } else if (key == "Heat_Tape_Off") {
-                     g_config.heatTapeOff = f;
+                              } else if (key == "heatTapeBadF") {
+                                 g_config.heatTapeBadF = clampF(f, 20.0f, 60.0f);
+                              } else if (key == "heatTapeClearF") {
+                                 g_config.heatTapeClearF = clampF(f, 20.0f, 60.0f);
+                              } else if (key == "heatTapeEvalMin") {
+                                 g_config.heatTapeEvalMin = clampU16(i, 1, 120);
 
-                   } else if (key == "collectorFreezeTempF") {
-                     g_config.collectorFreezeTempF = clampF(f, 20.0f, 80.0f);
-                   } else if (key == "collectorFreezeConfirmMin") {
-                     g_config.collectorFreezeConfirmMin = clampU16(i, 1, 120);
-                   } else if (key == "collectorFreezeRunMin") {
-                     g_config.collectorFreezeRunMin = clampU16(i, 1, 120);
+                              } else if (key == "tankFreezeTempF") {
+                                 g_config.tankFreezeTempF = clampF(f, 20.0f, 60.0f);
+                              } else if (key == "tankFreezeClearF") {
+                                 g_config.tankFreezeClearF = clampF(f, 20.0f, 80.0f);
+                              } else if (key == "tankFreezeConfirmMin") {
+                                 g_config.tankFreezeConfirmMin = clampU16(i, 1, 240);
+                              }
+                        }
+                    } 
 
-                   } else if (key == "lineFreezeTempF") {
-                     g_config.lineFreezeTempF = clampF(f, 20.0f, 80.0f);
-                   } else if (key == "lineFreezeConfirmMin") {
-                     g_config.lineFreezeConfirmMin = clampU16(i, 1, 120);
-                   } else if (key == "lineFreezeRunMin") {
-                     g_config.lineFreezeRunMin = clampU16(i, 1, 120);
+                   if (comma == -1) break;
+                    start = comma + 1;
+                }
+             // Persist to LittleFS
+             if (!saveSystemConfigToFS()) {
+             Serial.println("[Config] ERROR while saving system_config.json");
+             ws.textAll("ConfigSave:FAIL");
+             } else 
+               {
+                 Serial.println("[Config] system_config.json saved from WebUI");
+                 ws.textAll("ConfigSave:OK");
+                 // Re-send configuration so all clients update display
+                 sendConfigurationValues(nullptr);
+                }
+           }
 
-                   } else if (key == "collectorFreezeSensors") {
-                     parseU8List_PipeOrComma(val, g_config.collectorFreezeSensors,
-                                             sizeof(g_config.collectorFreezeSensors));
-                   } else if (key == "lineFreezeSensors") {
-                     parseU8List_PipeOrComma(val, g_config.lineFreezeSensors,
-                                             sizeof(g_config.lineFreezeSensors));
-                   }
-                 }
-
-                 // Persist to LittleFS
-                              if (!saveSystemConfigToFS()) {
-                              LOG_ERR("[Config] ERROR while saving system_config.json\n");
-                              queueWsBroadcast("ConfigSave:FAIL", "ConfigSave");
-                               } else 
-                              {
-                              LOG_CAT(DBG_CONFIG, "[Config] system_config.json saved from WebUI\n");
-                              queueWsBroadcast("ConfigSave:OK", "ConfigSave");
-
-                   // Re-send configuration so all clients update display
-                   g_sendConfig = true;
-                 }
-                 }   
-                    else if (message == "resetConfig") {
-
-                LOG_CAT(DBG_CONFIG, "[WS] Reset SystemConfig to defaults requested\n");
-
+        
+            else if (message == "resetConfig") {
+                Serial.println("[WS] Reset SystemConfig to defaults requested");
 
                 bool ok = resetSystemConfigToDefaults();  // helper from Config.cpp
 
-                                if (ok) {
-                    queueWsBroadcast("ConfigReset:OK", "ConfigReset");
+                if (ok) {
+                    ws.textAll("ConfigReset:OK");
                     // Push fresh values so browsers update all spans/inputs + currentConfig cache
-                    g_sendConfig = true;
+                    sendConfigurationValues(nullptr);
                 } else {
-                    queueWsBroadcast("ConfigReset:FAIL", "ConfigReset");
+                    ws.textAll("ConfigReset:FAIL");
                 }
-                        }   else if (message.startsWith("setTimeConfig:")) {
-                 String payload = message.substring(strlen("setTimeConfig:"));
-                 // Format: setTimeConfig:key=val,key=val,...
-                 int start = 0;
-
-                 while (start < payload.length()) {
-                   String pair = nextConfigPairMerged(payload, start);
-                   pair.trim();
-                   if (pair.length() == 0) continue;
-
-                   int eq = pair.indexOf('=');
-                   if (eq <= 0) continue;
-
-                   String key = pair.substring(0, eq);
-                   String val = pair.substring(eq + 1);
-                   key.trim();
-                   val.trim();
-
-                   if (key == "timeZoneId") {
-                     // e.g. "America/Los_Angeles" or your own IDs
-                     g_timeConfig.timeZoneId = val;
-                   } else if (key == "dstEnabled") {
-                     // accept 0/1, true/false
-                     val.toLowerCase();
-                     g_timeConfig.dstEnabled = (val == "1" || val == "true" || val == "yes" || val == "on");
-                   }
-                 }
-
-                    if (!saveTimeConfigToFS()) {
-                    LOG_ERR("[TimeConfig] ERROR while saving time_config.json\n");
-                    queueWsBroadcast("TimeConfigSave:FAIL", "TimeConfigSave");
-                } else {
-                    LOG_CAT(DBG_CONFIG, "[TimeConfig] time_config.json saved from WebUI\n");
-                    queueWsBroadcast("TimeConfigSave:OK", "TimeConfigSave");
-
-                   // Re-send so all clients update display
-                   g_sendTimeConfig = true;
-                   // 🔁 Re-run NTP so RTC + timestamps immediately pick up the new TZ
-                   requestImmediateNtpResync();
-                 }
             }
+
             
-                else if (message.equals("resetTimeConfig")) {
+            else if (message.startsWith("setTimeConfig:")) {
+                String payload = message.substring(strlen("setTimeConfig:"));
+                // Format: setTimeConfig:key=val,key=val,...
+                int start = 0;
+                while (start < payload.length()) {
+                    int comma = payload.indexOf(',', start);
+                    String pair = (comma == -1)
+                                    ? payload.substring(start)
+                                    : payload.substring(start, comma);
 
-                LOG_CAT(DBG_CONFIG, "[WS] Reset TimeConfig to defaults requested\n");
+                    pair.trim();
+                    if (pair.length() > 0) {
+                        int eq = pair.indexOf('=');
+                        if (eq > 0) {
+                            String key = pair.substring(0, eq);
+                            String val = pair.substring(eq + 1);
+                            key.trim();
+                            val.trim();
 
+                            if (key == "timeZoneId") {
+                                g_timeConfig.timeZoneId = val;
+                            } else if (key == "dstEnabled") {
+                                g_timeConfig.dstEnabled = (val.toInt() != 0);
+                            }
+                        }
+                    }
+
+                    if (comma == -1) break;
+                    start = comma + 1;
+                }
+
+                if (!saveTimeConfigToFS()) {
+                    Serial.println("[TimeConfig] ERROR while saving time_config.json");
+                    ws.textAll("TimeConfigSave:FAIL");
+                } else {
+                    Serial.println("[TimeConfig] time_config.json saved from WebUI");
+                    ws.textAll("TimeConfigSave:OK");
+                    // Re-send so all clients update display
+                    sendTimeConfig(nullptr);
+                    // 🔁 Re-run NTP so RTC + timestamps immediately pick up the new TZ
+                    requestImmediateNtpResync();
+        
+                }
+            }
+            else if (message.equals("resetTimeConfig")) {
+                Serial.println("[WS] Reset TimeConfig to defaults requested");
 
                 bool ok = resetTimeConfigToDefaults();
 
-                                if (ok) {
-                    queueWsBroadcast("TimeConfigReset:OK", "TimeConfigReset");
-                    g_sendTimeConfig = true;
+                if (ok) {
+                    ws.textAll("TimeConfigReset:OK");
+                    sendTimeConfig(nullptr);
                     
                 } else {
-                    queueWsBroadcast("TimeConfigReset:FAIL", "TimeConfigReset");
+                    ws.textAll("TimeConfigReset:FAIL");
                 }
             }
     }
@@ -1029,16 +536,18 @@ void handleWebSocketMessage(void* arg, uint8_t* data, size_t len) {
 
 
 
+// Handle setting pump mode
 void handleSetPumpMode(String message) {
     int firstColon = message.indexOf(':');
     int secondColon = message.indexOf(':', firstColon + 1);
     if (firstColon != -1 && secondColon != -1) {
-        int pumpIndex = message.substring(firstColon + 1, secondColon).toInt() - 1; 
+        int pumpIndex = message.substring(firstColon + 1, secondColon).toInt() - 1; // Adjust for 0-based index
         String mode = message.substring(secondColon + 1);
-        mode.toLowerCase(); 
+        mode.toLowerCase(); // Ensure mode is in lowercase
 
-        if (pumpIndex >= 0 && pumpIndex < numPumps) {
-            int newMode = PUMP_AUTO; 
+        if (pumpIndex >= 0 && pumpIndex < 10) {
+            // Only update if there is a change
+            int newMode = PUMP_AUTO; // Default to "auto"
             if (mode == "on") {
                 newMode = PUMP_ON;
             } else if (mode == "off") {
@@ -1047,70 +556,75 @@ void handleSetPumpMode(String message) {
 
             if (pumpModes[pumpIndex] != newMode) {
                 pumpModes[pumpIndex] = newMode;
-                LOG_CAT(DBG_PUMP, "Pump %d mode set to %s\n", pumpIndex + 1, mode.c_str());
-                g_sendPumpStatus = true; // Flag the gatekeeper
+                Serial.printf("Pump %d mode set to %s\n", pumpIndex + 1, mode.c_str());
+                sendPumpStatuses(nullptr); // Broadcast only if the state changes
             }
         } else {
-            LOG_CAT(DBG_PUMP, "Invalid pump index received.\n");
+            Serial.println("Invalid pump index received.");
         }
+    }
+}
+
+
+// Handle log data requests
+void handleRequestLogData(String message) {
+    // Expected format: requestLogData:pumpIndex:timeframe
+    int firstColon = message.indexOf(':');
+    int secondColon = message.lastIndexOf(':');
+    if (firstColon != -1 && secondColon != -1 && secondColon > firstColon) {
+        int pumpIndex = message.substring(firstColon + 1, secondColon).toInt() - 1; // Adjusting for 0-based index
+        String timeframe = message.substring(secondColon + 1);
+
+        // Prepare and send the log data
+        String logData = prepareLogData(pumpIndex, timeframe);
+        ws.textAll(logData);
+    } else {
+        Serial.println("Invalid requestLogData message format.");
     }
 }
 
 // Send pump statuses to client
-// Send pump statuses to client (Optimized with Local Cache)
 void sendPumpStatuses(AsyncWebSocketClient* client) {
-    // For broadcast path, do not even build the JSON unless a client is writable.
-    if (client == nullptr && !hasWritableWSClient()) {
-        return;
-    }
+    DynamicJsonDocument doc(2048);
+    JsonArray pumps = doc.to<JsonArray>();
 
-    // For one-client init path, only require a connected client.
-    if (client && client->status() != WS_CONNECTED) {
-        return;
-    }
+    for (int i = 0; i < NUM_PUMPS; i++) {
+        JsonObject pump = pumps.createNestedObject();
+        pump["pumpIndex"] = i + 1; // Adjust for 1-based indexing if needed
+        pump["name"] = pumpNames[i]; // Include pump name
+        pump["state"] = pumpStates[i] == PUMP_ON ? "ON" : "OFF";
 
-    static String cachedPayload = "";
-    static bool needsRebuild = true;
-
-    // If client == nullptr, it means this was triggered by g_sendPumpStatus = true
-    // (a state actually changed). Therefore, we MUST rebuild the cache.
-    if (client == nullptr) {
-        needsRebuild = true;
-    }
-
-    // Only do the heavy JSON serialization if the state changed, or cache is empty
-    if (needsRebuild || cachedPayload.length() == 0) {
-        DynamicJsonDocument doc(2048);
-        JsonArray pumps = doc.to<JsonArray>();
-
-        for (int i = 0; i < numPumps; i++) {
-            JsonObject pump = pumps.createNestedObject();
-            pump["pumpIndex"] = i + 1;
-            pump["name"] = pumpNames[i];
-            pump["state"] = pumpStates[i] == PUMP_ON ? "ON" : "OFF";
-
-            String modeStr;
-            switch (pumpModes[i]) {
-                case PUMP_ON:   modeStr = "on"; break;
-                case PUMP_OFF:  modeStr = "off"; break;
-                case PUMP_AUTO: modeStr = "auto"; break;
-                default:        modeStr = "unknown"; break;
-            }
-            pump["mode"] = modeStr;
+        String modeStr;
+        switch (pumpModes[i]) {
+            case PUMP_ON:
+                modeStr = "on";
+                break;
+            case PUMP_OFF:
+                modeStr = "off";
+                break;
+            case PUMP_AUTO:
+                modeStr = "auto";
+                break;
+            default:
+                modeStr = "unknown";
+                break;
         }
-
-        String pumpStatusData;
-        serializeJson(pumps, pumpStatusData);
-        cachedPayload = "PumpStatus:" + pumpStatusData;
-        needsRebuild = false; // Cache is now fresh
+        pump["mode"] = modeStr;
     }
 
-    // Fire the pre-baked string instantly
-    queueWsToClientOrBroadcast(client, cachedPayload, "PumpStatus");
+    String pumpStatusData;
+    serializeJson(pumps, pumpStatusData);
+
+    if (client) {
+        client->text("PumpStatus:" + pumpStatusData);
+    } else {
+        ws.textAll("PumpStatus:" + pumpStatusData);
+    }
 }
 
 // **New: Send Updated Temperatures**
 void sendUpdatedTemperatures() {
+    // This function can be called when changes are detected
     broadcastTemperatures();
 }
 
@@ -1133,15 +647,15 @@ void sendTemperatures(AsyncWebSocketClient* client) {
     tempData += "dhwT:" + String(dhwT) + ",";
     tempData += "PotHeatXinletT:" + String(PotHeatXinletT) + ",";
     tempData += "PotHeatXoutletT:" + String(PotHeatXoutletT) + ",";
+
+    // **New temperature variables**
     tempData += "pt1000Current:" + String(pt1000Current) + ",";
     tempData += "pt1000Average:" + String(pt1000Average) + ",";
-    tempData += "pt1000GoodAge:" + formatReadAgeSeconds(pt1000LastGoodReadMs) + ",";
 
-    // DTemp1 to DTemp13, their averages, and last-good-read ages
+    // DTemp1 to DTemp13 and their averages
     for (int i = 0; i < NUM_SENSORS; i++) {
         tempData += "DTemp" + String(i + 1) + ":" + String(DTemp[i]) + ",";
         tempData += "DTempAverage" + String(i + 1) + ":" + String(DTempAverage[i]) + ",";
-        tempData += "DTempGoodAge" + String(i + 1) + ":" + formatReadAgeSeconds(DTempLastGoodReadMs[i]) + ",";
     }
 
     // Remove the trailing comma
@@ -1149,7 +663,7 @@ void sendTemperatures(AsyncWebSocketClient* client) {
         tempData.remove(tempData.length() - 1);
     }
 
-    queueWsToClientOrBroadcast(client, tempData, "Temperatures");
+    client->text(tempData);
 }
 
 
@@ -1172,406 +686,112 @@ String getFormattedDate() {
 // Send date and time to client
 void sendDateTime(AsyncWebSocketClient* client) {
     String dateTimeData = "DateTime:currentTime:" + getFormattedTime() + ",currentDate:" + getFormattedDate();
-    queueWsToClientOrBroadcast(client, dateTimeData, "DateTime");
+    client->text(dateTimeData);
 }
 
 // Send uptime to client
 void sendUptime(AsyncWebSocketClient* client) {
     String uptimeData = "Uptime:" + uptime_formatter::getUptime();
-    queueWsToClientOrBroadcast(client, uptimeData, "Uptime");
+    client->text(uptimeData);
 }
 
 // Send heap + filesystem stats to client.
 // Uses two WebSocket messages:
-//   "SysStats:heap=...|psram=..."
+//   "Heap:<human-readable string>"
 //   "FSStats:{...json...}"
 void sendSystemStats(AsyncWebSocketClient* client) {
-    String heapStr  = getCachedHeapInternalString(); // cached INTERNAL heap only
-    String psramStr = getCachedPsramString();        // cached PSRAM only
-    String fsJson   = getFSStatsString();            // cached JSON string
-
-    String sysStatsMsg = "SysStats:heap=" + heapStr + "|psram=" + psramStr;
+    String heapStr = getFreeHeapString();   // from FileSystemManager.cpp
+    String fsJson  = getFSStatsString();    // JSON string
 
     if (client) {
-        queueWsClient(client, sysStatsMsg, "SysStats");
-        queueWsClient(client, "FSStats:" + fsJson, "FSStats");
+        client->text("Heap:" + heapStr);
+        client->text("FSStats:" + fsJson);
     } else {
-        queueWsBroadcast(sysStatsMsg, "SysStats");
-        queueWsBroadcast("FSStats:" + fsJson, "FSStats");
+        ws.textAll("Heap:" + heapStr);
+        ws.textAll("FSStats:" + fsJson);
     }
 }
 
-
-
-// ===== The Gatekeeper: Single WebSocket Transmitter =====
-void TaskWebSocketTransmitter(void* pvParameters) {
-    (void)pvParameters;
-
-    esp_task_wdt_add(NULL);
-
-        if (g_tempWsPayloadMutex == NULL) {
-        g_tempWsPayloadMutex = xSemaphoreCreateMutex();
-    }
-    if (!ensureQueuedWsMutex()) {
-        LOG_ERR("[WS] Failed to create outbound queue mutex\n");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint32_t lastFsMs        = millis();
-    uint32_t lastFastMs      = millis();
-    uint32_t lastDateTimeMs  = millis();
-
-    String lastHeapStr;
-    String lastPsramStr;
-
-    for (;;) {
-        esp_task_wdt_reset();
-
-        bool didWork = false;
-        const uint32_t now = millis();
-
-        // ------------------------------------------------------------
-        // 1. THE APP NAP DEFENSE (Gatekeeper)
-        // ------------------------------------------------------------
-        bool buffersReady = false;
-        
-        if (ws.count() > 0) {
-            if (ws.availableForWriteAll()) {
-                buffersReady = true;
-            } else {
-                // Clients are connected, but the AsyncTCP buffer is choked!
-                // This happens when Safari goes into "App Nap" and stops ACKing packets.
-                // CRITICAL FIX: We MUST NOT forcefully call ws.cleanupClients() here. 
-                // Deleting clients from a background FreeRTOS task while the LwIP thread 
-                // is active causes a Use-After-Free memory corruption and crashes the W5500.
-            }
-        }
-
-        // Track whether we currently have any writable clients
-        if (hasWritableWSClient()) {
-            g_wsLastWritableMs = now;
-        }
-
-        // If all clients are clogged/stale OR the buffers are choked, skip sending
-        if (wsInCooldown() || !buffersReady) {
-            g_sendDateTime = false;  // drop accumulated time spam during cooldown
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue; 
-        }
-
-        // ------------------------------------------------------------
-        // Priority 1: immediate state changes
-        // Service at most ONE queued event per loop, then pace.
-        // ------------------------------------------------------------
-
-        if (g_sendPumpStatus) {
-            g_sendPumpStatus = false;
-            sendPumpStatuses(nullptr);
-            didWork = true;
-        }
-        else if (g_sendAlarmState) {
-            g_sendAlarmState = false;
-            broadcastAlarmStateOverWebSocket();
-            didWork = true;
-        }
-        else if (processInitAllStep(now)) {
-            didWork = true;
-        }
-        else if (hasQueuedWsMessages()) {
-            QueuedWsMessage queuedItem;
-
-            if (dequeueWsMessage(queuedItem)) {
-                if (queuedItem.clientId == 0) {
-                    broadcastMessageOverWebSocket(queuedItem.message, queuedItem.messageType);
-                    didWork = true;
-                } else {
-                    AsyncWebSocketClient* target = findWsClientById(queuedItem.clientId);
-
-                    if (target == nullptr) {
-                        LOG_CAT(DBG_WEB,
-                                "[WS] Dropping queued one-client message; client id=%u no longer connected. type=%s\n",
-                                (unsigned)queuedItem.clientId,
-                                queuedItem.messageType.c_str());
-                    } else if (target->queueIsFull() || !target->canSend()) {
-                        if (queuedItem.retryCount < 3) {
-                            enqueueWsMessage(queuedItem.clientId,
-                                             queuedItem.message,
-                                             queuedItem.messageType,
-                                             queuedItem.retryCount + 1);
-                            didWork = true;  // enforce pacing even on retry
-                        } else {
-                            LOG_CAT(DBG_WEB,
-                                    "[WS] Dropping queued one-client message after retries. id=%u type=%s len=%u\n",
-                                    (unsigned)queuedItem.clientId,
-                                    queuedItem.messageType.c_str(),
-                                    (unsigned)queuedItem.message.length());
-                        }
-                    } else {
-                        target->text(queuedItem.message);
-                        didWork = true;
-                    }
-                }
-            }
-        }
-        else if (g_sendConfig) {
-            g_sendConfig = false;
-            sendConfigurationValues(nullptr);
-            didWork = true;
-        }
-        else if (g_sendTimeConfig) {
-            g_sendTimeConfig = false;
-            sendTimeConfig(nullptr);
-            didWork = true;
-        }
-        else if (g_sendTemperatures) {
-            g_sendTemperatures = false;
-
-            String payload;
-            if (g_tempWsPayloadMutex &&
-                xSemaphoreTake(g_tempWsPayloadMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                payload = g_tempWsPayload;
-                xSemaphoreGive(g_tempWsPayloadMutex);
-            }
-
-            if (payload.length() > 0) {
-                broadcastMessageOverWebSocket(payload, "Temperatures");
-                didWork = true;
-            }
-        }
-        // Rate-limit DateTime to 5s max, even if RTC task flags it every second
-        else if (g_sendDateTime && (uint32_t)(now - lastDateTimeMs) >= 5000UL) {
-            g_sendDateTime = false;
-            lastDateTimeMs = now;
-            sendDateTime(nullptr);
-            didWork = true;
-        }
-        else if (g_sendDateTime) {
-            // Drop extra queued DateTime ticks instead of piling them up
-            g_sendDateTime = false;
-        }
-
-        // ------------------------------------------------------------
-        // Priority 2: periodic stats
-        // Only run if no higher-priority work was sent this iteration.
-        // (No need to check hasWritableWSClient() here since buffersReady checked it above)
-        // ------------------------------------------------------------
-
-                if (!didWork && (uint32_t)(now - lastFastMs) >= 5000UL) {
-            lastFastMs = now;
-
-            String heapStr  = getCachedHeapInternalString();
-            String psramStr = getCachedPsramString();
-
-            if (heapStr != lastHeapStr || psramStr != lastPsramStr) {
-                lastHeapStr  = heapStr;
-                lastPsramStr = psramStr;
-
-                String msg = "SysStats:heap=" + heapStr + "|psram=" + psramStr;
-                broadcastMessageOverWebSocket(msg, "SysStats");
-                didWork = true;
-            }
-        }
-
-        if (!didWork && (uint32_t)(now - lastFsMs) >= 30000UL) {
-            lastFsMs = now;
-
-            String fsMsg = "FSStats:" + getFSStatsString();
-            broadcastMessageOverWebSocket(fsMsg, "FSStats");
-            didWork = true;
-        }
-
-        
-
-        if (didWork) {
-            // YIELD: Increase pacing slightly and ensure the Idle task/Network stack 
-            // can run between every single WebSocket frame sent.
-            vTaskDelay(pdMS_TO_TICKS(50)); 
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-}
-
-
-static void appendTemperatureSourceMapItem(String& out,
-                                           bool& first,
-                                           const char* systemTemp) {
-  if (!systemTemp) return;
-
-  String sourceName = "Unassigned";
-  String avgKey = "";
-  String rawKey = "";
-  String goodKey = "";
-
-  int dsSlot = findDs18B20AssignmentBySystemTemp(systemTemp);
-  if (dsSlot >= 0 && dsSlot < DS18B20_ASSIGNMENT_COUNT) {
-    sourceName = "DTemp" + String(dsSlot + 1);
-    avgKey = "DTempAverage" + String(dsSlot + 1);
-    rawKey = "DTemp" + String(dsSlot + 1);
-    goodKey = "DTempGoodAge" + String(dsSlot + 1);
-  } else if (strcmp(systemTemp, "panelT") == 0) {
-    // Collector manifold defaults to PT1000 unless explicitly mapped to DS18B20.
-    sourceName = "PT1000";
-    avgKey = "pt1000Average";
-    rawKey = "pt1000Current";
-    goodKey = "pt1000GoodAge";
-  }
-
-  if (!first) out += ",";
-  first = false;
-
-  out += systemTemp;
-  out += "|";
-  out += sourceName;
-  out += "|";
-  out += avgKey;
-  out += "|";
-  out += rawKey;
-  out += "|";
-  out += goodKey;
-}
-
-void sendTemperatureSourceMap(AsyncWebSocketClient* client) {
-  String map = "TempSourceMap:";
-  bool first = true;
-
-  appendTemperatureSourceMapItem(map, first, "outsideT");
-  appendTemperatureSourceMapItem(map, first, "storageT");
-  appendTemperatureSourceMapItem(map, first, "panelT");
-  appendTemperatureSourceMapItem(map, first, "CSupplyT");
-  appendTemperatureSourceMapItem(map, first, "CreturnT");
-  appendTemperatureSourceMapItem(map, first, "supplyT");
-  appendTemperatureSourceMapItem(map, first, "CircReturnT");
-  appendTemperatureSourceMapItem(map, first, "DhwSupplyT");
-  appendTemperatureSourceMapItem(map, first, "DhwReturnT");
-  appendTemperatureSourceMapItem(map, first, "HeatingSupplyT");
-  appendTemperatureSourceMapItem(map, first, "HeatingReturnT");
-  appendTemperatureSourceMapItem(map, first, "PotHeatXinletT");
-  appendTemperatureSourceMapItem(map, first, "PotHeatXoutletT");
-  appendTemperatureSourceMapItem(map, first, "dhwT");
-
-  queueWsToClientOrBroadcast(client, map, "TempSourceMap");
-}
 
 void sendAllData(AsyncWebSocketClient* client) {
-  if (client && client->status() != WS_CONNECTED) {
-    LOG_CAT(DBG_WEB, "[WS] Client not connected, skipping sendAllData.\n");
-    return;
-  }
+if (client && client->queueIsFull()) {
+Serial.println("[Warning] Client queue is full, skipping data transmission.");
+return;
+}
+sendPumpStatuses(client);
+// Add mutex and validation to temperature broadcasting
+if (xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
+String tempData = "Temperatures:";
+// Helper lambda to validate temperature
 
-  sendPumpStatuses(client);
-  sendTemperatureSourceMap(client);
 
-  if (xSemaphoreTake(temperatureMutex, portMAX_DELAY)) {
-    String tempData = "Temperatures:";
+// Build the temperature message
+tempData += "panelT:" + validateTemp(panelT);
+tempData += ",CSupplyT:" + validateTemp(CSupplyT);
+tempData += ",storageT:" + validateTemp(storageT);
+tempData += ",outsideT:" + validateTemp(outsideT);
+tempData += ",CircReturnT:" + validateTemp(CircReturnT);
+tempData += ",supplyT:" + validateTemp(supplyT);
+tempData += ",CreturnT:" + validateTemp(CreturnT);
+tempData += ",DhwSupplyT:" + validateTemp(DhwSupplyT);
+tempData += ",DhwReturnT:" + validateTemp(DhwReturnT);
+tempData += ",HeatingSupplyT:" + validateTemp(HeatingSupplyT);
+tempData += ",HeatingReturnT:" + validateTemp(HeatingReturnT);
+tempData += ",dhwT:" + validateTemp(dhwT);
+tempData += ",PotHeatXinletT:" + validateTemp(PotHeatXinletT);
+tempData += ",PotHeatXoutletT:" + validateTemp(PotHeatXoutletT);
+// Include new temperatures
+tempData += ",pt1000Current:" + validateTemp(pt1000Current);
+tempData += ",pt1000Average:" + validateTemp(pt1000Average);
+// Include DTemp1 to DTemp13 and their averages
+for (int i = 0; i < NUM_SENSORS; i++) {
+tempData += ",DTemp" + String(i + 1) + ":" + validateTemp(DTemp[i]);
+tempData += ",DTempAverage" + String(i + 1) + ":" + validateTemp(DTempAverage[i]);
+}
+// Add FS and heap stats inline (so front-end can parse them)
+// JSON returned by getFSStatsString() - no spaces expected
+String fsJson = getFSStatsString(); // {"usedBytes":...,"totalBytes":...,...}
+tempData += ",fsStats:" + fsJson;
+// Add heap info
+size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+size_t totalHeap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+float pctHeapUsed = (totalHeap ? ((float)(totalHeap - freeHeap) / (float)totalHeap) * 100.0f : 0.0f);
+String heapJson =
+  "{\"freeBytes\":" + String(freeHeap) +
+  ",\"totalBytes\":" + String(totalHeap) +
+  ",\"pctUsed\":" + String(pctHeapUsed, 1) + "}";
 
-    // Build the temperature message
-    tempData += "panelT:" + validateTemp(panelT);
-    tempData += ",CSupplyT:" + validateTemp(CSupplyT);
-    tempData += ",storageT:" + validateTemp(storageT);
-    tempData += ",outsideT:" + validateTemp(outsideT);
-    tempData += ",CircReturnT:" + validateTemp(CircReturnT);
-    tempData += ",supplyT:" + validateTemp(supplyT);
-    tempData += ",CreturnT:" + validateTemp(CreturnT);
-    tempData += ",DhwSupplyT:" + validateTemp(DhwSupplyT);
-    tempData += ",DhwReturnT:" + validateTemp(DhwReturnT);
-    tempData += ",HeatingSupplyT:" + validateTemp(HeatingSupplyT);
-    tempData += ",HeatingReturnT:" + validateTemp(HeatingReturnT);
-    tempData += ",dhwT:" + validateTemp(dhwT);
-    tempData += ",PotHeatXinletT:" + validateTemp(PotHeatXinletT);
-    tempData += ",PotHeatXoutletT:" + validateTemp(PotHeatXoutletT);
-    tempData += ",pt1000Current:" + validateTemp(pt1000Current);
-    tempData += ",pt1000Average:" + validateTemp(pt1000Average);
-    tempData += ",pt1000GoodAge:" + formatReadAgeSeconds(pt1000LastGoodReadMs);
-
-    for (int i = 0; i < NUM_SENSORS; i++) {
-      tempData += ",DTemp" + String(i + 1) + ":" + validateTemp(DTemp[i]);
-      tempData += ",DTempAverage" + String(i + 1) + ":" + validateTemp(DTempAverage[i]);
-      tempData += ",DTempGoodAge" + String(i + 1) + ":" + formatReadAgeSeconds(DTempLastGoodReadMs[i]);
-    }
-
-    // IMPORTANT:
-    // Do NOT do live Heap/PSRAM reads here.
-    // Those values are now sent separately through the cached SysStats path.
-    tempData.replace("Temperatures:,", "Temperatures:");
-
-    if (tempData.length() > strlen("Temperatures:")) {
-      queueWsToClientOrBroadcast(client, tempData, "Temperatures");
-    } else {
-      LOG_CAT(DBG_WEB, "[Warning] No valid temperature data to broadcast.\n");
-    }
-
-    xSemaphoreGive(temperatureMutex);
-  } else {
-    LOG_CAT(DBG_WEB, "[WS] Failed to take temperatureMutex in sendAllData.\n");
-  }
-
-  sendDateTime(client);
-  sendUptime(client);
+tempData += ",heapStats:" + heapJson;
+// Remove any unintended leading spaces or commas
+tempData.replace("Temperatures:,", "Temperatures:");
+// Check if any temperature is valid
+if (tempData.length() > strlen("Temperatures:")) {
+client->text(tempData);
+} else {
+Serial.println("[Warning] No valid temperature data to broadcast.");
+}
+// Release the mutex after operation
+xSemaphoreGive(temperatureMutex);
+} else {
+Serial.println("Failed to take temperatureMutex in sendAllData.");
+}
+sendDateTime(client);
+sendUptime(client);
 }
 
 
 
 
-
-
+// Broadcast a message over WebSocket
 void broadcastMessageOverWebSocket(const String& message, const String& messageType) {
-  if (message.length() == 0) {
-    LOG_ERR("[Error] Attempted to send zero-length WebSocket message: %s\n", messageType.c_str());
-    return;
-  }
-
-  size_t sent = 0;
-  size_t skipped = 0;
-  size_t connected = 0;
-
-  for (auto &client : ws.getClients()) {
-    if (client.status() != WS_CONNECTED) {
-      skipped++;
-      continue;
-    }
-
-    connected++;
-
-    if (client.queueIsFull() || !client.canSend()) {
-      skipped++;
-      continue;
-    }
-
-    bool success = client.text(message);
-
-    if (success) {
-      sent++;
+    if (message.length() > 0) {
+        ws.textAll(message);
     } else {
-      skipped++;
+        Serial.println("[Error] Attempted to send zero-length WebSocket message: " + messageType);
     }
-  }
-
-  if (sent > 0) {
-    g_wsLastWritableMs = millis();
-    return;
-  }
-
-  if (connected > 0 && skipped >= connected) {
-    g_wsBackpressureUntilMs = millis() + 5000UL;
-
-    LOG_CAT(DBG_WEB,
-            "[WS] broadcastMessageOverWebSocket: all clients skipped (queue full / cannot send). type=%s len=%u\n",
-            messageType.c_str(), (unsigned)message.length());
-  }
 }
-
-
-
-
-
-
-
-
 
 // Parse date and time from log file
-
 DateTime parseDateTimeFromLogFile(const String& datetimeStr) {
     String datetimeStrTrim = datetimeStr;
     datetimeStrTrim.trim();
@@ -1587,61 +807,34 @@ DateTime parseDateTimeFromLogFile(const String& datetimeStr) {
 
 // Calculate total log runtime
 unsigned long calculateTotalLogRuntime(const String& logFilename) {
-
-    if (!takeFsMutex(pdMS_TO_TICKS(2000))) {
-    LOG_ERR("[FS] calculateTotalLogRuntime: FS mutex timeout\n");
-    return 0;
-  }
-
-
-  if (!LittleFS.exists(logFilename)) {
-    giveFsMutex();
-    return 0;
-  }
-
-  File logFile = LittleFS.open(logFilename, "r");
+    File logFile = openLogFile(logFilename, "r");
     if (!logFile) {
-    LOG_ERR("[FS] Failed to open: %s\n", logFilename.c_str());
-    giveFsMutex();
-    return 0;
-  }
-
-
-  unsigned long totalRuntime = 0;
-  DateTime lastStartTime;
-  bool isPumpRunning = false;
-
-  uint32_t lineCount = 0;
-  while (logFile.available()) {
-    String line = logFile.readStringUntil('\n');
-    line.trim();
-
-    if (line.startsWith("START")) {
-      lastStartTime = parseDateTimeFromLogFile(line.substring(6));
-      isPumpRunning = true;
-    } else if (line.startsWith("STOP")) {
-      DateTime stopTime = parseDateTimeFromLogFile(line.substring(5));
-      if (isPumpRunning) {
-        totalRuntime += (stopTime.unixtime() - lastStartTime.unixtime());
-        isPumpRunning = false;
-      }
+        // Error message already handled in openLogFile
+        return 0;
     }
-
-    if ((++lineCount % 50) == 0) (void)0;
-  }
-
-  logFile.close();
-  giveFsMutex();
-
-  // If still running, add runtime up to now (no FS needed)
-  if (isPumpRunning) {
-    DateTime currentTime = getCurrentTimeAtomic();
-    totalRuntime += (currentTime.unixtime() - lastStartTime.unixtime());
-  }
-
-  return totalRuntime;
+    unsigned long totalRuntime = 0;
+    DateTime lastStartTime;
+    bool isPumpRunning = false;
+    while (logFile.available()) {
+        String line = logFile.readStringUntil('\n');
+        if (line.startsWith("START")) {
+            lastStartTime = parseDateTimeFromLogFile(line.substring(6));
+            isPumpRunning = true;
+        } else if (line.startsWith("STOP")) {
+            DateTime stopTime = parseDateTimeFromLogFile(line.substring(5));
+            if (isPumpRunning) {
+                totalRuntime += (stopTime.unixtime() - lastStartTime.unixtime());
+                isPumpRunning = false;
+            }
+        }
+    }
+    if (isPumpRunning) {
+        DateTime currentTime = getCurrentTimeAtomic();
+        totalRuntime += (currentTime.unixtime() - lastStartTime.unixtime());
+    }
+    logFile.close();
+    return totalRuntime;
 }
-
 
 // Prepare log data for a given pump and timeframe
 String prepareLogData(int pumpIndex, String timeframe) {
@@ -1662,11 +855,10 @@ String prepareLogData(int pumpIndex, String timeframe) {
         runtimeSeconds = aggregatePreviousMonthlyLogsReport(pumpIndex, currentTime);
     } else if (timeframe == "prevYear" || timeframe == "lastYear") {
         runtimeSeconds = aggregatePreviousYearlyLogsReport(pumpIndex, currentTime);
-        } else {
+    } else {
         // Handle invalid timeframe
-        LOG_CAT(DBG_PUMP_RUN_TIME_UI, "Invalid timeframe requested: %s\n", timeframe.c_str());
+        Serial.println("Invalid timeframe requested: " + timeframe);
     }
-
     return String(runtimeSeconds);
 }
 
@@ -1693,335 +885,255 @@ unsigned long aggregateDailyLogsReport(int pumpIndex, DateTime currentTime) {
 
 // Function to aggregate previous day's logs
 unsigned long aggregatePreviousDailyLogsReport(int pumpIndex, DateTime currentTime) {
-
-  String dailyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";
-  unsigned long prevDayRuntimeSeconds = 0;
-
-  if (!takeFsMutex(pdMS_TO_TICKS(2000))) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] month: FS mutex timeout\n");
-    return 0;
-
-  }
-
-  if (!LittleFS.exists(dailyLogFilename)) {
-    giveFsMutex();
-    return 0;
-  }
-
-  File dailyLogFile = LittleFS.open(dailyLogFilename, "r");
-  if (!dailyLogFile) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] Failed to open: %s\n", dailyLogFilename.c_str());
-    giveFsMutex();
-
-    return 0;
-  }
-
-  DateTime prevDay = currentTime - TimeSpan(1, 0, 0, 0);
-  String prevDayStr = String(prevDay.year()) + "-" +
-                      (prevDay.month() < 10 ? "0" : "") + String(prevDay.month()) + "-" +
-                      (prevDay.day() < 10 ? "0" : "") + String(prevDay.day());
-
-  while (dailyLogFile.available()) {
-    String line = dailyLogFile.readStringUntil('\n');
-    line.trim();
-
-    int spaceIndex = line.indexOf(' ');
-    if (spaceIndex != -1) {
-      String datePart = line.substring(0, spaceIndex);
-      if (datePart == prevDayStr) {
-        int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
-        int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
-        if (runtimeStartIndex != -1 && secondsIndex != -1) {
-          String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
-          runtimeStr.trim();
-          prevDayRuntimeSeconds += runtimeStr.toInt();
-        }
-      }
+    String dailyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";  // Updated path
+    File dailyLogFile = openLogFile(dailyLogFilename, "r");
+    unsigned long prevDayRuntimeSeconds = 0;
+    if (!dailyLogFile) {
+        // Error message already handled in openLogFile
+        return prevDayRuntimeSeconds;
     }
-  }
 
-  dailyLogFile.close();
-  giveFsMutex();
-  return prevDayRuntimeSeconds;
+    // Get the previous day's date
+    DateTime prevDay = currentTime - TimeSpan(1, 0, 0, 0);
+    String prevDayStr = String(prevDay.year()) + "-" +
+                        (prevDay.month() < 10 ? "0" : "") + String(prevDay.month()) + "-" +
+                        (prevDay.day() < 10 ? "0" : "") + String(prevDay.day());
+
+    while (dailyLogFile.available()) {
+        String line = dailyLogFile.readStringUntil('\n');
+        line.trim(); // Remove any leading/trailing whitespace
+
+        // Extract date and runtime
+        int spaceIndex = line.indexOf(' ');
+        if (spaceIndex != -1) {
+            String datePart = line.substring(0, spaceIndex);
+            if (datePart == prevDayStr) {
+                // Find "Total Runtime:" and extract the runtime value
+                int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
+                int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
+                if (runtimeStartIndex != -1 && secondsIndex != -1) {
+                    String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
+                    runtimeStr.trim();
+                    unsigned long runtime = runtimeStr.toInt();
+                    prevDayRuntimeSeconds += runtime;
+                }
+            }
+        }
+    }
+    dailyLogFile.close();
+    return prevDayRuntimeSeconds;
 }
-
 
 // Function to aggregate monthly logs
 unsigned long aggregateMonthlyLogsReport(int pumpIndex, DateTime currentTime) {
+    String dailyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";  // Updated path
+    File dailyLogFile = openLogFile(dailyLogFilename, "r");
+    if (!dailyLogFile) {
+        // Error message already handled in openLogFile
+        return 0; // Return 0 seconds if the file is not found
+    }
 
-  String dailyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Daily.txt";
-  unsigned long totalRuntimeSeconds = 0;
+    unsigned long totalRuntimeSeconds = 0;
 
-  // Read Daily.txt under FS lock
-  if (!takeFsMutex(pdMS_TO_TICKS(2000))) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] month: FS mutex timeout\n");
-    return 0;
+    // Create a buffer to hold the current month as a string (e.g., "2024-09")
+    char currentMonth[8];
+    snprintf(currentMonth, sizeof(currentMonth), "%04d-%02d", currentTime.year(), currentTime.month());
 
-  }
-
-  if (LittleFS.exists(dailyLogFilename)) {
-    File dailyLogFile = LittleFS.open(dailyLogFilename, "r");
-    if (dailyLogFile) {
-      char currentMonth[8];
-      snprintf(currentMonth, sizeof(currentMonth), "%04d-%02d", currentTime.year(), currentTime.month());
-
-      while (dailyLogFile.available()) {
+    // Process each line in the daily log file
+    while (dailyLogFile.available()) {
         String line = dailyLogFile.readStringUntil('\n');
-        line.trim();
+        line.trim(); // Remove leading/trailing whitespace
 
+        // Find the date and runtime in the line
         int dateSeparatorIndex = line.indexOf(' ');
         if (dateSeparatorIndex != -1) {
-          String date = line.substring(0, dateSeparatorIndex);
-          if (date.startsWith(currentMonth)) {
-            int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
-            int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
-            if (runtimeStartIndex != -1 && secondsIndex != -1) {
-              String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
-              runtimeStr.trim();
-              totalRuntimeSeconds += runtimeStr.toInt();
+            String date = line.substring(0, dateSeparatorIndex);
+            // Check if the log entry belongs to the current month
+            if (date.startsWith(currentMonth)) {
+                // Extract the runtime for this entry
+                int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
+                int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
+                if (runtimeStartIndex != -1 && secondsIndex != -1) {
+                    String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
+                    runtimeStr.trim();
+                    totalRuntimeSeconds += runtimeStr.toInt();
+                }
             }
-          }
         }
-      }
-      dailyLogFile.close();
     }
-  }
+    dailyLogFile.close();
 
-  giveFsMutex();
+    // Add today's runtime
+    unsigned long todayRuntime = aggregateDailyLogsReport(pumpIndex, currentTime);
+    totalRuntimeSeconds += todayRuntime;
 
-  // Add today runtime (separate FS operation inside calculateTotalLogRuntime)
-  totalRuntimeSeconds += aggregateDailyLogsReport(pumpIndex, currentTime);
-  return totalRuntimeSeconds;
+    return totalRuntimeSeconds;
 }
-
 
 // Function to aggregate previous month's logs
 unsigned long aggregatePreviousMonthlyLogsReport(int pumpIndex, DateTime currentTime) {
-
-  String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";
-  unsigned long prevMonthRuntimeSeconds = 0;
-
-  if (!takeFsMutex(pdMS_TO_TICKS(2000))) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] prevmonth: FS mutex timeout\n");
-    return 0;
-
-  }
-
-  if (!LittleFS.exists(monthlyLogFilename)) {
-    giveFsMutex();
-    return 0;
-  }
-
-  File monthlyLogFile = LittleFS.open(monthlyLogFilename, "r");
-  if (!monthlyLogFile) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] Failed to open: %s\n", monthlyLogFilename.c_str());
-    giveFsMutex();
-    return 0;
-  }
-
-  int prevMonth = currentTime.month() - 1;
-  int prevYear  = currentTime.year();
-  if (prevMonth == 0) { prevMonth = 12; prevYear -= 1; }
-
-  char prevMonthStr[8];
-  snprintf(prevMonthStr, sizeof(prevMonthStr), "%04d-%02d", prevYear, prevMonth);
-
-  while (monthlyLogFile.available()) {
-    String line = monthlyLogFile.readStringUntil('\n');
-    line.trim();
-
-    int s = line.indexOf(' ');
-    if (s != -1) {
-      String date = line.substring(0, s);
-      if (date == prevMonthStr) {
-        int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
-        int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
-        if (runtimeStartIndex != -1 && secondsIndex != -1) {
-          String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
-          runtimeStr.trim();
-          prevMonthRuntimeSeconds += runtimeStr.toInt();
-        }
-      }
+    String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";  // Updated path
+    File monthlyLogFile = openLogFile(monthlyLogFilename, "r");
+    unsigned long prevMonthRuntimeSeconds = 0;
+    if (!monthlyLogFile) {
+        // Error message already handled in openLogFile
+        return prevMonthRuntimeSeconds;
     }
-  }
 
-  monthlyLogFile.close();
-  giveFsMutex();
-  return prevMonthRuntimeSeconds;
+    // Get the previous month string (e.g., "2023-08")
+    int prevMonth = currentTime.month() - 1;
+    int prevYear = currentTime.year();
+    if (prevMonth == 0) {
+        prevMonth = 12;
+        prevYear -= 1;
+    }
+    char prevMonthStr[8];
+    snprintf(prevMonthStr, sizeof(prevMonthStr), "%04d-%02d", prevYear, prevMonth);
+
+    // Read all lines and aggregate runtime values for the previous month
+    while (monthlyLogFile.available()) {
+        String line = monthlyLogFile.readStringUntil('\n');
+        line.trim();
+        int s = line.indexOf(' ');
+        if (s != -1) {
+            String date = line.substring(0, s);
+            if (date == prevMonthStr) {  // Check for exact match
+                int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
+                int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
+                if (runtimeStartIndex != -1 && secondsIndex != -1) {
+                    String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
+                    runtimeStr.trim();
+                    prevMonthRuntimeSeconds += runtimeStr.toInt();
+                }
+            }
+        }
+    }
+    monthlyLogFile.close();
+    return prevMonthRuntimeSeconds;
 }
-
 
 // Function to aggregate yearly logs
 unsigned long aggregateYearlyLogsReport(int pumpIndex, DateTime currentTime) {
-
-  unsigned long totalRuntimeSeconds = aggregateMonthlyLogsReport(pumpIndex, currentTime);
-
-  String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";
-
-  if (!takeFsMutex(pdMS_TO_TICKS(2000))) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] year: FS mutex timeout\n");
-    return totalRuntimeSeconds;
-
-  }
-
-  if (!LittleFS.exists(monthlyLogFilename)) {
-    giveFsMutex();
-    return totalRuntimeSeconds;
-  }
-
-  File monthlyLogFile = LittleFS.open(monthlyLogFilename, "r");
-  if (!monthlyLogFile) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] Failed to open: %s\n", monthlyLogFilename.c_str());
-    giveFsMutex();
-
-    return totalRuntimeSeconds;
-  }
-
-  char currentYear[5];
-  snprintf(currentYear, sizeof(currentYear), "%04d", currentTime.year());
-
-  while (monthlyLogFile.available()) {
-    String line = monthlyLogFile.readStringUntil('\n');
-    line.trim();
-
-    int s = line.indexOf(' ');
-    if (s != -1) {
-      String date = line.substring(0, s);
-      if (date.startsWith(currentYear)) {
-        int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
-        int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
-        if (runtimeStartIndex != -1 && secondsIndex != -1) {
-          String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
-          runtimeStr.trim();
-          totalRuntimeSeconds += runtimeStr.toInt();
-        }
-      }
+    unsigned long monthRuntimeSeconds = aggregateMonthlyLogsReport(pumpIndex, currentTime);
+    String monthlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Monthly.txt";  // Updated path
+    File monthlyLogFile = openLogFile(monthlyLogFilename, "r");
+    unsigned long totalRuntimeSeconds = monthRuntimeSeconds; // Start with the current month's runtime
+    if (!monthlyLogFile) {
+        // Error message already handled in openLogFile
+        return totalRuntimeSeconds;
     }
-  }
 
-  monthlyLogFile.close();
-  giveFsMutex();
-  return totalRuntimeSeconds;
+    // Current year as a string (e.g., "2024")
+    char currentYear[5];
+    snprintf(currentYear, sizeof(currentYear), "%04d", currentTime.year());
+
+    // Read all lines and aggregate runtime values for the current year
+    while (monthlyLogFile.available()) {
+        String line = monthlyLogFile.readStringUntil('\n');
+        line.trim();
+        int s = line.indexOf(' ');
+        if (s != -1) {
+            String date = line.substring(0, s);
+            if (date.startsWith(currentYear)) { // Check if the log entry belongs to the current year
+                int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
+                int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
+                if (runtimeStartIndex != -1 && secondsIndex != -1) {
+                    String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
+                    runtimeStr.trim();
+                    totalRuntimeSeconds += runtimeStr.toInt();
+                }
+            }
+        }
+    }
+    monthlyLogFile.close();
+    return totalRuntimeSeconds;
 }
-
 
 // Function to aggregate previous year's logs
 unsigned long aggregatePreviousYearlyLogsReport(int pumpIndex, DateTime currentTime) {
-
-  String yearlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Yearly.txt";
-  unsigned long prevYearRuntimeSeconds = 0;
-
-  if (!takeFsMutex(pdMS_TO_TICKS(2000))) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] prevYear: FS mutex timeout\n");
-    return 0;
-
-  }
-
-  if (!LittleFS.exists(yearlyLogFilename)) {
-    giveFsMutex();
-    return 0;
-  }
-
-  File yearlyLogFile = LittleFS.open(yearlyLogFilename, "r");
-  if (!yearlyLogFile) {
-    LOG_CAT(DBG_PUMP_RUN_TIME_UI, "[FS] Failed to open: %s\n", yearlyLogFilename.c_str());
-    giveFsMutex();
-
-    return 0;
-  }
-
-  int prevYear = currentTime.year() - 1;
-  char prevYearStr[5];
-  snprintf(prevYearStr, sizeof(prevYearStr), "%04d", prevYear);
-
-  while (yearlyLogFile.available()) {
-    String line = yearlyLogFile.readStringUntil('\n');
-    line.trim();
-
-    int s = line.indexOf(' ');
-    if (s != -1) {
-      String date = line.substring(0, s);
-      if (date == prevYearStr) {
-        int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
-        int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
-        if (runtimeStartIndex != -1 && secondsIndex != -1) {
-          String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
-          runtimeStr.trim();
-          prevYearRuntimeSeconds += runtimeStr.toInt();
-        }
-      }
+    String yearlyLogFilename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Yearly.txt";  // Updated path
+    File yearlyLogFile = openLogFile(yearlyLogFilename, "r");
+    unsigned long prevYearRuntimeSeconds = 0;
+    if (!yearlyLogFile) {
+        // Error message already handled in openLogFile
+        return prevYearRuntimeSeconds;
     }
-  }
 
-  yearlyLogFile.close();
-  giveFsMutex();
-  return prevYearRuntimeSeconds;
+    // Get the previous year string (e.g., "2023")
+    int prevYear = currentTime.year() - 1;
+    char prevYearStr[5];
+    snprintf(prevYearStr, sizeof(prevYearStr), "%04d", prevYear);
+
+    // Read all lines and aggregate runtime values for the previous year
+    while (yearlyLogFile.available()) {
+        String line = yearlyLogFile.readStringUntil('\n');
+        line.trim();
+        int s = line.indexOf(' ');
+        if (s != -1) {
+            String date = line.substring(0, s);
+            if (date == prevYearStr) {
+                int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
+                int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
+                if (runtimeStartIndex != -1 && secondsIndex != -1) {
+                    String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
+                    runtimeStr.trim();
+                    prevYearRuntimeSeconds += runtimeStr.toInt();
+                }
+            }
+        }
+    }
+    yearlyLogFile.close();
+    return prevYearRuntimeSeconds;
 }
-
 
 // Function to aggregate decade logs
 unsigned long aggregateDecadeLogsReport(int pumpIndex, DateTime currentTime) {
-  (void)currentTime; // not used right now
-  unsigned long runtime = 0;
+    unsigned long runtime = 0;
+    String filename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Yearly.txt";  // Updated path
 
-  String filename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Yearly.txt";
-
-  // ✅ Never block forever on FS mutex (tgz can hold it for a long time)
-    if (!takeFileSystemMutexWithRetry("aggregateDecadeLogsReport",
-                                    pdMS_TO_TICKS(200), 10)) {
-    LOG_CAT(DBG_PUMPLOG, "[PumpLogs] aggregateDecadeLogsReport: FS busy, skipping\n");
-    return 0;
-  }
-
-
-  // Ensure dir exists
-  if (!LittleFS.exists("/Pump_Logs")) {
-    LittleFS.mkdir("/Pump_Logs");
-  }
-
-    if (!LittleFS.exists(filename)) {
-    xSemaphoreGive(fileSystemMutex);
-    return 0;
-  }
-
-  File file = LittleFS.open(filename, "r");
-  if (!file || file.size() == 0) {
-    if (file) file.close();
-    LOG_CAT(DBG_FS, "Invalid or empty file: %s\n", filename.c_str());
-    xSemaphoreGive(fileSystemMutex);
-    return 0;
-  }
-
-  int lineCount = 0;
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    line.trim();
-    if (line.isEmpty()) continue;
-
-    // ✅ Correct parsing (your old +15 logic made runtimeStartIndex never -1)
-    int idx = line.indexOf("Total Runtime: ");
-    if (idx >= 0) {
-      int runtimeStartIndex = idx + 15;
-      int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
-      if (secondsIndex > runtimeStartIndex) {
-        String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
-        runtimeStr.trim();
-        runtime += runtimeStr.toInt();
+    if (xSemaphoreTake(fileSystemMutex, portMAX_DELAY)) {
+      if (!LittleFS.exists("/Pump_Logs")) {  // CHANGE: Create dir if missing
+        LittleFS.mkdir("/Pump_Logs");
       }
-    }
 
-    lineCount++;
-    if ((lineCount % 200) == 0) {
-vTaskDelay(1);
-    }
-  }
+      if (!LittleFS.exists(filename)) {
+          Serial.println("Skipping missing file: " + filename);
+          xSemaphoreGive(fileSystemMutex);
+          return 0;
+      }
 
-  file.close();
-  xSemaphoreGive(fileSystemMutex);
-  return runtime;
+      File file = LittleFS.open(filename, "r");
+      if (!file || file.size() == 0) {
+          if (file) file.close();
+          Serial.println("Invalid or empty file: " + filename);
+          xSemaphoreGive(fileSystemMutex);
+          return 0;
+      }
+
+      int lineCount = 0;
+      while (file.available()) {
+          String line = file.readStringUntil('\n');
+          line.trim();
+          if (line.isEmpty()) continue;
+
+          int runtimeStartIndex = line.indexOf("Total Runtime: ") + 15;
+          int secondsIndex = line.indexOf(" seconds", runtimeStartIndex);
+          if (runtimeStartIndex != -1 && secondsIndex != -1) {
+              String runtimeStr = line.substring(runtimeStartIndex, secondsIndex);
+              runtimeStr.trim();
+              runtime += runtimeStr.toInt();
+          }
+
+          lineCount++;
+          if (lineCount % 10 == 0) {
+              esp_task_wdt_reset();
+          }
+      }
+      file.close();
+      xSemaphoreGive(fileSystemMutex);
+    }
+    return runtime;
 }
-
-
 
 
 // Setup routes for the server
@@ -2030,10 +1142,9 @@ void setupRoutes() {
                 server.on("/hello", HTTP_GET, [](AsyncWebServerRequest* req){
           String from = req->hasParam("from") ? req->getParam("from")->value() 
           : "unknown";
-                    LOG_CAT(DBG_WEB, "[HTTP hello] from=%s\n", from.c_str());
+          Serial.println("[HTTP hello] from=" + from);
           req->send(200, "text/plain", "ok");
         });
-
 
         // [ADD] SecondWebpage runtimes via fetch (no WS)
         server.on("/api/pump-runtimes", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -2111,693 +1222,15 @@ void setupRoutes() {
             // Debug: Check if file exists
             String filePath = "/" + filename; // Assuming files are in the root directory
             if (LittleFS.exists(filePath)) {
-    LOG_CAT(DBG_WEB, "Sending file: %s\n", filePath.c_str());
-    request->send(LittleFS, filePath, String(), true);
-
+                Serial.println("Sending file: " + filePath);
+                request->send(LittleFS, filePath, String(), true);
             } else {
-    LOG_CAT(DBG_WEB, "[HTTP] File not found: %s\n", filePath.c_str());
-    request->send(404, "text/plain", "File not found");
-
+                Serial.println("File not found: " + filePath);
+                request->send(404, "text/plain", "File not found");
             }
         } else {
             request->send(400, "text/plain", "Missing file parameter");
         }
-    });
-
-        // -- DS18B20 assignment config page --
-    server.on("/ds18b20-config", HTTP_GET, [](AsyncWebServerRequest* request) {
-        const char* html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>DS18B20 Sensor Assignments</title>
-  <style>
-    body { font-family: Arial, sans-serif; font-size: 14px; margin: 8px; }
-    table { border-collapse: collapse; }
-    th, td { border: 1px solid #999; padding: 4px; vertical-align: middle; }
-    th { background: #eef4fb; }
-    input, select, button { font-size: 13px; }
-    .rom { width: 175px; }
-    .romSelect { width: 230px; margin-left: 4px; }
-    .busSelect { width: 68px; }
-    .offset { width: 46px; }
-    .centerCell { text-align: center; }
-    .statusCell { min-width: 170px; font-size: 12px; }
-    .okText { color: #087a08; font-weight: bold; }
-    .warnText { color: #b00000; font-weight: bold; }
-    .dirtyRow { background: #fff8d8; }
-    .issueRow { background: #ffe0e0; }
-    .saveDirty { background: #ffd45c; border: 2px solid #9b6200; font-weight: bold; }
-    .msg { margin-top: 10px; font-weight: bold; min-height: 1.4em; }
-    .buttonRow { margin: 8px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .scanBox { margin-top: 10px; padding: 6px; border: 1px solid #aaa; background: #f9fbff; }
-    .scanBox h3 { margin: 0 0 6px 0; }
-    .muted { color: #555; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <h2>DS18B20 Sensor Assignments</h2>
-  <p>Assign each configured DS18B20 ROM to a system temperature and one-wire bus. Saving changes writes ds18b20_config.json. Reboot after saving so the DS18B20 boot scan rebuilds the runtime map.</p>
-
-  <div class="buttonRow">
-    <button id="reloadBtn">Reload Config</button>
-    <button id="scanBtn">Search OneWire Buses</button>
-    <button id="resetBtn">Restore Defaults</button>
-    <button id="rebootBtn" style="font-weight:bold; color:#b00000;">Reboot Controller</button>
-  </div>
-
-  <table id="assignmentTable">
-    <thead>
-      <tr>
-        <th>Slot</th>
-        <th>DTemp</th>
-        <th>ROM Address</th>
-        <th>Found / Assigned ROM Selector</th>
-        <th>System Temperature</th>
-        <th>Bus</th>
-        <th>Enabled</th>
-        <th>Offset F</th>
-        <th>Status</th>
-        <th>Save</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-
-  <div id="scanBox" class="scanBox" style="display:none;">
-    <h3>OneWire Search Results</h3>
-    <div class="muted">New/unassigned ROMs can be selected from the dropdown in any row, or manually typed into the ROM Address field.</div>
-    <table id="scanTable" style="margin-top:6px;">
-      <thead><tr><th>Bus</th><th>ROM</th><th>Status</th><th>Assigned Slot</th><th>System Temp</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
-  <div id="msg" class="msg"></div>
-
-<script>
-let validSystemTemps = [];
-let currentAssignments = [];
-let scannedSensors = [];
-let dirtySlots = new Set();
-
-function setMsg(text) {
-  document.getElementById('msg').textContent = text;
-}
-
-function normalizeRom(rom) {
-  return String(rom || '').trim().toLowerCase();
-}
-
-function isZeroRom(rom) {
-  const r = normalizeRom(rom);
-  return !r || r === '0x0' || r === '0';
-}
-
-function getAssignment(slot) {
-  return currentAssignments.find(r => Number(r.slot) === Number(slot));
-}
-
-function getScannedSensorByRom(rom) {
-  const key = normalizeRom(rom);
-  return scannedSensors.find(s => normalizeRom(s.rom) === key);
-}
-
-function markDirty(slot, reason) {
-  dirtySlots.add(Number(slot));
-  renderAssignments();
-  setMsg('Slot ' + slot + ' row changed but not saved. Save changes before reboot.');
-}
-
-function clearDirty(slot) {
-  dirtySlots.delete(Number(slot));
-}
-
-function makeSystemTempSelect(row) {
-  const sel = document.createElement('select');
-  validSystemTemps.forEach(name => {
-    const opt = document.createElement('option');
-    opt.value = name;
-    opt.textContent = name;
-    if (name === row.systemTemp) opt.selected = true;
-    sel.appendChild(opt);
-  });
-  sel.onchange = () => {
-    row.systemTemp = sel.value;
-    markDirty(row.slot);
-  };
-  return sel;
-}
-
-function findDuplicateRomSlot(row) {
-  const rom = normalizeRom(row.rom);
-  if (isZeroRom(rom) || !row.enabled) return -1;
-  const dup = currentAssignments.find(other =>
-    Number(other.slot) !== Number(row.slot) &&
-    other.enabled &&
-    normalizeRom(other.rom) === rom
-  );
-  return dup ? Number(dup.slot) : -1;
-}
-
-function findDuplicateSystemTempSlot(row) {
-  if (!row.enabled || !row.systemTemp) return -1;
-  const dup = currentAssignments.find(other =>
-    Number(other.slot) !== Number(row.slot) &&
-    other.enabled &&
-    other.systemTemp === row.systemTemp
-  );
-  return dup ? Number(dup.slot) : -1;
-}
-
-function getRowIssues(row) {
-  const issues = [];
-  if (!row.enabled) return issues;
-
-  const dupRomSlot = findDuplicateRomSlot(row);
-  if (dupRomSlot >= 0) issues.push('Duplicate ROM with slot ' + dupRomSlot);
-
-  const dupTempSlot = findDuplicateSystemTempSlot(row);
-  if (dupTempSlot >= 0) issues.push('Duplicate system temp with slot ' + dupTempSlot);
-
-  if (!isZeroRom(row.rom)) {
-    if (row.observedBus && Number(row.observedBus) !== Number(row.bus)) {
-      issues.push('ROM found on Bus ' + row.observedBus + ', configured Bus ' + row.bus);
-    } else if (row.present === false) {
-      issues.push('Configured ROM not found');
-    }
-  }
-
-  return issues;
-}
-
-function buildRomChoices(currentRom) {
-  const choices = [];
-  const seen = {};
-  const current = normalizeRom(currentRom);
-
-  function addChoice(rom, bus, label, assignedSlot) {
-    const key = normalizeRom(rom);
-    if (!key || key === '0x0' || key === '0' || seen[key]) return;
-    seen[key] = true;
-    choices.push({ rom: rom, bus: bus, label: label, assignedSlot: assignedSlot });
-  }
-
-  currentAssignments.forEach(row => {
-    if (!row.rom) return;
-    addChoice(row.rom, row.bus,
-      'Assigned: Slot ' + row.slot + ' / DTemp' + row.dtemp + ' / ' + row.systemTemp + ' / Bus ' + row.bus + ' / ' + row.rom,
-      row.slot);
-  });
-
-  scannedSensors.forEach(s => {
-    const status = s.assigned ? ('Assigned: Slot ' + s.slot + ' / DTemp' + s.dtemp + ' / ' + s.systemTemp)
-                              : 'NEW UNASSIGNED';
-    addChoice(s.rom, s.bus, status + ' / Found Bus ' + s.bus + ' / ' + s.rom,
-      s.assigned ? s.slot : -1);
-  });
-
-  if (current && !seen[current]) {
-    choices.unshift({ rom: currentRom, bus: 0, label: 'Current row value / ' + currentRom, assignedSlot: -1 });
-  }
-
-  return choices;
-}
-
-function swapRomAndBus(slotA, slotB) {
-  const a = getAssignment(slotA);
-  const b = getAssignment(slotB);
-  if (!a || !b) return;
-
-  const oldRom = a.rom;
-  const oldBus = a.bus;
-  a.rom = b.rom;
-  a.bus = b.bus;
-  b.rom = oldRom;
-  b.bus = oldBus;
-
-  dirtySlots.add(Number(slotA));
-  dirtySlots.add(Number(slotB));
-  renderAssignments();
-  setMsg('Swapped ROM and Bus between slot ' + slotA + ' and slot ' + slotB + '. Save both changed rows before reboot.');
-}
-
-function makeRomSelect(row) {
-  const sel = document.createElement('select');
-  sel.className = 'romSelect';
-
-  const placeholder = document.createElement('option');
-  placeholder.value = '';
-  placeholder.textContent = 'Select ROM...';
-  sel.appendChild(placeholder);
-
-  buildRomChoices(row.rom || '').forEach(choice => {
-    const opt = document.createElement('option');
-    opt.value = choice.rom;
-    opt.textContent = choice.label;
-    opt.dataset.bus = String(choice.bus || 0);
-    opt.dataset.assignedSlot = String(choice.assignedSlot ?? -1);
-    if (normalizeRom(choice.rom) === normalizeRom(row.rom)) opt.selected = true;
-    sel.appendChild(opt);
-  });
-
-  sel.onchange = () => {
-    if (!sel.value) return;
-
-    const selected = sel.options[sel.selectedIndex];
-    const assignedSlot = Number(selected.dataset.assignedSlot || -1);
-    const selectedBus = Number(selected.dataset.bus || 0);
-
-    if (assignedSlot >= 0 && assignedSlot !== Number(row.slot)) {
-      if (confirm('This ROM is already assigned to slot ' + assignedSlot + '.\n\nSwap ROM and Bus between slot ' + row.slot + ' and slot ' + assignedSlot + '?')) {
-        swapRomAndBus(row.slot, assignedSlot);
-        return;
-      }
-    }
-
-    row.rom = sel.value;
-    if (selectedBus === 1 || selectedBus === 2) row.bus = selectedBus;
-    markDirty(row.slot);
-  };
-
-  return sel;
-}
-
-function renderScanResults() {
-  const box = document.getElementById('scanBox');
-  const tbody = document.querySelector('#scanTable tbody');
-  tbody.innerHTML = '';
-
-  if (!scannedSensors.length) {
-    box.style.display = 'none';
-    return;
-  }
-
-  box.style.display = 'block';
-
-  scannedSensors.forEach(s => {
-    const tr = document.createElement('tr');
-    [s.bus, s.rom, s.assigned ? 'Assigned' : 'NEW / unassigned',
-     s.assigned ? ('Slot ' + s.slot + ' / DTemp' + s.dtemp) : '--',
-     s.assigned ? s.systemTemp : '--'].forEach(text => {
-      const td = document.createElement('td');
-      td.textContent = text;
-      tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
-  });
-}
-
-async function scanOneWire() {
-  setMsg('Searching OneWire buses...');
-  const res = await fetch('/api/ds18b20-scan', { cache: 'no-store' });
-  const out = await res.json();
-
-  if (!out.ok) {
-    setMsg('OneWire search failed: ' + (out.error || 'unknown error'));
-    return;
-  }
-
-  scannedSensors = out.sensors || [];
-  renderScanResults();
-  setMsg('OneWire search complete. Found ' + scannedSensors.length + ' valid DS18B20 ROMs. New/unassigned sensors are available in each ROM selector.');
-  renderAssignments();
-}
-
-function updateRowField(row, field, value) {
-  row[field] = value;
-  markDirty(row.slot);
-}
-
-function renderAssignments() {
-  const tbody = document.querySelector('#assignmentTable tbody');
-  tbody.innerHTML = '';
-
-  let firstIssue = '';
-
-  currentAssignments.forEach(row => {
-    const issues = getRowIssues(row);
-    const isDirty = dirtySlots.has(Number(row.slot));
-    const tr = document.createElement('tr');
-    if (issues.length) tr.className = 'issueRow';
-    if (isDirty) tr.className = (tr.className ? tr.className + ' ' : '') + 'dirtyRow';
-
-    const slotTd = document.createElement('td');
-    slotTd.textContent = row.slot;
-    tr.appendChild(slotTd);
-
-    const dtempTd = document.createElement('td');
-    dtempTd.textContent = 'DTemp' + row.dtemp;
-    tr.appendChild(dtempTd);
-
-    const romInput = document.createElement('input');
-    romInput.className = 'rom';
-    romInput.value = row.rom || '';
-    romInput.onchange = () => updateRowField(row, 'rom', romInput.value.trim());
-    const romTd = document.createElement('td');
-    romTd.appendChild(romInput);
-    tr.appendChild(romTd);
-
-    const romSelectTd = document.createElement('td');
-    romSelectTd.appendChild(makeRomSelect(row));
-    tr.appendChild(romSelectTd);
-
-    const sysSel = makeSystemTempSelect(row);
-    const sysTd = document.createElement('td');
-    sysTd.appendChild(sysSel);
-    tr.appendChild(sysTd);
-
-    const busSel = document.createElement('select');
-    busSel.className = 'busSelect';
-    [1, 2].forEach(bus => {
-      const opt = document.createElement('option');
-      opt.value = String(bus);
-      opt.textContent = 'Bus ' + bus;
-      if (Number(row.bus) === bus) opt.selected = true;
-      busSel.appendChild(opt);
-    });
-    busSel.onchange = () => updateRowField(row, 'bus', Number(busSel.value));
-    const busTd = document.createElement('td');
-    busTd.appendChild(busSel);
-    tr.appendChild(busTd);
-
-    const enabledInput = document.createElement('input');
-    enabledInput.type = 'checkbox';
-    enabledInput.checked = !!row.enabled;
-    enabledInput.onchange = () => updateRowField(row, 'enabled', enabledInput.checked);
-    const enabledTd = document.createElement('td');
-    enabledTd.className = 'centerCell';
-    enabledTd.appendChild(enabledInput);
-    tr.appendChild(enabledTd);
-
-    const offsetInput = document.createElement('input');
-    offsetInput.type = 'number';
-    offsetInput.step = '0.1';
-    offsetInput.className = 'offset';
-    offsetInput.value = row.offsetF || 0;
-    offsetInput.onchange = () => updateRowField(row, 'offsetF', offsetInput.value || '0');
-    const offsetTd = document.createElement('td');
-    offsetTd.appendChild(offsetInput);
-    tr.appendChild(offsetTd);
-
-    const statusTd = document.createElement('td');
-    statusTd.className = 'statusCell';
-    if (isDirty) {
-      statusTd.innerHTML = '<span class="warnText">Changed / not saved</span>';
-    } else if (issues.length) {
-      statusTd.innerHTML = '<span class="warnText">' + issues.join('<br>') + '</span>';
-      if (!firstIssue) firstIssue = 'Slot ' + row.slot + ': ' + issues.join('; ');
-    } else if (!row.enabled) {
-      statusTd.textContent = 'Disabled';
-    } else {
-      statusTd.innerHTML = '<span class="okText">OK</span>';
-    }
-    tr.appendChild(statusTd);
-
-    const saveBtn = document.createElement('button');
-    saveBtn.textContent = 'Save Row';
-    if (isDirty) saveBtn.className = 'saveDirty';
-    saveBtn.onclick = async () => {
-      const ok = await saveRow(row);
-      if (ok) {
-        clearDirty(row.slot);
-        setMsg('Slot ' + row.slot + ' changes saved. Reboot required for runtime remap.');
-        await loadConfig(false, true);
-      }
-    };
-    const saveTd = document.createElement('td');
-    saveTd.appendChild(saveBtn);
-    tr.appendChild(saveTd);
-
-    tbody.appendChild(tr);
-  });
-
-  if (!dirtySlots.size && firstIssue) {
-    setMsg(firstIssue);
-  }
-
-  renderScanResults();
-}
-
-async function saveRow(row) {
-  const params = new URLSearchParams();
-  params.set('slot', row.slot);
-  params.set('rom', String(row.rom || '').trim());
-  params.set('systemTemp', row.systemTemp || '');
-  params.set('bus', row.bus);
-  params.set('enabled', row.enabled ? '1' : '0');
-  params.set('offsetF', row.offsetF || '0');
-
-  const r = await fetch('/api/ds18b20-set?' + params.toString(), { cache: 'no-store' });
-  const out = await r.json();
-  if (!out.ok) {
-    setMsg('Save failed for slot ' + row.slot + ': ' + (out.error || 'unknown error'));
-    return false;
-  }
-  return true;
-}
-
-async function saveDirtyRows() {
-  const slots = Array.from(dirtySlots).sort((a, b) => a - b);
-  for (const slot of slots) {
-    const row = getAssignment(slot);
-    if (!row) continue;
-    const ok = await saveRow(row);
-    if (!ok) return false;
-    clearDirty(slot);
-  }
-  await loadConfig(false, true);
-  setMsg('Saved changed rows: ' + slots.join(', ') + '. Reboot required.');
-  return true;
-}
-
-async function loadConfig(showMsg, preserveDirty) {
-  if (showMsg !== false) setMsg('Loading...');
-  const res = await fetch('/api/ds18b20-config', { cache: 'no-store' });
-  const cfg = await res.json();
-  validSystemTemps = cfg.validSystemTemps || [];
-  currentAssignments = cfg.assignments || [];
-  if (!preserveDirty) dirtySlots.clear();
-  renderAssignments();
-  if (showMsg !== false) setMsg('Loaded ' + currentAssignments.length + ' assignments.');
-}
-
-document.getElementById('reloadBtn').onclick = () => loadConfig(true);
-document.getElementById('scanBtn').onclick = scanOneWire;
-
-document.getElementById('resetBtn').onclick = async () => {
-  if (!confirm('Restore DS18B20 assignments to compiled defaults?')) return;
-  const r = await fetch('/api/ds18b20-reset', { cache: 'no-store' });
-  const out = await r.json();
-  if (out.ok) {
-    dirtySlots.clear();
-    setMsg('Defaults restored. Reboot required.');
-    loadConfig(false);
-  } else {
-    setMsg('Reset failed: ' + (out.error || 'unknown error'));
-  }
-};
-
-document.getElementById('rebootBtn').onclick = async () => {
-  if (dirtySlots.size) {
-    const saveFirst = confirm('Changes not saved.\n\nClick OK to save changed rows before reboot.\nClick Cancel to reboot without saving those unsaved changes.');
-    if (saveFirst) {
-      const saved = await saveDirtyRows();
-      if (!saved) return;
-    }
-  }
-
-  if (!confirm('Reboot the ESP32 controller now? Pump/control operation will stop during the reboot.')) return;
-  setMsg('Reboot command sent. The page will disconnect while the controller restarts.');
-
-  try {
-    const r = await fetch('/api/reboot-controller', { method: 'POST', cache: 'no-store' });
-    const out = await r.json();
-    if (!out.ok) setMsg('Reboot request failed: ' + (out.error || 'unknown error'));
-  } catch (e) {
-    // The reboot can interrupt the HTTP response on some browsers. That is expected.
-  }
-};
-
-loadConfig(true);
-</script>
-</body>
-</html>
-)rawliteral";
-        request->send(200, "text/html; charset=UTF-8", html);
-    });
-
-        // -- DS18B20 assignment config API --
-    server.on("/api/ds18b20-config", HTTP_GET, [](AsyncWebServerRequest* request) {
-        DynamicJsonDocument doc(3072);
-        doc["version"] = g_ds18b20Config.version;
-        doc["path"] = DS18B20_CONFIG_PATH;
-
-        JsonArray valid = doc.createNestedArray("validSystemTemps");
-        valid.add("panelT");
-        valid.add("CSupplyT");
-        valid.add("storageT");
-        valid.add("outsideT");
-        valid.add("CircReturnT");
-        valid.add("supplyT");
-        valid.add("CreturnT");
-        valid.add("DhwSupplyT");
-        valid.add("DhwReturnT");
-        valid.add("HeatingSupplyT");
-        valid.add("HeatingReturnT");
-        valid.add("dhwT");
-        valid.add("PotHeatXinletT");
-        valid.add("PotHeatXoutletT");
-
-        JsonArray assignments = doc.createNestedArray("assignments");
-        for (uint8_t i = 0; i < DS18B20_ASSIGNMENT_COUNT; i++) {
-            const Ds18B20SensorAssignment& a = g_ds18b20Config.assignments[i];
-
-            bool present = false;
-            uint8_t observedBus = 0;
-            uint32_t lastGoodMs = 0;
-            getDS18B20SlotStatus(i, &present, &observedBus, &lastGoodMs);
-
-            int duplicateRomSlot = -1;
-            int duplicateSystemTempSlot = -1;
-            for (uint8_t j = 0; j < DS18B20_ASSIGNMENT_COUNT; j++) {
-                if (j == i) continue;
-                const Ds18B20SensorAssignment& other = g_ds18b20Config.assignments[j];
-
-                if (a.enabled && other.enabled && a.rom != 0ULL && a.rom == other.rom) {
-                    duplicateRomSlot = j;
-                }
-
-                if (a.enabled && other.enabled && strcmp(a.systemTemp, other.systemTemp) == 0) {
-                    duplicateSystemTempSlot = j;
-                }
-            }
-
-            JsonObject row = assignments.createNestedObject();
-            row["slot"] = i;
-            row["dtemp"] = i + 1;
-            row["rom"] = ds18b20RomToString(a.rom);
-            row["systemTemp"] = a.systemTemp;
-            row["bus"] = a.bus;
-            row["enabled"] = a.enabled;
-            row["offsetF"] = a.offsetF;
-            row["present"] = present;
-            row["observedBus"] = observedBus;
-            row["wrongBus"] = (a.enabled && observedBus != 0 && observedBus != a.bus);
-            row["lastGoodMs"] = lastGoodMs;
-            row["duplicateRom"] = (duplicateRomSlot >= 0);
-            row["duplicateRomSlot"] = duplicateRomSlot;
-            row["duplicateSystemTemp"] = (duplicateSystemTempSlot >= 0);
-            row["duplicateSystemTempSlot"] = duplicateSystemTempSlot;
-        }
-
-        String json;
-        serializeJson(doc, json);
-        AsyncWebServerResponse* resp = request->beginResponse(200, "application/json; charset=UTF-8", json);
-        resp->addHeader("Cache-Control", "no-store");
-        request->send(resp);
-    });
-
-    server.on("/api/ds18b20-scan", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = buildDS18B20ScanJson();
-        AsyncWebServerResponse* resp = request->beginResponse(200, "application/json; charset=UTF-8", json);
-        resp->addHeader("Cache-Control", "no-store");
-        request->send(resp);
-    });
-
-    server.on("/api/ds18b20-set", HTTP_GET, [](AsyncWebServerRequest* request) {
-        if (!request->hasParam("slot") || !request->hasParam("rom") ||
-            !request->hasParam("systemTemp") || !request->hasParam("bus")) {
-            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Missing slot, rom, systemTemp, or bus\"}");
-            return;
-        }
-
-        int slot = request->getParam("slot")->value().toInt();
-        if (slot < 0 || slot >= DS18B20_ASSIGNMENT_COUNT) {
-            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid slot\"}");
-            return;
-        }
-
-        uint64_t rom = 0ULL;
-        String romText = request->getParam("rom")->value();
-        if (!parseDs18b20RomString(romText.c_str(), rom)) {
-            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid DS18B20 ROM\"}");
-            return;
-        }
-
-        String systemTemp = request->getParam("systemTemp")->value();
-        systemTemp.trim();
-        if (!isValidSystemTempName(systemTemp.c_str())) {
-            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid systemTemp\"}");
-            return;
-        }
-
-        int bus = request->getParam("bus")->value().toInt();
-        if (bus != 1 && bus != 2) {
-            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid bus\"}");
-            return;
-        }
-
-        bool enabled = true;
-        if (request->hasParam("enabled")) {
-            String enabledStr = request->getParam("enabled")->value();
-            enabledStr.toLowerCase();
-            enabled = (enabledStr == "1" || enabledStr == "true" || enabledStr == "yes" || enabledStr == "on");
-        }
-
-        float offsetF = 0.0f;
-        if (request->hasParam("offsetF")) {
-            offsetF = request->getParam("offsetF")->value().toFloat();
-        }
-
-        g_ds18b20Config.assignments[slot].rom = rom;
-        strncpy(g_ds18b20Config.assignments[slot].systemTemp,
-                systemTemp.c_str(),
-                sizeof(g_ds18b20Config.assignments[slot].systemTemp) - 1);
-        g_ds18b20Config.assignments[slot].systemTemp[sizeof(g_ds18b20Config.assignments[slot].systemTemp) - 1] = '\0';
-        g_ds18b20Config.assignments[slot].bus = (uint8_t)bus;
-        g_ds18b20Config.assignments[slot].enabled = enabled;
-        g_ds18b20Config.assignments[slot].offsetF = offsetF;
-
-        bool ok = saveDs18B20ConfigToFS();
-        if (!ok) {
-            request->send(500, "application/json", "{\"ok\":false,\"error\":\"Failed to save ds18b20_config.json\"}");
-            return;
-        }
-
-        request->send(200, "application/json", "{\"ok\":true,\"rebootRequired\":true}");
-    });
-
-    server.on("/api/ds18b20-reset", HTTP_GET, [](AsyncWebServerRequest* request) {
-        bool ok = resetDs18B20ConfigToDefaults();
-        if (!ok) {
-            request->send(500, "application/json", "{\"ok\":false,\"error\":\"Failed to reset DS18B20 config\"}");
-            return;
-        }
-        request->send(200, "application/json", "{\"ok\":true,\"rebootRequired\":true}");
-    });
-
-
-    server.on("/api/reboot-controller", HTTP_POST, [](AsyncWebServerRequest* request) {
-        request->send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
-
-        xTaskCreate(
-          delayedControllerRebootTask,
-          "DelayedReboot",
-          4096,
-          nullptr,
-          1,
-          nullptr
-        );
-    });
-
-        // -- Network diagnostics route --
-    server.on("/api/network-diagnostics", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = getNetworkDiagnosticsJson();
-        AsyncWebServerResponse* resp = request->beginResponse(200, "application/json; charset=UTF-8", json);
-        resp->addHeader("Cache-Control", "no-store");
-        request->send(resp);
     });
 
         // -- FS stats route --
@@ -2807,115 +1240,98 @@ loadConfig(true);
     });
 
     setupAlarmRoutes();
+    
+    // Setup log data route
+    setupLogDataRoute();
 }
 
+// Setup log data route
+void setupLogDataRoute() {
+    server.on("/get-log-data", HTTP_GET, [](AsyncWebServerRequest* request) {
+        if (request->hasParam("pumpIndex") && request->hasParam("timeframe")) {
+            String pumpIndexParam = request->getParam("pumpIndex")->value();
+            String timeframe = request->getParam("timeframe")->value();
+            int pumpIndex = pumpIndexParam.toInt() - 1; // Adjusting for 0-based index
+            unsigned long runtime = 0;
+            DateTime currentTime = getCurrentTimeAtomic(); // Get the current time
+            if (timeframe == "day") {
+                runtime = aggregateDailyLogsReport(pumpIndex, currentTime);
+            } else if (timeframe == "prevDay" || timeframe == "yesterday") {
+                runtime = aggregatePreviousDailyLogsReport(pumpIndex, currentTime);
+            } else if (timeframe == "month") {
+                runtime = aggregateMonthlyLogsReport(pumpIndex, currentTime);
+            } else if (timeframe == "prevMonth" || timeframe == "lastMonth") {
+                runtime = aggregatePreviousMonthlyLogsReport(pumpIndex, currentTime);
+            } else if (timeframe == "year") {
+                runtime = aggregateYearlyLogsReport(pumpIndex, currentTime);
+            } else if (timeframe == "prevYear" || timeframe == "lastYear") {
+                runtime = aggregatePreviousYearlyLogsReport(pumpIndex, currentTime);
+            } else if (timeframe == "total" || timeframe == "decade") {
+                runtime = aggregateDecadeLogsReport(pumpIndex, currentTime);
+            } else {
+                request->send(400, "application/json", "{\"error\":\"Invalid timeframe\"}");
+                return;
+            }
+            // Prepare the JSON response
+            DynamicJsonDocument doc(1024);
+            doc["runtime"] = runtime;
+            String response;
+            serializeJson(doc, response);
+            request->send(200, "application/json", response);
+        } else {
+            request->send(400, "application/json", "{\"error\":\"Missing parameters\"}");
+        }
+    });
+}
 
 // Respond to 'Update All' request from Webpage
 // In WebServerManager.cpp
 
 void refreshRuntimeCache() {
     DateTime currentTime = getCurrentTimeAtomic();
-
-    for (int i = 0; i < numPumps; i++) {
-        // This task is WDT-monitored in TaskManager.cpp.
-        // Reset between filesystem-heavy aggregation calls so the runtime refresh
-        // can safely process larger LittleFS log files without tripping WDT.
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(1));
-
+    for (int i = 0; i < 10; i++) {
         cachedRuntimes[i][0] = aggregateDailyLogsReport(i, currentTime);
-        esp_task_wdt_reset();
-
         cachedRuntimes[i][1] = aggregatePreviousDailyLogsReport(i, currentTime);
-        esp_task_wdt_reset();
-
         cachedRuntimes[i][2] = aggregateMonthlyLogsReport(i, currentTime);
-        esp_task_wdt_reset();
-
         cachedRuntimes[i][3] = aggregatePreviousMonthlyLogsReport(i, currentTime);
-        esp_task_wdt_reset();
-
         cachedRuntimes[i][4] = aggregateYearlyLogsReport(i, currentTime);
-        esp_task_wdt_reset();
-
         cachedRuntimes[i][5] = aggregatePreviousYearlyLogsReport(i, currentTime);
-        esp_task_wdt_reset();
-
         cachedRuntimes[i][6] = aggregateDecadeLogsReport(i, currentTime);
+        
         esp_task_wdt_reset();
-
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    // Clear inactive internal cache slots so pump 9/10 stale data cannot leak
-    // into a later JSON response if numPumps is reduced.
-    for (int i = numPumps; i < 10; i++) {
-        for (int j = 0; j < 7; j++) {
-            cachedRuntimes[i][j] = 0;
-        }
+          
     }
 }
-  
-        
-
-
 
 void updateAllRuntimes() {
-    // Pump START/STOP events are now RAM-cached first.
-    // Flush them before runtime aggregation so the webpage sees current logs.
-    (void)flushPendingPumpLogEvents(pdMS_TO_TICKS(1000), 2);
-
-    // Capture the version that caused this build before doing the long filesystem work.
-    // If another page requests a newer version while this build is running, the task
-    // will process that next queued notification afterward.
-    uint32_t version = g_pumpRuntimeRequestedVersion;
-
     refreshRuntimeCache();  // Refresh cache before sending
 
-    esp_task_wdt_reset();
+    uint32_t version = g_pumpRuntimeRequestedVersion;
 
-    // [ArduinoJson v7 Fix] 
-    // 1. No size argument needed (it grows automatically).
-    // 2. We use 'new' to keep the document object off the stack (prevents stack overflow).
-    JsonDocument* doc = new JsonDocument();
+    DynamicJsonDocument doc(8192);
+    doc["version"] = version;
+    JsonArray data = doc.createNestedArray("data");
 
-    if (!doc) {
-        LOG_ERR("[PumpRuntimes] Failed to allocate runtime JSON document.\n");
-        return;
-    }
+    for (int i = 0; i < 10; i++) {
 
-    (*doc)["version"] = version;
-    
-    // v7 Syntax: use ["key"].to<JsonArray>() instead of createNestedArray("key")
-    JsonArray data = (*doc)["data"].to<JsonArray>();
-
-    for (int i = 0; i < numPumps; i++) {
-        esp_task_wdt_reset();
-
-        // v7 Syntax: use add<JsonObject>() instead of createNestedObject()
-        JsonObject pumpData = data.add<JsonObject>();
-        
+        JsonObject pumpData = data.createNestedObject();
         pumpData["pumpIndex"] = i + 1;
-        pumpData["day"]       = cachedRuntimes[i][0];
-        pumpData["prevDay"]   = cachedRuntimes[i][1];
-        pumpData["month"]     = cachedRuntimes[i][2];
+        pumpData["day"] = cachedRuntimes[i][0];
+        pumpData["prevDay"] = cachedRuntimes[i][1];
+        pumpData["month"] = cachedRuntimes[i][2];
         pumpData["prevMonth"] = cachedRuntimes[i][3];
-        pumpData["year"]      = cachedRuntimes[i][4];
-        pumpData["prevYear"]  = cachedRuntimes[i][5];
-        pumpData["total"]     = cachedRuntimes[i][6];
+        pumpData["year"] = cachedRuntimes[i][4];
+        pumpData["prevYear"] = cachedRuntimes[i][5];
+        pumpData["total"] = cachedRuntimes[i][6];
 
-        vTaskDelay(pdMS_TO_TICKS(1));
+        esp_task_wdt_reset();  // Reset WDT
+        
     }
 
-    String jsonString;
-    serializeJson(*doc, jsonString);
+      String jsonString;
+    serializeJson(doc, jsonString);
 
-    // CRITICAL: Free the heap memory
-    delete doc; 
-
-    esp_task_wdt_reset();
-
-    // Store for HTTP fetch clients
+    // [ADD] store for HTTP fetch clients
     ensurePumpRuntimeJsonMutex();
     if (g_pumpRuntimeJsonMutex &&
         xSemaphoreTake(g_pumpRuntimeJsonMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -2925,4 +1341,8 @@ void updateAllRuntimes() {
         g_pumpRuntimeJson = jsonString; // best-effort fallback
     }
     g_pumpRuntimeBuiltVersion = version;
+
+    
 }
+
+
