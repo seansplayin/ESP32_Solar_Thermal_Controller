@@ -26,7 +26,7 @@
 #include <freertos/queue.h>
 #include "AlarmHistory.h"
 #include "MemoryStats.h"
-#include "TarGZ.h"
+#include "RawTar.h"
 #include "DiagLog.h"
 
 
@@ -47,8 +47,8 @@ volatile uint32_t g_tempBcastSkipped = 0;  // task skipped because no writable W
 // Declare the flag as extern
 extern volatile bool needToUpdatePumpRuntimes;
 
-// TGZ producer task handle is defined in TarGZ.cpp (NULL when idle)
-extern TaskHandle_t thTgzProducer;
+// Raw TAR producer task handle is defined in RawTar.cpp (NULL when idle)
+extern TaskHandle_t thRawTarProducer;
 
 
 // Task handles for synchronization (add new handles as needed)
@@ -127,7 +127,7 @@ void monitorStacks() {
     {"UpdatePumpRuntimes",       thUpdatePumpRuntimes,           8192},
     {"TaskTemperatureLogging",   thTemperatureLogging,           4096},
     {"FileSystemCleanup",        thFileSystemCleanup,            4096},
-    {"tgzProducer",              thTgzProducer, (uint32_t)TGZ_PRODUCER_TASK_STACK_WORDS},
+    {"rawTarProducer",           thRawTarProducer, (uint32_t)RAW_TAR_PRODUCER_TASK_STACK_WORDS},
     {"EndofBootup",              thEndofBootup,                  4096}
   };
 
@@ -140,11 +140,11 @@ void monitorStacks() {
     if (h == NULL) {
 
       // prints the last-run stack usage using values you captured right before the producer task deleted itself:
-      if (strcmp(tasks[i].taskName, "tgzProducer") == 0 &&
-          tgzLastStackWords > 0 && tgzLastHwmWords > 0) {
+      if (strcmp(tasks[i].taskName, "rawTarProducer") == 0 &&
+          rawTarLastStackWords > 0 && rawTarLastHwmWords > 0) {
 
-        uint32_t stackWords = tgzLastStackWords;
-        uint32_t hwmWords   = tgzLastHwmWords;
+        uint32_t stackWords = rawTarLastStackWords;
+        uint32_t hwmWords   = rawTarLastHwmWords;
 
         uint32_t usedWords = (stackWords > hwmWords) ? (stackWords - hwmWords) : 0;
 
@@ -534,7 +534,7 @@ void TaskLogger(void* pv) {
   // Phase 1 pump-log buffering:
   // logPumpEvent() now captures START/STOP records in RAM immediately.
   // This task only services the legacy fallback queue and periodically flushes
-  // the RAM buffer to /Pump_Logs.  A busy filesystem/TGZ download no longer
+  // the RAM buffer to /Pump_Logs.  A busy filesystem/archive download no longer
   // causes pump runtime events to be dropped.
   for (;;) {
     servicePumpLogBufferOnce(600000UL, 64); // 10-minute flush or 64 pending events

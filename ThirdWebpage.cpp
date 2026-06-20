@@ -13,7 +13,7 @@
 #include <freertos/semphr.h>
 #include "TaskManager.h"
 #define DEST_FS_USES_LITTLEFS
-#include "TarGZ.h"
+#include "RawTar.h"
 #include <esp_task_wdt.h>
 #include "DiagLog.h"
 #include "Logging.h"
@@ -274,7 +274,18 @@ static const char *thirdPageHtml = R"rawliteral(
     .blue-button:focus {
       outline: 2px solid rgba(0,0,255,0.6);
       outline-offset: 2px;
-      }    
+      }
+    .archive-download-ready {
+      font-weight: bold;
+      color: blue;
+      background: white;
+      border: 2px solid blue;
+      animation: archiveDownloadPulse 0.8s infinite alternate;
+    }
+    @keyframes archiveDownloadPulse {
+      from { background: white; color: blue; box-shadow: 0 0 2px blue; transform: scale(1.00); }
+      to   { background: #e8f0ff; color: blue; box-shadow: 0 0 10px blue; transform: scale(1.06); }
+    }    
 
     #fileBrowser {
       margin: 8px auto 0;
@@ -896,12 +907,62 @@ function archiveTimeRange(bytes) {
   return humanDuration(fast) + ' to ' + humanDuration(slow);
 }
 
-let tgzPollTimer = null;
+function archivePathNoTrailing(path) {
+  path = String(path || '').trim();
+  if (!path.startsWith('/')) path = '/' + path;
+  while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+  return path;
+}
+
+function isTemperatureLogsRootArchive(path) {
+  return archivePathNoTrailing(path) === '/Temperature_Logs';
+}
+
+function launchArchiveDownloadWindow(url) {
+  const sep = url.indexOf('?') >= 0 ? '&' : '?';
+  const finalUrl = url + sep + 'ts=' + Date.now();
+  window.open(finalUrl, '_blank');
+}
+function launchHiddenArchiveDownload(url) {
+  // Phase2V: directory archive downloads are launched as a real browser
+  // navigation/new-tab request instead of a hidden iframe. Some browsers
+  // will stream the response to a hidden iframe without saving the file.
+  launchArchiveDownloadWindow(url);
+}
+
+function archiveRawTarUrl(path) {
+  path = archivePathNoTrailing(path);
+  return '/fs/download_raw_tar?dir=' + encodeURIComponent(path);
+}
+function openArchiveRawTar(path) {
+  const url = archiveRawTarUrl(path);
+  window.open(url + (url.indexOf('?') >= 0 ? '&' : '?') + 'ts=' + Date.now(), '_blank');
+}
+function archiveClickDebug(path, source) {
+  fetch('/fs/archive_click?source=' + encodeURIComponent(source || 'third') + '&path=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' }).catch(console.log);
+}
+async function scanArchiveDir(path, source) {
+  archiveClickDebug(path, source || 'temperature-section-scan');
+  const box = archiveStatusBox();
+  box.textContent = 'Estimating directory. No archive is being created...';
+  try {
+    const r = await fetch('/fs/tar_info?verbose=1&max=1500&dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
+    const info = await r.json();
+    box.textContent = 'Scan ' + (info.ok ? 'OK' : 'FAILED') + ' for ' + path + ': entries=' + (info.entries || 0) + ', dirs=' + (info.dirs || 0) + ', files=' + (info.files || 0) + ', source=' + humanBytes(info.bytes || 0) + ', maxPathLen=' + (info.maxPathLen || 0) + ', longPaths=' + (info.longPaths || 0) + ', zeroFiles=' + (info.zeroFiles || 0) + (info.error ? ', error=' + info.error : '');
+  } catch (e) {
+    box.textContent = 'Scan request failed: ' + (e && e.message ? e.message : e);
+    console.log(e);
+  }
+  setTimeout(postHeightToParent, 50);
+}
+
+
+let archivePollTimer = null;
 function archiveStatusBox() {
-  let box = document.getElementById('tgzStatusBox');
+  let box = document.getElementById('archiveStatusBox');
   if (!box) {
     box = document.createElement('div');
-    box.id = 'tgzStatusBox';
+    box.id = 'archiveStatusBox';
     box.className = 'emptyNote';
     box.style.border = '1px solid #b8c7d9';
     box.style.margin = '4px 0';
@@ -914,55 +975,30 @@ function archiveStatusBox() {
   return box;
 }
 
-async function stopArchiveDownload() {
-  try {
-    await fetch('/fs/download_compressed/cancel', { method:'POST' });
-  } catch (e) {
-    console.log(e);
-  }
-}
 
-function startArchiveStatusPolling() {
-  const box = archiveStatusBox();
-  if (tgzPollTimer) clearInterval(tgzPollTimer);
-  async function poll() {
-    try {
-      const r = await fetch('/fs/download_compressed/status?ts=' + Date.now(), { cache:'no-store' });
-      const st = await r.json();
-      if (!st.active) {
-        box.textContent = 'Archive status: idle. Pending pump log events: ' + (st.pendingPumpLogEvents || 0);
-        clearInterval(tgzPollTimer);
-        tgzPollTimer = null;
-        setTimeout(postHeightToParent, 50);
-        return;
-      }
-      const sent = humanBytes(st.bytesSent || 0);
-      const produced = humanBytes(st.bytesProduced || 0);
-      const source = humanBytes(st.estimatedBytes || 0);
-      box.textContent = 'Archive ' + st.state + ' | source ' + source + ' | sent ' + sent + ' | produced ' + produced + ' | pending pump events ' + (st.pendingPumpLogEvents || 0) + ' ';
-      const btn = document.createElement('button');
-      btn.className = 'blue-button';
-      btn.textContent = 'Stop Download';
-      btn.onclick = stopArchiveDownload;
-      box.appendChild(btn);
-      if (st.state === 'complete' || st.state === 'failed' || st.state === 'cancelled') {
-        clearInterval(tgzPollTimer);
-        tgzPollTimer = null;
-      }
-      setTimeout(postHeightToParent, 50);
-    } catch (e) {
-      console.log(e);
-    }
-  }
-  poll();
-  tgzPollTimer = setInterval(poll, 1500);
+
+function showArchiveStartButton(box, path, url, source) {
+  if (!box) box = archiveStatusBox();
+  box.textContent = 'Archive estimate complete for ' + path + '. Click the highlighted Download button to launch the browser download.';
+  const btn = document.createElement('button');
+  btn.className = 'blue-button archive-download-ready';
+  btn.textContent = 'Download';
+  btn.onclick = () => {
+    archiveClickDebug(path, source || 'temperature-section-start-button');
+    box.textContent = 'Starting archive download in a new browser tab/window...';
+    launchHiddenArchiveDownload(url);
+  };
+  box.appendChild(document.createTextNode(' '));
+  box.appendChild(btn);
+  setTimeout(postHeightToParent, 50);
 }
 
 async function prepareArchiveDownload(path) {
+  archiveClickDebug(path, 'temperature-section-prepare');
   const box = archiveStatusBox();
   box.textContent = 'Estimating archive size...';
   try {
-    const r = await fetch('/fs/download_compressed/info?dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
+    const r = await fetch('/fs/tar_info?dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
     const info = await r.json();
     if (!info.ok) {
       box.textContent = 'Archive estimate failed: ' + (info.error || 'unknown error');
@@ -972,20 +1008,22 @@ async function prepareArchiveDownload(path) {
     const bytes = Number(info.bytes || 0);
     let msg = 'Archive download for ' + path + '\n';
     msg += 'Source data: ' + humanBytes(bytes) + '\n';
+    if (info.tarBytes) msg += 'Estimated TAR size: ' + humanBytes(info.tarBytes) + '\n';
+    if (info.fsPctUsed !== undefined) msg += 'Filesystem used: ' + Number(info.fsPctUsed).toFixed(1) + '% (cleanup starts at ' + Number(info.cleanupStartLimit || 0).toFixed(1) + '%)\n';
+    if (info.cleanupRisk) msg += 'WARNING: filesystem cleanup may be close to triggering. The cleanup task will be deferred for protected Temperature_Logs files while this archive is active.\n';
     msg += 'Files: ' + (info.files || 0) + '  Folders: ' + (info.dirs || 0) + '\n';
     msg += 'Estimated download time: ' + archiveTimeRange(bytes) + '\n';
     if (info.truncated) msg += 'Estimate was truncated because the folder is very large.\n';
-    msg += '\nStart download now?';
+    msg += '\nTo continue with download select "OK" to close this window and then click the highlighted "Download" button in the Archive Output Section.';
     if (!confirm(msg)) {
       box.textContent = 'Archive download cancelled before start.';
       setTimeout(postHeightToParent, 50);
       return;
     }
-    box.textContent = 'Starting archive download...';
-    startArchiveStatusPolling();
-    window.open('/fs/download_compressed?dir=' + encodeURIComponent(path), '_blank');
+    showArchiveStartButton(box, path, '/fs/download_raw_tar?dir=' + encodeURIComponent(path), 'temperature-section-start-button');
   } catch (e) {
-    box.textContent = 'Archive estimate failed.';
+    box.textContent = 'Archive estimate failed: ' + (e && e.message ? e.message : e);
+    alert(box.textContent);
     console.log(e);
   }
   setTimeout(postHeightToParent, 50);
@@ -1082,7 +1120,7 @@ async function listTemperatureLogFiles() {
 
       const dlBtn = document.createElement('button');
       dlBtn.className = 'blue-button';
-      dlBtn.textContent = item.isDir ? 'Download .tar.gz' : 'Download';
+      dlBtn.textContent = item.isDir ? 'Download .tar' : 'Download';
       dlBtn.onclick = () => {
         if (item.isDir) {
           prepareArchiveDownload(fullPath);
@@ -1135,6 +1173,8 @@ static const char *fsBrowserHtml = R"rawliteral(
     h3 { color:#459; font-size:26px; line-height:1.1; margin:2px 0 6px; }
     .blue-button { background:white; color:blue; padding:0 4px; font-size:14px; cursor:pointer; border:1px solid blue; border-radius:3px; margin:1px; }
     .blue-button:hover { background:darkblue; color:white; }
+    .archive-download-ready { font-weight:bold; color:blue; background:white; border:2px solid blue; animation: archiveDownloadPulse 0.8s infinite alternate; }
+    @keyframes archiveDownloadPulse { from { background:white; color:blue; box-shadow:0 0 2px blue; transform:scale(1.00); } to { background:#e8f0ff; color:blue; box-shadow:0 0 10px blue; transform:scale(1.06); } }
     #browserBox { border:1px solid #b8c7d9; background:#fbfdff; padding:8px; text-align:left; }
     #toolbar { text-align:center; margin-bottom:6px; }
     #pathLine { text-align:center; color:purple; font-size:12px; margin:4px 0 8px; overflow-wrap:anywhere; }
@@ -1157,7 +1197,7 @@ static const char *fsBrowserHtml = R"rawliteral(
       <button class="blue-button" onclick="document.getElementById('uploadInput').click()">Upload to Current</button>
       <input type="file" id="uploadInput" style="display:none;" onchange="uploadFile(this.files)">
       <button class="blue-button" onclick="createFolder()">Create Folder</button>
-      <button class="blue-button" onclick="downloadCurrentDir()">Download Current Dir</button>
+      <button class="blue-button" style="font-weight:bold;" onclick="downloadCurrentDir()">Download .tar</button>
     </div>
     <div id="pathLine">Current path: <span id="currentPath">/</span></div>
     <div id="fileList"></div>
@@ -1207,12 +1247,58 @@ function fsArchiveTimeRange(bytes) {
   const fast = bytes / (200 * 1024);
   return fsHumanDuration(fast) + ' to ' + fsHumanDuration(slow);
 }
-let fsTgzPollTimer = null;
+function fsArchivePathNoTrailing(path) {
+  path = String(path || '').trim();
+  if (!path.startsWith('/')) path = '/' + path;
+  while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+  return path;
+}
+function fsIsTemperatureLogsRootArchive(path) {
+  return fsArchivePathNoTrailing(path) === '/Temperature_Logs';
+}
+function fsLaunchArchiveDownloadWindow(url) {
+  const sep = url.indexOf('?') >= 0 ? '&' : '?';
+  const finalUrl = url + sep + 'ts=' + Date.now();
+  window.open(finalUrl, '_blank');
+}
+function fsLaunchHiddenArchiveDownload(url) {
+  // Phase2V: full Flash Memory Browser archive downloads are launched
+  // as real browser download navigations instead of hidden iframe streams.
+  fsLaunchArchiveDownloadWindow(url);
+}
+function fsArchiveRawTarUrl(path) {
+  path = fsArchivePathNoTrailing(path);
+  return '/fs/download_raw_tar?dir=' + encodeURIComponent(path);
+}
+function fsOpenArchiveRawTar(path) {
+  const url = fsArchiveRawTarUrl(path);
+  window.open(url + (url.indexOf('?') >= 0 ? '&' : '?') + 'ts=' + Date.now(), '_blank');
+}
+function fsArchiveClickDebug(path, source) {
+  fetch('/fs/archive_click?source=' + encodeURIComponent(source || 'fs-browser') + '&path=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' }).catch(console.log);
+}
+async function fsScanArchiveDir(path, source) {
+  fsArchiveClickDebug(path, source || 'fs-browser-scan');
+  const box = fsArchiveStatusBox();
+  box.textContent = 'Estimating directory. No archive is being created...';
+  try {
+    const r = await fetch('/fs/tar_info?verbose=1&max=1500&dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
+    const info = await r.json();
+    box.textContent = 'Scan ' + (info.ok ? 'OK' : 'FAILED') + ' for ' + path + ': entries=' + (info.entries || 0) + ', dirs=' + (info.dirs || 0) + ', files=' + (info.files || 0) + ', source=' + fsHumanBytes(info.bytes || 0) + ', maxPathLen=' + (info.maxPathLen || 0) + ', longPaths=' + (info.longPaths || 0) + ', zeroFiles=' + (info.zeroFiles || 0) + (info.error ? ', error=' + info.error : '');
+  } catch (e) {
+    box.textContent = 'Scan request failed: ' + (e && e.message ? e.message : e);
+    console.log(e);
+  }
+  setTimeout(postHeightToParent, 50);
+}
+
+
+let fsArchivePollTimer = null;
 function fsArchiveStatusBox() {
-  let box = document.getElementById('tgzStatusBox');
+  let box = document.getElementById('archiveStatusBox');
   if (!box) {
     box = document.createElement('div');
-    box.id = 'tgzStatusBox';
+    box.id = 'archiveStatusBox';
     box.className = 'emptyNote';
     box.style.border = '1px solid #b8c7d9';
     box.style.margin = '4px 0';
@@ -1224,46 +1310,27 @@ function fsArchiveStatusBox() {
   setTimeout(postHeightToParent, 50);
   return box;
 }
-async function fsStopArchiveDownload() {
-  try {
-    await fetch('/fs/download_compressed/cancel', { method:'POST' });
-  } catch (e) { console.log(e); }
-}
-function fsStartArchiveStatusPolling() {
-  const box = fsArchiveStatusBox();
-  if (fsTgzPollTimer) clearInterval(fsTgzPollTimer);
-  async function poll() {
-    try {
-      const r = await fetch('/fs/download_compressed/status?ts=' + Date.now(), { cache:'no-store' });
-      const st = await r.json();
-      if (!st.active) {
-        box.textContent = 'Archive status: idle. Pending pump log events: ' + (st.pendingPumpLogEvents || 0);
-        clearInterval(fsTgzPollTimer);
-        fsTgzPollTimer = null;
-        setTimeout(postHeightToParent, 50);
-        return;
-      }
-      box.textContent = 'Archive ' + st.state + ' | source ' + fsHumanBytes(st.estimatedBytes || 0) + ' | sent ' + fsHumanBytes(st.bytesSent || 0) + ' | produced ' + fsHumanBytes(st.bytesProduced || 0) + ' | pending pump events ' + (st.pendingPumpLogEvents || 0) + ' ';
-      const btn = document.createElement('button');
-      btn.className = 'blue-button';
-      btn.textContent = 'Stop Download';
-      btn.onclick = fsStopArchiveDownload;
-      box.appendChild(btn);
-      if (st.state === 'complete' || st.state === 'failed' || st.state === 'cancelled') {
-        clearInterval(fsTgzPollTimer);
-        fsTgzPollTimer = null;
-      }
-      setTimeout(postHeightToParent, 50);
-    } catch (e) { console.log(e); }
-  }
-  poll();
-  fsTgzPollTimer = setInterval(poll, 1500);
+function fsShowArchiveStartButton(box, path, url, source) {
+  if (!box) box = fsArchiveStatusBox();
+  box.textContent = 'Archive estimate complete for ' + path + '. Click the highlighted Download button to launch the browser download.';
+  const btn = document.createElement('button');
+  btn.className = 'blue-button archive-download-ready';
+  btn.textContent = 'Download';
+  btn.onclick = () => {
+    fsArchiveClickDebug(path, source || 'fs-browser-start-button');
+    box.textContent = 'Starting archive download in a new browser tab/window...';
+    fsLaunchHiddenArchiveDownload(url);
+  };
+  box.appendChild(document.createTextNode(' '));
+  box.appendChild(btn);
+  setTimeout(postHeightToParent, 50);
 }
 async function fsPrepareArchiveDownload(path) {
+  fsArchiveClickDebug(path, 'fs-browser-prepare');
   const box = fsArchiveStatusBox();
   box.textContent = 'Estimating archive size...';
   try {
-    const r = await fetch('/fs/download_compressed/info?dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
+    const r = await fetch('/fs/tar_info?dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
     const info = await r.json();
     if (!info.ok) {
       box.textContent = 'Archive estimate failed: ' + (info.error || 'unknown error');
@@ -1273,20 +1340,22 @@ async function fsPrepareArchiveDownload(path) {
     const bytes = Number(info.bytes || 0);
     let msg = 'Archive download for ' + path + '\n';
     msg += 'Source data: ' + fsHumanBytes(bytes) + '\n';
+    if (info.tarBytes) msg += 'Estimated TAR size: ' + fsHumanBytes(info.tarBytes) + '\n';
+    if (info.fsPctUsed !== undefined) msg += 'Filesystem used: ' + Number(info.fsPctUsed).toFixed(1) + '% (cleanup starts at ' + Number(info.cleanupStartLimit || 0).toFixed(1) + '%)\n';
+    if (info.cleanupRisk) msg += 'WARNING: filesystem cleanup may be close to triggering. The cleanup task will be deferred for protected Temperature_Logs files while this archive is active.\n';
     msg += 'Files: ' + (info.files || 0) + '  Folders: ' + (info.dirs || 0) + '\n';
     msg += 'Estimated download time: ' + fsArchiveTimeRange(bytes) + '\n';
     if (info.truncated) msg += 'Estimate was truncated because the folder is very large.\n';
-    msg += '\nStart download now?';
+    msg += '\nTo continue with download select "OK" to close this window and then click the highlighted "Download" button in the Archive Output Section.';
     if (!confirm(msg)) {
       box.textContent = 'Archive download cancelled before start.';
       setTimeout(postHeightToParent, 50);
       return;
     }
-    box.textContent = 'Starting archive download...';
-    fsStartArchiveStatusPolling();
-    window.open('/fs/download_compressed?dir=' + encodeURIComponent(path), '_blank');
+    fsShowArchiveStartButton(box, path, '/fs/download_raw_tar?dir=' + encodeURIComponent(path), 'fs-browser-start-button');
   } catch (e) {
-    box.textContent = 'Archive estimate failed.';
+    box.textContent = 'Archive estimate failed: ' + (e && e.message ? e.message : e);
+    alert(box.textContent);
     console.log(e);
   }
   setTimeout(postHeightToParent, 50);
@@ -1327,7 +1396,7 @@ async function listFiles(path) {
 
         const dl = document.createElement('button');
         dl.className = 'blue-button';
-        dl.textContent = item.isDir ? 'Download .tar.gz' : 'Download';
+        dl.textContent = item.isDir ? 'Download .tar' : 'Download';
         dl.onclick = () => {
           if (item.isDir) {
             fsPrepareArchiveDownload(fullPath);
@@ -1395,12 +1464,18 @@ listFiles(currentPath);
 
 void setupThirdPageRoutes() {
   server.on("/third-page", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "text/html", thirdPageHtml);
+    AsyncWebServerResponse *response = req->beginResponse(200, "text/html", thirdPageHtml);
+    response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    response->addHeader("Pragma", "no-cache");
+    req->send(response);
   });
 
 
   server.on("/fs-browser", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "text/html", fsBrowserHtml);
+    AsyncWebServerResponse *response = req->beginResponse(200, "text/html", fsBrowserHtml);
+    response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    response->addHeader("Pragma", "no-cache");
+    req->send(response);
   });
 
 
@@ -1726,8 +1801,8 @@ void setupThirdPageRoutes() {
 
 
   
-  // Download directory as tar.gz (ON-THE-FLY streaming, no temp file)
-  TarGZ::registerRoutes(server);
+  // Download directories as streamed raw TAR
+  RawTar::registerRoutes(server);
 
 
 

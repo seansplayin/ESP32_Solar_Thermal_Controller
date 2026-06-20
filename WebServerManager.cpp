@@ -20,7 +20,6 @@
 #include "TimeSync.h"   
 #include "AlarmManager.h"
 #include "AlarmWebpage.h"
-#include "TarGZ.h"
 #include "DiagLog.h"
 #include "NetworkManager.h"
 #include "DS18B20.h"
@@ -1966,7 +1965,7 @@ unsigned long aggregateDecadeLogsReport(int pumpIndex, DateTime currentTime) {
 
   String filename = "/Pump_Logs/pump" + String(pumpIndex + 1) + "_Yearly.txt";
 
-  // ✅ Never block forever on FS mutex (tgz can hold it for a long time)
+  // ✅ Never block forever on FS mutex (an archive stream can hold it for a long time)
     if (!takeFileSystemMutexWithRetry("aggregateDecadeLogsReport",
                                     pdMS_TO_TICKS(200), 10)) {
     LOG_CAT(DBG_PUMPLOG, "[PumpLogs] aggregateDecadeLogsReport: FS busy, skipping\n");

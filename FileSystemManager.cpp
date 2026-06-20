@@ -11,7 +11,6 @@
 #include <esp_err.h>
 #include <esp_task_wdt.h> 
 #include <freertos/semphr.h>
-#include <ESP32-targz.h>
 #include "DiagLog.h"
 
 
@@ -24,6 +23,55 @@
 
 SemaphoreHandle_t fileSystemMutex = nullptr;
 bool g_fileSystemReady = false; // Global Flag to enable Temp Log after FS Mount
+
+static SemaphoreHandle_t g_archiveStateMutex = nullptr;
+static volatile bool g_archiveDownloadActive = false;
+static String g_activeArchiveRoot = "";
+
+static void ensureArchiveStateMutex() {
+    if (!g_archiveStateMutex) g_archiveStateMutex = xSemaphoreCreateMutex();
+}
+
+void fsSetArchiveDownloadActive(bool active, const String& rootPath) {
+    ensureArchiveStateMutex();
+    if (g_archiveStateMutex && xSemaphoreTake(g_archiveStateMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        g_archiveDownloadActive = active;
+        g_activeArchiveRoot = active ? rootPath : String("");
+        xSemaphoreGive(g_archiveStateMutex);
+    } else {
+        g_archiveDownloadActive = active;
+        g_activeArchiveRoot = active ? rootPath : String("");
+    }
+    LOG_CAT(DBG_FS, "[FS] archive protection %s root=%s\n",
+            active ? "ACTIVE" : "cleared", g_activeArchiveRoot.c_str());
+}
+
+bool fsArchiveDownloadActive() {
+    return g_archiveDownloadActive;
+}
+
+String fsActiveArchiveRoot() {
+    ensureArchiveStateMutex();
+    String out;
+    if (g_archiveStateMutex && xSemaphoreTake(g_archiveStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        out = g_activeArchiveRoot;
+        xSemaphoreGive(g_archiveStateMutex);
+    } else {
+        out = g_activeArchiveRoot;
+    }
+    return out;
+}
+
+bool fsArchiveDownloadProtectsPath(const String& path) {
+    if (!g_archiveDownloadActive) return false;
+    String root = fsActiveArchiveRoot();
+    if (root.length() == 0) return false;
+    String p = path;
+    if (!p.startsWith("/")) p = "/" + p;
+    while (p.length() > 1 && p.endsWith("/")) p.remove(p.length() - 1);
+    while (root.length() > 1 && root.endsWith("/")) root.remove(root.length() - 1);
+    return (p == root || p.startsWith(root + "/"));
+}
 
 
 
@@ -379,6 +427,14 @@ static void deleteTemperatureLogsForDateUnlocked(const String &dateStr) {
 
 void enforceTemperatureLogDiskLimit() {
     if (!g_fileSystemReady) return;
+    if (fsArchiveDownloadActive()) {
+        String activeRoot = fsActiveArchiveRoot();
+        if (activeRoot == "/Temperature_Logs" || activeRoot.startsWith("/Temperature_Logs/")) {
+            LOG_CAT(DBG_FS, "[FS] enforceTemperatureLogDiskLimit(): deferred because archive is active for %s\n",
+                    activeRoot.c_str());
+            return;
+        }
+    }
     LOG_CAT(DBG_FS, "[FS] enforceTemperatureLogDiskLimit(): checking disk usage...\n");
 
     if (!takeFileSystemMutexWithRetry("[FS] enforceTemperatureLogDiskLimit",

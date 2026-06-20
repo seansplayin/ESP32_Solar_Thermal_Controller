@@ -404,51 +404,34 @@
 
 
   // -----------------------------------------------------------------------
-   // ThirdWebpage File Browser settings for downloading directories
-   // ===== TGZ (tar.gz) streaming settings located in TarGZ.cpp=====
-   // PSRAM ring buffer size used while streaming tar.gz downloads.
-   // Typical good values: 128*1024 .. 512*1024
+   // ThirdWebpage File Browser settings for streaming raw TAR directory downloads
+   // Raw TAR is used instead of compressed archive support was unstable on
+   // larger Temperature_Logs trees. The streamed raw TAR route does not cache
+   // the whole archive in PSRAM; it sends headers and file chunks directly to
+   // the connected web client.
    // -----------------------------------------------------------------------
-  
-   // TarGZ constants (adjust values as needed)
-   #define TGZ_DELETE_DELAY_MS 5000  // Delay before deleting session (ms)
-   #define TGZ_HTTP_CHUNK_BYTES 4096 // Max bytes per HTTP chunk. tune based on Fingbuf memory allocation
 
-   // TGZ ring buffer placement: 
-   #ifndef TGZ_RING_CACHE_LOCATION
-   #define TGZ_RING_CACHE_LOCATION 1 // 0 = Internal Heap, 1 = PSRAM (falls back to Internal if PSRAM not available)
+   #ifndef RAW_TAR_DELETE_DELAY_MS
+   #define RAW_TAR_DELETE_DELAY_MS 5000
    #endif
 
-   // Ringbuf Memory suggestions: Mininum: 128 KB =(128 * 1024), Decent: 256 KB =(256 * 1024), Extra Smothing: 512 KB = (512 * 1024), Excessive unless downloading Large Directories 4 MB =(4 * 1024 * 1024)
-   #ifndef TGZ_RINGBUF_BYTES
-   #if TGZ_RING_CACHE_LOCATION == 1  // Don't change this value
-   #define TGZ_RINGBUF_BYTES (4 * 1024 * 1024)    // PSRAM default:
-   #else
-   #define TGZ_RINGBUF_BYTES (16 * 1024)  // Internal heap default: recomended 256 KB (Must = at least 16 KB+ and Fragmentation will possibly occur, very fragile with less than 33 KB)
-   #endif
+   #ifndef RAW_TAR_HTTP_CHUNK_BYTES
+   #define RAW_TAR_HTTP_CHUNK_BYTES 4096
    #endif
 
-   // Stack size (bytes) for the tar.gz producer task that runs compression.
-   #ifndef TGZ_PRODUCER_TASK_STACK_BYTES
-   #define TGZ_PRODUCER_TASK_STACK_BYTES (12288)      // If you see stack canary trips, increase to 16384 or 20480.  
+   #ifndef RAW_TAR_READ_CHUNK_BYTES
+   #define RAW_TAR_READ_CHUNK_BYTES 4096
    #endif
 
-   // Task priority for the tar.gz producer task.
-   #ifndef TGZ_PRODUCER_TASK_PRIORITY
-   #define TGZ_PRODUCER_TASK_PRIORITY 1      // Typical range on ESP32: 1..5 (higher = more CPU time)
+   #ifndef RAW_TAR_MAX_MANIFEST_ENTRIES
+   #define RAW_TAR_MAX_MANIFEST_ENTRIES 6000
    #endif
 
-   // Core pinning:
-   #ifndef TGZ_PRODUCER_TASK_CORE
-   #define TGZ_PRODUCER_TASK_CORE (-1)    //  0 or 1 to pin to specific core or -1 for "no affinity" (not pinned)
+   #ifndef RAW_TAR_PRODUCER_TASK_STACK_WORDS
+   #define RAW_TAR_PRODUCER_TASK_STACK_WORDS 2048
    #endif
-  // -----------------------------------------------------------------------
 
-
-
-  // -----------------------------------------------------------------------
-   // Freezed Protection Runtime System Configuration (editable via web UI)
-   // ----------------------------------------------------------------------- 
+   // -----------------------------------------------------------------------
     struct SystemConfig {
     // ---- Serial diagnostics (runtime toggles; future web UI) ----
     bool     diagSerialEnable;  // master runtime enable

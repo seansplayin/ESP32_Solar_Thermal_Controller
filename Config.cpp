@@ -5,7 +5,6 @@
 #include <LittleFS.h>
 #include <string.h>
 #include <stdlib.h>
-#include "TarGZ.h"
 #include "DiagLog.h"
 #include "DiagConfig.h"
 

@@ -59,7 +59,7 @@ extern TaskHandle_t thTaskLogger;
 extern TaskHandle_t thWebSocketTransmitter;
 extern TaskHandle_t thEndofBootup;
 
-// tgzProducer last-run stack stats (WORDS)
+// rawTarProducer last-run stack stats (WORDS)
 
 
 
@@ -128,7 +128,7 @@ static void checkStacks90() {
   struct TaskSpec { const char* name; uint32_t stackUnits; };
 
   // stackUnits MUST match what was passed to xTaskCreate/xTaskCreatePinnedToCore.
-  // NOTE: On this project build, StackType_t is 1 byte (see TGZ debug print),
+  // NOTE: On this project build, StackType_t is 1 byte (see archive debug print),
   // so these are effectively BYTES. If StackType_t changes, the math still works.
   static const TaskSpec specs[] = {
     {"TaskLogger",               4096},

@@ -166,6 +166,17 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       border-radius: 3px;
     }
     .blue-button:hover { background-color: darkblue; color:white; }
+    .archive-download-ready {
+      font-weight: bold;
+      color: blue;
+      background: white;
+      border: 2px solid blue;
+      animation: archiveDownloadPulse 0.8s infinite alternate;
+    }
+    @keyframes archiveDownloadPulse {
+      from { background: white; box-shadow: 0 0 2px blue; transform: scale(1.00); }
+      to   { background: #dbeafe; box-shadow: 0 0 10px blue; transform: scale(1.06); }
+    }
     .blue-button:focus {
       outline: 2px solid rgba(0,0,255,0.6);
       outline-offset: 2px;
@@ -399,7 +410,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       }
 
 
-      let tgzPollTimer = null;
+      let archivePollTimer = null;
 
       function humanBytes(bytes) {
         bytes = Number(bytes || 0);
@@ -428,11 +439,27 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
         return humanDuration(fast) + ' to ' + humanDuration(slow);
       }
 
+      function launchArchiveDownloadWindow(url) {
+        const sep = url.indexOf('?') >= 0 ? '&' : '?';
+        const finalUrl = url + sep + 'ts=' + Date.now();
+        window.open(finalUrl, '_blank');
+      }
+
+      function launchHiddenArchiveDownload(url) {
+        // Phase2M: launch archive downloads as real browser
+        // new-tab/download navigations instead of hidden iframe streams.
+        launchArchiveDownloadWindow(url);
+      }
+
+      function archiveClickDebug(path, source) {
+        fetch('/fs/archive_click?source=' + encodeURIComponent(source || 'pump-section') + '&path=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' }).catch(console.log);
+      }
+
       function archiveStatusBox() {
-        let box = document.getElementById('tgzStatusBox');
+        let box = document.getElementById('archiveStatusBox');
         if (!box) {
           box = document.createElement('div');
-          box.id = 'tgzStatusBox';
+          box.id = 'archiveStatusBox';
           box.className = 'emptyNote';
           box.style.border = '1px solid #b8c7d9';
           box.style.margin = '4px 0';
@@ -444,53 +471,27 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
         return box;
       }
 
-      async function stopArchiveDownload() {
-        try {
-          await fetch('/fs/download_compressed/cancel', { method:'POST' });
-        } catch (e) {
-          console.log(e);
-        }
-      }
-
-      function startArchiveStatusPolling() {
-        const box = archiveStatusBox();
-        if (tgzPollTimer) clearInterval(tgzPollTimer);
-        async function poll() {
-          try {
-            const r = await fetch('/fs/download_compressed/status?ts=' + Date.now(), { cache:'no-store' });
-            const st = await r.json();
-            if (!st.active) {
-              box.textContent = 'Archive status: idle. Pending pump log events: ' + (st.pendingPumpLogEvents || 0);
-              clearInterval(tgzPollTimer);
-              tgzPollTimer = null;
-              return;
-            }
-            const sent = humanBytes(st.bytesSent || 0);
-            const produced = humanBytes(st.bytesProduced || 0);
-            const source = humanBytes(st.estimatedBytes || 0);
-            box.textContent = 'Archive ' + st.state + ' | source ' + source + ' | sent ' + sent + ' | produced ' + produced + ' | pending pump events ' + (st.pendingPumpLogEvents || 0) + ' ';
-            const btn = document.createElement('button');
-            btn.className = 'blue-button';
-            btn.textContent = 'Stop Download';
-            btn.onclick = stopArchiveDownload;
-            box.appendChild(btn);
-            if (st.state === 'complete' || st.state === 'failed' || st.state === 'cancelled') {
-              clearInterval(tgzPollTimer);
-              tgzPollTimer = null;
-            }
-          } catch (e) {
-            console.log(e);
-          }
-        }
-        poll();
-        tgzPollTimer = setInterval(poll, 1500);
+      function showArchiveStartButton(box, path, url, source) {
+        if (!box) box = archiveStatusBox();
+        box.textContent = 'Archive estimate complete for ' + path + '. Click the highlighted Download button to launch the browser download.';
+        const btn = document.createElement('button');
+        btn.className = 'blue-button archive-download-ready';
+        btn.textContent = 'Download';
+        btn.onclick = () => {
+          archiveClickDebug(path, source || 'pump-section-start-button');
+          box.textContent = 'Starting archive download in a new browser tab/window...';
+          launchHiddenArchiveDownload(url);
+        };
+        box.appendChild(document.createTextNode(' '));
+        box.appendChild(btn);
       }
 
       async function prepareArchiveDownload(path) {
+        archiveClickDebug(path, 'pump-section-prepare');
         const box = archiveStatusBox();
         box.textContent = 'Estimating archive size...';
         try {
-          const r = await fetch('/fs/download_compressed/info?dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
+          const r = await fetch('/fs/tar_info?dir=' + encodeURIComponent(path) + '&ts=' + Date.now(), { cache:'no-store' });
           const info = await r.json();
           if (!info.ok) {
             box.textContent = 'Archive estimate failed: ' + (info.error || 'unknown error');
@@ -500,17 +501,18 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
           const bytes = Number(info.bytes || 0);
           let msg = 'Archive download for ' + path + '\n';
           msg += 'Source data: ' + humanBytes(bytes) + '\n';
+    if (info.tarBytes) msg += 'Estimated TAR size: ' + humanBytes(info.tarBytes) + '\n';
+    if (info.fsPctUsed !== undefined) msg += 'Filesystem used: ' + Number(info.fsPctUsed).toFixed(1) + '% (cleanup starts at ' + Number(info.cleanupStartLimit || 0).toFixed(1) + '%)\n';
+    if (info.cleanupRisk) msg += 'WARNING: filesystem cleanup may be close to triggering. The cleanup task will be deferred for protected Temperature_Logs files while this archive is active.\n';
           msg += 'Files: ' + (info.files || 0) + '  Folders: ' + (info.dirs || 0) + '\n';
           msg += 'Estimated download time: ' + archiveTimeRange(bytes) + '\n';
           if (info.truncated) msg += 'Estimate was truncated because the folder is very large.\n';
-          msg += '\nStart download now?';
+          msg += '\nTo continue with download select "OK" to close this window and then click the highlighted "Download" button in the Archive Output Section.';
           if (!confirm(msg)) {
             box.textContent = 'Archive download cancelled before start.';
             return;
           }
-          box.textContent = 'Starting archive download...';
-          startArchiveStatusPolling();
-          window.open('/fs/download_compressed?dir=' + encodeURIComponent(path), '_blank');
+          showArchiveStartButton(box, path, '/fs/download_raw_tar?dir=' + encodeURIComponent(path), 'pump-section-start-button');
         } catch (e) {
           box.textContent = 'Archive estimate failed.';
           console.log(e);
@@ -604,7 +606,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
 
             const dlBtn = document.createElement('button');
             dlBtn.className = 'blue-button';
-            dlBtn.textContent = item.isDir ? 'Download .tar.gz' : 'Download';
+            dlBtn.textContent = item.isDir ? 'Download .tar' : 'Download';
             dlBtn.onclick = () => {
               if (item.isDir) {
                 prepareArchiveDownload(fullPath);
@@ -613,6 +615,7 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
               }
             };
             row.appendChild(dlBtn);
+
             list.appendChild(row);
           });
         } catch (e) {
@@ -636,10 +639,10 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       document.getElementById('downloadAllFilesButton').addEventListener('click', function() {
         prepareArchiveDownload('/Pump_Logs');
       });
-        });
-     document
-    .getElementById('pumpRuntimesLink')
-    .href = window.location.origin + '/second-page';
+      document
+        .getElementById('pumpRuntimesLink')
+        .href = window.location.origin + '/second-page';
+    });
   </script>
 </body>
 </html>
@@ -825,7 +828,10 @@ void readPumpLogFiles(
       };
 
       // Stream directly from PROGMEM, replacing tags on the fly
-      request->send_P(200, "text/html; charset=UTF-8", secondPageTemplate, processor);
+      AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html; charset=UTF-8", secondPageTemplate, processor);
+      response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+      response->addHeader("Pragma", "no-cache");
+      request->send(response);
     });
   }
 

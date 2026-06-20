@@ -2,6 +2,7 @@
 #define TEMPERATURELOGGING_H
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
 
 // -----------------------------------------------------------------------
 // Mutex handles as extern to be accessible in other files - do not change
@@ -15,6 +16,9 @@ void setupTemperatureLogging();
 void TaskTemperatureLogging_Run(void *pvParams);
 
 // Temperature Logging gate - ensures Temperature logging is last to load
-void enableTemperatureLogging(); 
+void enableTemperatureLogging();
+
+// Request a one-shot flush from the TemperatureLogging task and wait for completion.
+bool requestTemperatureLogCacheFlush(TickType_t waitTicks = pdMS_TO_TICKS(7000)); 
 
 #endif // TEMPERATURELOGGING_H

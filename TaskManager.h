@@ -32,10 +32,10 @@ extern bool flagZeroLengthTime;
   extern TaskHandle_t thFileSystemCleanup;
 extern TaskHandle_t thEndofBootup;
 
-// tgz producer last-run stack stats (defined in TarGZ.cpp)
-extern volatile uint32_t tgzLastStackWords;
-extern volatile uint32_t tgzLastHwmWords;
-extern TaskHandle_t thTgzProducer;
+// Raw TAR archive producer last-run stack stats (defined in RawTar.cpp)
+extern volatile uint32_t rawTarLastStackWords;
+extern volatile uint32_t rawTarLastHwmWords;
+extern TaskHandle_t thRawTarProducer;
 extern QueueHandle_t logQueue;
 
 #endif

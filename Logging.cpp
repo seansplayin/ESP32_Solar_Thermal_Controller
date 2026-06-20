@@ -121,7 +121,7 @@ extern QueueHandle_t logQueue;
 // Pump log RAM buffering
 // -----------------------------------------------------------------------------
 // Pump START/STOP events are control-history data. They must not be lost just
-// because a large TGZ download, file browser stream, or cleanup task is holding
+// because a large archive download, file browser stream, or cleanup task is holding
 // the filesystem mutex.  Phase 1 behavior:
 //   * logPumpEvent() captures the event in RAM immediately.
 //   * TaskLogger flushes RAM events to /Pump_Logs every 10 minutes or when the
@@ -369,7 +369,7 @@ DateTime parseDateTimeFromLog(const String& datetimeStr);
 
 // New queue based Logging Topology for Pump Runtimes: checkTimeAndAct → setElapsed_Day / setperformLogAggregation → performLogAggregation.
 // Phase 1 update: logPumpEvent now captures the event in RAM immediately.
-// TaskLogger later flushes RAM events to /Pump_Logs so long TGZ/file-browser activity
+// TaskLogger later flushes RAM events to /Pump_Logs so long archive/file-browser activity
 // cannot cause START/STOP events to be dropped.
 void logPumpEvent(uint8_t pumpIndex, bool isStart, const DateTime &ts) {
   LogEvent ev{ pumpIndex, isStart, ts };

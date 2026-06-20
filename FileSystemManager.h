@@ -47,6 +47,15 @@ extern String g_cachedFsStatsJson;
 void updateFSStatsCache();
 String getFSStatsString();
 
+
+// ================================
+// ARCHIVE / CLEANUP COORDINATION
+// ================================
+void fsSetArchiveDownloadActive(bool active, const String& rootPath);
+bool fsArchiveDownloadActive();
+String fsActiveArchiveRoot();
+bool fsArchiveDownloadProtectsPath(const String& path);
+
 // ================================
 // TEMPERATURE LOG MAINTENANCE
 // ================================

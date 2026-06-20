@@ -57,6 +57,24 @@ extern bool g_timeValid;        // from RTCManager / TimeSync
 
 // Temperature logging stays disabled until valid time exists.
 static bool g_tempLogEnabled = false;
+static volatile bool g_forceTempLogFlushRequest = false;
+static volatile uint32_t g_tempLogFlushCompletedCount = 0;
+
+bool requestTemperatureLogCacheFlush(TickType_t waitTicks) {
+    if (!g_tempLogEnabled || !g_fileSystemReady) return false;
+    uint32_t before = g_tempLogFlushCompletedCount;
+    g_forceTempLogFlushRequest = true;
+    uint32_t start = millis();
+    while (g_tempLogFlushCompletedCount == before) {
+        esp_task_wdt_reset();
+        if ((uint32_t)(millis() - start) >= ((uint32_t)waitTicks * portTICK_PERIOD_MS)) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return true;
+}
+
 
 void enableTemperatureLogging()
 {
@@ -243,11 +261,11 @@ static void addToCache(int sensorIdx0, float value) {
 // ---------------------------------------------------------------------------
 // Flush all caches to flash (Batch Write to Minimize Mutex Holds)
 // ---------------------------------------------------------------------------
-static void flushCache() {
+static void flushCache(bool force = false) {
     uint32_t nowMs = millis();
 
-    // Gate time value since last flush (Config.h)
-    if (nowMs - lastFlushMsGlobal < (TEMP_LOG_SAMPLE_SEC * 1000UL)) {
+    // Gate time value since last flush (Config.h), unless an archive preflight requested a snapshot flush.
+    if (!force && nowMs - lastFlushMsGlobal < (TEMP_LOG_SAMPLE_SEC * 1000UL)) {
 #ifdef TEMP_LOG_DEBUG_FLUSH
         LOG_CAT(DBG_TEMPLOG, "[TempLog] Flush skipped -- less than 1 min since last\n");
 #endif
@@ -394,7 +412,14 @@ void TaskTemperatureLogging_Run(void*)
             }
         }
 
-        // 4) Respect the sample interval (based on millis, not wall clock)
+        // 4) Archive preflight can request a cache flush so the archive manifest is a clean snapshot.
+        if (g_forceTempLogFlushRequest) {
+            g_forceTempLogFlushRequest = false;
+            flushCache(true);
+            g_tempLogFlushCompletedCount++;
+        }
+
+        // 5) Respect the sample interval (based on millis, not wall clock)
         uint32_t nowMs = millis();
         if (nowMs - lastSampleMs < (TEMP_LOG_SAMPLE_SEC * 1000UL)) {
             vTaskDelay(pdMS_TO_TICKS(200));  // small yield, don’t hammer CPU
