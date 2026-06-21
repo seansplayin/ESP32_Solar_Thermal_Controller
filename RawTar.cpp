@@ -6,6 +6,7 @@
 #include <FS.h>
 #include <vector>
 #include <algorithm>
+#include <string.h>
 #include <time.h>
 #include <esp_task_wdt.h>
 #include "FileSystemManager.h"
@@ -21,6 +22,161 @@ volatile uint32_t rawTarLastHwmWords   = 0;
 
 static volatile bool g_rawTarInProgress = false;
 static bool g_rawTarBegun = false;
+
+static String u64ToString(uint64_t v);
+
+struct RawTarArchiveStatusState {
+  bool hasStatus = false;
+  bool active = false;
+  bool completed = false;
+  bool failed = false;
+  char token[56] = {0};
+  char root[128] = {0};
+  char filename[96] = {0};
+  char error[128] = {0};
+  uint32_t entries = 0;
+  uint32_t files = 0;
+  uint32_t dirs = 0;
+  uint64_t sourceBytes = 0;
+  uint64_t estTarBytes = 0;
+  uint64_t bytesOut = 0;
+  uint32_t filesSent = 0;
+  uint32_t dirsSent = 0;
+  uint32_t seq = 0;
+};
+
+static portMUX_TYPE g_rawTarStatusMux = portMUX_INITIALIZER_UNLOCKED;
+static RawTarArchiveStatusState g_rawTarStatus;
+
+static void rawTarSafeCopy(char* dst, size_t dstSize, const char* src) {
+  if (!dst || dstSize == 0) return;
+  if (!src) src = "";
+  size_t n = strlen(src);
+  if (n >= dstSize) n = dstSize - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+static String rawTarJsonEscape(const char* src) {
+  String out;
+  if (!src) return out;
+  while (*src) {
+    char c = *src++;
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+static void rawTarMakeBeginLine(const RawTarArchiveStatusState& st, char* out, size_t outSize) {
+  if (!out || outSize == 0) return;
+  snprintf(out, outSize,
+           "[RAW-TAR] stream begin dir=%s entries=%u files=%u dirs=%u sourceBytes=%llu estTarBytes=%llu filename=%s",
+           st.root, (unsigned)st.entries, (unsigned)st.files, (unsigned)st.dirs,
+           (unsigned long long)st.sourceBytes, (unsigned long long)st.estTarBytes, st.filename);
+}
+
+static void rawTarMakeCompleteLine(const RawTarArchiveStatusState& st, char* out, size_t outSize) {
+  if (!out || outSize == 0) return;
+  snprintf(out, outSize,
+           "[RAW-TAR] stream complete root=%s bytesOut=%llu filesSent=%u dirsSent=%u err=%s",
+           st.root, (unsigned long long)st.bytesOut,
+           (unsigned)st.filesSent, (unsigned)st.dirsSent, st.error);
+}
+
+static void rawTarStatusBegin(const char* token, const char* root, const char* filename,
+                              uint32_t entries, uint32_t files, uint32_t dirs,
+                              uint64_t sourceBytes, uint64_t estTarBytes) {
+  portENTER_CRITICAL(&g_rawTarStatusMux);
+  g_rawTarStatus.hasStatus = true;
+  g_rawTarStatus.active = true;
+  g_rawTarStatus.completed = false;
+  g_rawTarStatus.failed = false;
+  rawTarSafeCopy(g_rawTarStatus.token, sizeof(g_rawTarStatus.token), token);
+  rawTarSafeCopy(g_rawTarStatus.root, sizeof(g_rawTarStatus.root), root);
+  rawTarSafeCopy(g_rawTarStatus.filename, sizeof(g_rawTarStatus.filename), filename);
+  rawTarSafeCopy(g_rawTarStatus.error, sizeof(g_rawTarStatus.error), "");
+  g_rawTarStatus.entries = entries;
+  g_rawTarStatus.files = files;
+  g_rawTarStatus.dirs = dirs;
+  g_rawTarStatus.sourceBytes = sourceBytes;
+  g_rawTarStatus.estTarBytes = estTarBytes;
+  g_rawTarStatus.bytesOut = 0;
+  g_rawTarStatus.filesSent = 0;
+  g_rawTarStatus.dirsSent = 0;
+  g_rawTarStatus.seq++;
+  portEXIT_CRITICAL(&g_rawTarStatusMux);
+}
+
+static void rawTarStatusProgress(const char* token, uint64_t bytesOut, uint32_t filesSent, uint32_t dirsSent) {
+  portENTER_CRITICAL(&g_rawTarStatusMux);
+  if (g_rawTarStatus.hasStatus && g_rawTarStatus.active &&
+      strncmp(g_rawTarStatus.token, token ? token : "", sizeof(g_rawTarStatus.token)) == 0) {
+    g_rawTarStatus.bytesOut = bytesOut;
+    g_rawTarStatus.filesSent = filesSent;
+    g_rawTarStatus.dirsSent = dirsSent;
+    g_rawTarStatus.seq++;
+  }
+  portEXIT_CRITICAL(&g_rawTarStatusMux);
+}
+
+static void rawTarStatusComplete(const char* token, bool failed,
+                                 uint64_t bytesOut, uint32_t filesSent, uint32_t dirsSent, const char* err) {
+  portENTER_CRITICAL(&g_rawTarStatusMux);
+  if (g_rawTarStatus.hasStatus &&
+      strncmp(g_rawTarStatus.token, token ? token : "", sizeof(g_rawTarStatus.token)) == 0) {
+    g_rawTarStatus.active = false;
+    g_rawTarStatus.completed = true;
+    g_rawTarStatus.failed = failed;
+    g_rawTarStatus.bytesOut = bytesOut;
+    g_rawTarStatus.filesSent = filesSent;
+    g_rawTarStatus.dirsSent = dirsSent;
+    rawTarSafeCopy(g_rawTarStatus.error, sizeof(g_rawTarStatus.error), err);
+    g_rawTarStatus.seq++;
+  }
+  portEXIT_CRITICAL(&g_rawTarStatusMux);
+}
+
+static String rawTarStatusJson(const String& tokenFilter) {
+  RawTarArchiveStatusState st;
+  portENTER_CRITICAL(&g_rawTarStatusMux);
+  memcpy(&st, &g_rawTarStatus, sizeof(st));
+  portEXIT_CRITICAL(&g_rawTarStatusMux);
+
+  bool tokenMatches = (tokenFilter.length() == 0) || (strncmp(st.token, tokenFilter.c_str(), sizeof(st.token)) == 0);
+  char beginLine[512];
+  char completeLine[512];
+  rawTarMakeBeginLine(st, beginLine, sizeof(beginLine));
+  rawTarMakeCompleteLine(st, completeLine, sizeof(completeLine));
+
+  String json;
+  json.reserve(1200);
+  json += "{\"ok\":true";
+  json += ",\"hasStatus\":" + String((st.hasStatus && tokenMatches) ? "true" : "false");
+  json += ",\"token\":\"" + rawTarJsonEscape(st.token) + "\"";
+  json += ",\"active\":" + String((st.active && tokenMatches) ? "true" : "false");
+  json += ",\"completed\":" + String((st.completed && tokenMatches) ? "true" : "false");
+  json += ",\"failed\":" + String((st.failed && tokenMatches) ? "true" : "false");
+  json += ",\"root\":\"" + rawTarJsonEscape(st.root) + "\"";
+  json += ",\"filename\":\"" + rawTarJsonEscape(st.filename) + "\"";
+  json += ",\"entries\":" + String((unsigned)st.entries);
+  json += ",\"files\":" + String((unsigned)st.files);
+  json += ",\"dirs\":" + String((unsigned)st.dirs);
+  json += ",\"sourceBytes\":" + u64ToString(st.sourceBytes);
+  json += ",\"estTarBytes\":" + u64ToString(st.estTarBytes);
+  json += ",\"bytesOut\":" + u64ToString(st.bytesOut);
+  json += ",\"filesSent\":" + String((unsigned)st.filesSent);
+  json += ",\"dirsSent\":" + String((unsigned)st.dirsSent);
+  json += ",\"error\":\"" + rawTarJsonEscape(st.error) + "\"";
+  json += ",\"beginLine\":\"" + rawTarJsonEscape(beginLine) + "\"";
+  json += ",\"completeLine\":\"" + rawTarJsonEscape(completeLine) + "\"";
+  json += ",\"seq\":" + String((unsigned)st.seq);
+  json += "}";
+  return json;
+}
 
 static String u64ToString(uint64_t v) {
   char buf[32];
@@ -254,6 +410,14 @@ static String rawTarEstimateJson(const String& dir, bool ok, const RawTarEstimat
   json += ",\"cleanupStartLimit\":" + String(FS_Cleaning_START_LIMIT, 1);
   json += ",\"cleanupStopLimit\":" + String(FS_Cleaning_STOP_LIMIT, 1);
   json += ",\"cleanupRisk\":" + String(cleanupRisk ? "true" : "false");
+  String fnDir = rawTarNormalizePath(dir, false);
+  String fnBase;
+  if (fnDir == "/") {
+    fnBase = "drive.download.tar";
+  } else {
+    fnBase = fnDir.substring(fnDir.lastIndexOf('/') + 1) + ".tar";
+  }
+  json += ",\"filename\":\"" + fnBase + "\"";
   if (err.length()) {
     String esc = err;
     esc.replace("\\", "\\\\");
@@ -293,10 +457,90 @@ static bool rawTarBuildManifest(const String& dir, std::vector<RawTarEntry>& ent
   return true;
 }
 
+// Estimate-only tree walk used by /fs/tar_info.
+// This intentionally does NOT build the full String/vector manifest.  The
+// manifest is only needed when the archive actually starts.  Keeping the
+// estimate path allocation-light prevents repeated UI preflight requests from
+// fragmenting heap or tripping the allocator on large Temperature_Logs trees.
+static bool rawTarEstimateTreeUnlocked(const String& path, RawTarEstimate& est, String& err, uint8_t depth) {
+  if (depth > 32) { err = "recursion depth exceeded"; return false; }
+  if (est.entries >= RAW_TAR_MAX_MANIFEST_ENTRIES) { est.truncated = true; err = "estimate entry limit exceeded"; return false; }
+
+  File node = LittleFS.open(path, "r");
+  if (!node) { err = "open failed: " + path; return false; }
+  const bool isDir = node.isDirectory();
+  const uint32_t sz = isDir ? 0 : (uint32_t)node.size();
+  node.close();
+
+  const String norm = rawTarNormalizePath(path, false);
+  est.entries++;
+  if (isDir) est.dirs++;
+  else { est.files++; est.sourceBytes += sz; }
+  est.tarBytes += 512ULL + (isDir ? 0ULL : rawTarPaddedFileBytes(sz));
+  if (norm.length() > est.maxPathLen) est.maxPathLen = (uint16_t)norm.length();
+
+  if (!isDir) return true;
+
+  File dir = LittleFS.open(path, "r");
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    err = "dir reopen failed: " + path;
+    return false;
+  }
+
+  File child = dir.openNextFile();
+  while (child) {
+    String childName = String(child.name());
+    child.close();
+
+    String childPath = rawTarChildPath(path, childName);
+    if (childPath.length() > 1 && childPath != path) {
+      if (!rawTarEstimateTreeUnlocked(childPath, est, err, depth + 1)) {
+        dir.close();
+        return false;
+      }
+    }
+
+    esp_task_wdt_reset();
+    vTaskDelay(1);
+    child = dir.openNextFile();
+  }
+
+  dir.close();
+  return true;
+}
+
+static bool rawTarBuildEstimate(const String& dir, RawTarEstimate& est, String& err) {
+  est = RawTarEstimate();
+
+  if (!takeFileSystemMutexWithRetry("[RAW-TAR] estimate", pdMS_TO_TICKS(10000), 3)) {
+    err = "filesystem busy while estimating archive";
+    return false;
+  }
+  if (!LittleFS.exists(dir)) {
+    xSemaphoreGive(fileSystemMutex);
+    err = "path not found";
+    return false;
+  }
+  File root = LittleFS.open(dir, "r");
+  const bool isDir = root && root.isDirectory();
+  if (root) root.close();
+  if (!isDir) {
+    xSemaphoreGive(fileSystemMutex);
+    err = "not a directory";
+    return false;
+  }
+
+  const bool ok = rawTarEstimateTreeUnlocked(dir, est, err, 0);
+  xSemaphoreGive(fileSystemMutex);
+  return ok;
+}
+
 struct RawTarStreamSession {
   std::vector<RawTarEntry> entries;
   String root;
   String filename;
+  char token[56] = {0};
   size_t index = 0;
   enum Phase : uint8_t { PHASE_HEADER, PHASE_DATA, PHASE_PADDING, PHASE_TRAILER, PHASE_DONE, PHASE_FAILED } phase = PHASE_HEADER;
   uint8_t header[512];
@@ -346,6 +590,7 @@ static void rawTarFinishSession(RawTarStreamSession* s, bool failed = false, con
   s->phase = failed ? RawTarStreamSession::PHASE_FAILED : RawTarStreamSession::PHASE_DONE;
   if (err.length()) s->error = err;
   rawTarClearArchiveState();
+  rawTarStatusComplete(s->token, failed, s->bytesOut, s->filesSent, s->dirsSent, s->error.c_str());
   LOG_CAT(DBG_ARCHIVE,
           "[RAW-TAR] stream %s root=%s bytesOut=%llu filesSent=%u dirsSent=%u err=%s\n",
           failed ? "failed" : "complete", s->root.c_str(),
@@ -400,6 +645,7 @@ static size_t rawTarStreamCallback(RawTarStreamSession* s, uint8_t* buffer, size
         if (e.isDir) {
           e.sent = true;
           s->dirsSent++;
+          rawTarStatusProgress(s->token, s->bytesOut, s->filesSent, s->dirsSent);
           s->index++;
           s->headerPos = 512;
         } else {
@@ -422,6 +668,7 @@ static size_t rawTarStreamCallback(RawTarStreamSession* s, uint8_t* buffer, size
         rawTarCloseFile(s);
         e.sent = true;
         s->filesSent++;
+        rawTarStatusProgress(s->token, s->bytesOut, s->filesSent, s->dirsSent);
         s->phase = RawTarStreamSession::PHASE_PADDING;
         continue;
       }
@@ -458,6 +705,7 @@ static size_t rawTarStreamCallback(RawTarStreamSession* s, uint8_t* buffer, size
       pos += (size_t)n;
       s->fileRemaining -= (uint32_t)n;
       s->bytesOut += (size_t)n;
+      rawTarStatusProgress(s->token, s->bytesOut, s->filesSent, s->dirsSent);
       continue;
     }
 
@@ -501,8 +749,17 @@ static bool rawTarPreFlushForPath(const String& dir) {
   if (dir == "/Pump_Logs" || dir.startsWith("/Pump_Logs/")) {
     ok = flushPendingPumpLogEvents(pdMS_TO_TICKS(3000), 3) && ok;
   }
+
+  // Do NOT force a Temperature_Logs cache flush from the async HTTP download
+  // path.  Root archive downloads already proved stable without this flush,
+  // while Temperature_Logs-specific downloads were aborting before archive
+  // protection/manifest build.  That points at the synchronous temp-log flush
+  // request path, not the raw TAR stream itself.  The archive remains a valid
+  // snapshot of files already on LittleFS; the newest RAM-cached samples will
+  // be included after the normal temperature logger flushes them.
   if (dir == "/Temperature_Logs" || dir.startsWith("/Temperature_Logs/")) {
-    ok = requestTemperatureLogCacheFlush(pdMS_TO_TICKS(7000)) && ok;
+    LOG_CAT(DBG_ARCHIVE,
+            "[RAW-TAR] Temperature log cache preflush skipped for stability; archiving files already on FS.\n");
   }
   return ok;
 }
@@ -514,10 +771,9 @@ static void handleRawTarInfo(AsyncWebServerRequest* request) {
   String dir = rawTarNormalizePath(request->getParam("dir")->value(), false);
   if (!isSafePath(dir)) { request->send(400, "application/json", "{\"ok\":false,\"error\":\"Unsafe path\"}"); return; }
 
-  std::vector<RawTarEntry> entries;
   RawTarEstimate est;
   String err;
-  bool ok = rawTarBuildManifest(dir, entries, est, err);
+  bool ok = rawTarBuildEstimate(dir, est, err);
   request->send(ok ? 200 : 500, "application/json", rawTarEstimateJson(dir, ok, est, err));
 }
 
@@ -538,6 +794,8 @@ static void handleRawTarDownload(AsyncWebServerRequest* request) {
   if (!s) { request->send(500, "text/plain", "session allocation failed"); return; }
   s->root = dir;
   s->filename = rawTarFilenameForDir(dir);
+  String tokenParam = request->hasParam("token") ? request->getParam("token")->value() : String("rawtar_no_token");
+  rawTarSafeCopy(s->token, sizeof(s->token), tokenParam.c_str());
 
   RawTarEstimate est;
   String err;
@@ -555,6 +813,7 @@ static void handleRawTarDownload(AsyncWebServerRequest* request) {
 
   g_rawTarInProgress = true;
   fsSetArchiveDownloadActive(true, dir);
+  rawTarStatusBegin(s->token, dir.c_str(), s->filename.c_str(), est.entries, est.files, est.dirs, est.sourceBytes, est.tarBytes);
 
   LOG_CAT(DBG_ARCHIVE,
           "[RAW-TAR] stream begin dir=%s entries=%u files=%u dirs=%u sourceBytes=%llu estTarBytes=%llu filename=%s\n",
@@ -579,6 +838,11 @@ static void handleRawTarDownload(AsyncWebServerRequest* request) {
   request->send(response);
 }
 
+static void handleRawTarStatus(AsyncWebServerRequest *request) {
+  String token = request->hasParam("token") ? request->getParam("token")->value() : String("");
+  request->send(200, "application/json", rawTarStatusJson(token));
+}
+
 static void handleArchiveClick(AsyncWebServerRequest *request) {
   String source = request->hasParam("source") ? request->getParam("source")->value() : "unknown";
   String path   = request->hasParam("path") ? request->getParam("path")->value() : "";
@@ -598,6 +862,7 @@ void RawTar::registerRoutes(AsyncWebServer &server) {
   server.on("/fs/tar_info", HTTP_GET, handleRawTarInfo);
   server.on("/fs/raw_tar_info", HTTP_GET, handleRawTarInfo);
   server.on("/fs/download_raw_tar", HTTP_GET, handleRawTarDownload);
+  server.on("/fs/archive_status", HTTP_GET, handleRawTarStatus);
   server.on("/fs/tar_raw", HTTP_GET, handleRawTarDownload);
   server.on("/fs/download_tar", HTTP_GET, handleRawTarDownload);
 }

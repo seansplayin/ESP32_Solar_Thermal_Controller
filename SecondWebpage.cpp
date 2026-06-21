@@ -166,17 +166,6 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       border-radius: 3px;
     }
     .blue-button:hover { background-color: darkblue; color:white; }
-    .archive-download-ready {
-      font-weight: bold;
-      color: blue;
-      background: white;
-      border: 2px solid blue;
-      animation: archiveDownloadPulse 0.8s infinite alternate;
-    }
-    @keyframes archiveDownloadPulse {
-      from { background: white; box-shadow: 0 0 2px blue; transform: scale(1.00); }
-      to   { background: #dbeafe; box-shadow: 0 0 10px blue; transform: scale(1.06); }
-    }
     .blue-button:focus {
       outline: 2px solid rgba(0,0,255,0.6);
       outline-offset: 2px;
@@ -239,7 +228,10 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
     <button id="downloadFilesButton" class="blue-button" style="display:none;">Download Selected</button>
     <button id="downloadAllFilesButton" class="blue-button" style="display:none;">Download All</button>
   </div>
-  <div id="filesContainer"></div>
+  <div id="filesContainer" style="display:none;">
+    <div id="pumpLogFileList"></div>
+    <div id="pumpArchiveStatusBox" class="emptyNote" style="display:none; border:1px solid #b8c7d9; margin:4px 0; padding:5px; white-space:pre-wrap;"></div>
+  </div>
 
   </div> <script>
     // Format seconds -> Hh Mm Ss
@@ -456,34 +448,95 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
       }
 
       function archiveStatusBox() {
-        let box = document.getElementById('archiveStatusBox');
+        let box = document.getElementById('pumpArchiveStatusBox');
         if (!box) {
           box = document.createElement('div');
-          box.id = 'archiveStatusBox';
+          box.id = 'pumpArchiveStatusBox';
           box.className = 'emptyNote';
           box.style.border = '1px solid #b8c7d9';
           box.style.margin = '4px 0';
           box.style.padding = '5px';
+          box.style.whiteSpace = 'pre-wrap';
+        }
+        const pathLine = document.getElementById('pumpLogCurrentPathLine');
+        if (pathLine && pathLine.parentNode) {
+          pathLine.parentNode.insertBefore(box, pathLine.nextSibling);
+        } else {
           const container = document.getElementById('filesContainer');
-          container.parentNode.insertBefore(box, container);
+          if (container && box.parentNode !== container) container.appendChild(box);
         }
         box.style.display = 'block';
         return box;
       }
 
-      function showArchiveStartButton(box, path, url, source) {
+      function archiveCompleteLabel(failed) {
+        return (failed ? 'Download Failed' : 'Download Complete') + ' - ' + new Date().toLocaleString();
+      }
+
+      function archiveBuildBeginLine(path, info) {
+        info = info || {};
+        return '[RAW-TAR] stream begin dir=' + path +
+          ' entries=' + (info.entries || 0) +
+          ' files=' + (info.files || 0) +
+          ' dirs=' + (info.dirs || 0) +
+          ' sourceBytes=' + (info.bytes || info.sourceBytes || 0) +
+          ' estTarBytes=' + (info.tarBytes || info.estTarBytes || 0) +
+          ' filename=' + (info.filename || 'download.tar');
+      }
+      function archiveCompleteFallback(path, st) {
+        st = st || {};
+        return '[RAW-TAR] stream complete root=' + path +
+          ' bytesOut=' + (st.bytesOut || 0) +
+          ' filesSent=' + (st.filesSent || 0) +
+          ' dirsSent=' + (st.dirsSent || 0) +
+          ' err=' + (st.error || '');
+      }
+      function archiveAppendToken(url, token) {
+        const sep = url.indexOf('?') >= 0 ? '&' : '?';
+        return url + sep + 'token=' + encodeURIComponent(token);
+      }
+      function archiveStartStatusPoll(box, path, token, beginLine) {
+        if (archivePollTimer) clearInterval(archivePollTimer);
+        let tries = 0;
+        archivePollTimer = setInterval(async () => {
+          tries++;
+          try {
+            const r = await fetch('/fs/archive_status?token=' + encodeURIComponent(token) + '&ts=' + Date.now(), { cache:'no-store' });
+            const st = await r.json();
+            if (!st || !st.hasStatus || st.token !== token) {
+              if (tries > 900) { clearInterval(archivePollTimer); archivePollTimer = null; }
+              return;
+            }
+            const started = st.beginLine || beginLine;
+            box.style.whiteSpace = 'pre-wrap';
+            if (st.completed) {
+              clearInterval(archivePollTimer);
+              archivePollTimer = null;
+              box.textContent = archiveCompleteLabel(st.failed) + '\n' +
+                started + '\n' +
+                (st.completeLine || archiveCompleteFallback(path, st));
+            } else {
+              box.textContent = 'Archive download in progress...\n' +
+                started + '\n' +
+                'Transferred so far: ' + humanBytes(st.bytesOut || 0) +
+                '   Files sent: ' + (st.filesSent || 0) + '/' + (st.files || 0) +
+                '   Folders sent: ' + (st.dirsSent || 0) + '/' + (st.dirs || 0);
+            }
+          } catch (e) {
+            console.log(e);
+            if (tries > 900) { clearInterval(archivePollTimer); archivePollTimer = null; }
+          }
+        }, 1000);
+      }
+      function showArchiveStartButton(box, path, url, source, info) {
         if (!box) box = archiveStatusBox();
-        box.textContent = 'Archive estimate complete for ' + path + '. Click the highlighted Download button to launch the browser download.';
-        const btn = document.createElement('button');
-        btn.className = 'blue-button archive-download-ready';
-        btn.textContent = 'Download';
-        btn.onclick = () => {
-          archiveClickDebug(path, source || 'pump-section-start-button');
-          box.textContent = 'Starting archive download in a new browser tab/window...';
-          launchHiddenArchiveDownload(url);
-        };
-        box.appendChild(document.createTextNode(' '));
-        box.appendChild(btn);
+        const beginLine = archiveBuildBeginLine(path, info || {});
+        const token = 'rawtar_' + Date.now() + '_' + Math.floor(Math.random() * 1000000);
+        archiveClickDebug(path, source || 'pump-section-start-button');
+        box.style.whiteSpace = 'pre-wrap';
+        box.textContent = 'Starting archive download in a new browser tab/window...\n' + beginLine + '\nWaiting for completion...';
+        archiveStartStatusPoll(box, path, token, beginLine);
+        launchHiddenArchiveDownload(archiveAppendToken(url, token));
       }
 
       async function prepareArchiveDownload(path) {
@@ -507,12 +560,12 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
           msg += 'Files: ' + (info.files || 0) + '  Folders: ' + (info.dirs || 0) + '\n';
           msg += 'Estimated download time: ' + archiveTimeRange(bytes) + '\n';
           if (info.truncated) msg += 'Estimate was truncated because the folder is very large.\n';
-          msg += '\nTo continue with download select "OK" to close this window and then click the highlighted "Download" button in the Archive Output Section.';
+          msg += '\nSelect "OK" to begin the archive download in a new browser tab/window.';
           if (!confirm(msg)) {
             box.textContent = 'Archive download cancelled before start.';
             return;
           }
-          showArchiveStartButton(box, path, '/fs/download_raw_tar?dir=' + encodeURIComponent(path), 'pump-section-start-button');
+          showArchiveStartButton(box, path, '/fs/download_raw_tar?dir=' + encodeURIComponent(path), 'pump-section-start-button', info);
         } catch (e) {
           box.textContent = 'Archive estimate failed.';
           console.log(e);
@@ -524,18 +577,20 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
         const opening = (container.style.display === 'none' || container.style.display === '');
         if (opening) {
           container.style.display = 'block';
+          this.textContent = 'Hide Pump Logs';
           setPumpLogButtonsVisible(true);
           pumpLogCurrentPath = pumpLogRoot;
           fetchPumpLogFileList();
         } else {
           container.style.display = 'none';
+          this.textContent = 'View Pump Logs';
           setPumpLogButtonsVisible(false);
           requestAnimationFrame(() => requestAnimationFrame(postHeightToParent));
         }
       });
 
       async function fetchPumpLogFileList() {
-        const list = document.getElementById('filesContainer');
+        const list = document.getElementById('pumpLogFileList');
         list.innerHTML = '<div class="emptyNote">Loading pump logs...</div>';
         try {
           const r = await fetch(`/fs/list?dir=${encodeURIComponent(pumpLogCurrentPath)}&ts=${Date.now()}`, { cache: 'no-store' });
@@ -570,8 +625,14 @@ static const char secondPageTemplate[] PROGMEM = R"rawliteral(
 
           const pathLine = document.createElement('div');
           pathLine.className = 'browserPath';
+          pathLine.id = 'pumpLogCurrentPathLine';
           pathLine.textContent = 'Current path: ' + pumpLogCurrentPath;
           list.appendChild(pathLine);
+          const existingArchiveBox = document.getElementById('pumpArchiveStatusBox');
+          if (existingArchiveBox && existingArchiveBox.textContent.trim()) {
+            existingArchiveBox.style.display = 'block';
+            list.appendChild(existingArchiveBox);
+          }
 
           if (!Array.isArray(items) || items.length === 0) {
             const empty = document.createElement('div');

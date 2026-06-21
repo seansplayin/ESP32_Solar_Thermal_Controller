@@ -481,6 +481,13 @@ ESP32_Solar_Thermal_Controller_20260614234210 - Pump log start and stop events a
 
 ESP32_Solar_Thermal_Controller_20260620005348 - moved Flash Memory Browser from Temperature Logs Iframe to unused webpage section. Modified View Temperature Log and View Pump Log menu's to enable log file and directory downloads. Extensive rework of the system's file downloading scheme. Unfortunately I was unable to make directory downloads work consistently with a 500KB Temperature_Logs directory and ultimately completely removed TarGZ and it's compressor archive from sketch. Directories downloaded work via a streaming .tar file but the data is not compressed during flight.
 
+ESP32_Solar_Thermal_Controller_20260620115016 - Downloads are all successful now. 
+
+ESP32_Solar_Thermal_Controller_20260621005254 - Small cosmedic changes to the Download information output boxes for Pump Runtimes and Temperature Logs Iframes and reloaced the download buttons to the popup archive information window. Sketch ran for 10 hours with pins occurring constantly and on the first Network Disconnect events the controller crashed with corrupt heap message. 
+
+
+
+
 
 Work on this in the future:
 
