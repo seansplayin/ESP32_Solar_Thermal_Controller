@@ -485,6 +485,84 @@ ESP32_Solar_Thermal_Controller_20260620115016 - Downloads are all successful now
 
 ESP32_Solar_Thermal_Controller_20260621005254 - Small cosmedic changes to the Download information output boxes for Pump Runtimes and Temperature Logs Iframes and reloaced the download buttons to the popup archive information window. Sketch ran for 10 hours with pins occurring constantly and on the first Network Disconnect events the controller crashed with corrupt heap message. 
 
+Ethernet adapter went 10 hours without a single network adapter disconnect event and then the ethernet recovery event caused corrupt heap and the controller rebooted. I read on a forum somewhere and I asaked ChatGPT about specific settings to solve nusence W5500 disconnects stemming from AsyncTCP being used on an multicore RTOS with the W5500 network adapter and work loads being on different cores and this is what chatgpt responded with. ChatGPT wrong the following response and made me a new sketch that incorporated a new file "build_opt.h" with these configuration settings "-D CONFIG_ASYNC_TCP_RUNNING_CORE=1, -D CONFIG_ASYNC_TCP_PRIORITY=10, -D CONFIG_ASYNC_TCP_QUEUE_SIZE=64, -D CONFIG_ASYNC_TCP_STACK_SIZE=8192, -D CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000" and then wrote "Yes — this is exactly the next direction I would take. Your uploaded log shows the key failure happening during the recovery path: WebSocket disconnect / Ethernet disconnect, then `ETH.end()` / `Ethernet Stopped`, then `CORRUPT HEAP: Bad tail` and reboot. That supports the idea that normal webpage traffic is not the main crash point; the risk is the ETH/W5500 restart while AsyncTCP/WebSocket objects may still be alive. I built the next diagnostic package here: [Download Phase2N NetCoreAffinityDiag](sandbox:/mnt/data/ESP32_Solar_Thermal_Controller_Phase2N_NetCoreAffinityDiag.zip)
+
+What I changed:
+
+1. **Added `build_opt.h`**
+
+   ```cpp
+   -D CONFIG_ASYNC_TCP_RUNNING_CORE=1
+   -D CONFIG_ASYNC_TCP_PRIORITY=10
+   -D CONFIG_ASYNC_TCP_QUEUE_SIZE=64
+   -D CONFIG_ASYNC_TCP_STACK_SIZE=8192
+   -D CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000
+   ```
+
+2. **Modified `NetworkManager.cpp`**
+
+   * Logs the active AsyncTCP build settings at boot.
+   * Logs core IDs for Ethernet events: started, connected, got IP, lost IP, disconnected, stopped.
+   * Pins `NetWatchdog` to core 1.
+   * Keeps `NetRecover` pinned to core 1.
+   * Before `ETH.end()`, closes WebSocket clients using:
+
+     ```cpp
+     ws.closeAll();
+     ws.cleanupClients();
+     ```
+   * Adds heap integrity checks:
+
+     * before WebSocket close / `ETH.end()`
+     * after WebSocket close
+     * after `ETH.end()`
+     * after recovery `ETH.begin()`
+
+The AsyncTCP build-option direction is also consistent with the current ESPAsyncWebServer / AsyncTCP docs: they describe `CONFIG_ASYNC_TCP_RUNNING_CORE` as the core that handles queue events and server callbacks, and their example pins it to core 1. They also list priority 10, queue size 64, and adjustable stack sizing as the relevant build flags. ([GitHub][1])
+
+Changed files list:
+
+* `build_opt.h` — new
+* `NetworkManager.cpp` — modified
+
+I could not compile it in the Arduino IDE from here, so treat this as the next bench-test package. The serial markers to watch for are:
+
+```text
+[Network] AsyncTCP build config: core=1 priority=10 queue=64 stack=8192 ack=5000
+[NETCORE] setupNetwork entered core=...
+[NETCORE] NetWatchdog task started core=...
+[NETCORE] NetRecover task started core=...
+[Network] Heap before WS close/ETH.end: ok=...
+[Network] Heap after WS close: ok=...
+[Network] Heap after ETH.end(): ok=...
+[Network] Heap after ETH.begin(): ok=...
+```
+
+The most important result is whether heap is already bad **before** `ETH.end()`, or only becomes bad **during/after** `ETH.end()`. That will tell us whether the corruptor is normal runtime traffic or the recovery sequence itself.
+
+[1]: https://github.com/me-no-dev/ESPAsyncWebServer/blob/master/README.ESP32Async.md "ESPAsyncWebServer/README.ESP32Async.md at master · me-no-dev/ESPAsyncWebServer · GitHub"
+"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

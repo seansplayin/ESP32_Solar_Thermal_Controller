@@ -12,6 +12,8 @@
 #include "DiagLog.h"
 #include <string.h>
 #include "AlarmManager.h"
+#include "WebServerManager.h"
+#include <esp_heap_caps.h>
 
 // PHY configuration for W5500
 #define ETH_PHY_TYPE ETH_PHY_W5500
@@ -23,6 +25,23 @@
 #ifndef ETH_SPI_FREQ_MHZ
 #define ETH_SPI_FREQ_MHZ 10 // at 15 mhz 92 network disconnects in 20 hours runtime. at 10 mhz 47 disconnects in 24 hours.
 #endif
+
+#ifndef CONFIG_ASYNC_TCP_RUNNING_CORE
+#define CONFIG_ASYNC_TCP_RUNNING_CORE -1
+#endif
+#ifndef CONFIG_ASYNC_TCP_PRIORITY
+#define CONFIG_ASYNC_TCP_PRIORITY 10
+#endif
+#ifndef CONFIG_ASYNC_TCP_QUEUE_SIZE
+#define CONFIG_ASYNC_TCP_QUEUE_SIZE 64
+#endif
+#ifndef CONFIG_ASYNC_TCP_STACK_SIZE
+#define CONFIG_ASYNC_TCP_STACK_SIZE 8192
+#endif
+#ifndef CONFIG_ASYNC_TCP_MAX_ACK_TIME
+#define CONFIG_ASYNC_TCP_MAX_ACK_TIME 5000
+#endif
+
 
 // --- Static IP Configuration ---
 const bool USE_STATIC_IP = false;          // Set to false to use dynamic DHCP or true to use static
@@ -58,6 +77,14 @@ static volatile uint32_t s_lastGotIpMs    = 0;
 
 static portMUX_TYPE s_netDiagMux = portMUX_INITIALIZER_UNLOCKED;
 static NetworkDiagnosticsSnapshot s_netDiag = {};
+
+static void logNetworkCoreTrace(const char* label) {
+  LOG_ERR("[NETCORE] %s core=%u heap8=%u min8=%u\n",
+          label,
+          (unsigned)xPortGetCoreID(),
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+}
 
 static void recordNetworkEvent(const char* eventText) {
   uint32_t nowMs = millis();
@@ -127,6 +154,7 @@ static void NetworkRecoveryTask(void* pvParameters);
 // ---------------- Active Socket Watchdog ----------------
 void TaskNetworkWatchdog(void *pvParameters) {
     int failedAttempts = 0;
+    logNetworkCoreTrace("NetWatchdog task started");
     for(;;) {
         // Ping every 15 seconds instead of 30
         vTaskDelay(pdMS_TO_TICKS(15000)); 
@@ -196,6 +224,18 @@ static void hardResetW5500() {
   vTaskDelay(pdMS_TO_TICKS(150));              // Give the chip 150ms to fully boot before talking to it over SPI
 }
 
+
+static void closeWebSocketsBeforeEthRestart() {
+  // AsyncTCP / ESPAsyncWebServer can still have queued client objects after the
+  // W5500 link drops. Close those clients from the recovery task before ETH.end()
+  // frees the Ethernet stack underneath them.
+  logNetworkCoreTrace("Closing WS clients before ETH.end");
+  ws.closeAll();
+  vTaskDelay(pdMS_TO_TICKS(300));
+  ws.cleanupClients();
+  vTaskDelay(pdMS_TO_TICKS(200));
+}
+
 static void requestNetworkRecovery() {
   if (s_ethRestartInProgress) {
     return;
@@ -212,6 +252,7 @@ static void requestNetworkRecovery() {
 
 static void NetworkRecoveryTask(void* pvParameters) {
   (void)pvParameters;
+  logNetworkCoreTrace("NetRecover task started");
 
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -253,13 +294,27 @@ static void NetworkRecoveryTask(void* pvParameters) {
       incrementNetworkCounter(&s_netDiag.recoveryStartedCount);
       recordNetworkEvent("Debounced recovery started");
       LOG_ERR("[Network] Debounced recovery: restarting W5500 / ETH stack\n");
+      logNetworkCoreTrace("Recovery starting");
       AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN,
                          "Debounced recovery: restarting W5500 / ETH stack");
       eth_link_up = false;
       eth_connected = false;
 
+      uint32_t heapBefore = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+      uint32_t heapMinBefore = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+      bool heapOkBefore = heap_caps_check_integrity_all(false);
+      LOG_ERR("[Network] Heap before WS close/ETH.end: ok=%d free8=%u min8=%u\n",
+              heapOkBefore ? 1 : 0, (unsigned)heapBefore, (unsigned)heapMinBefore);
+
+      closeWebSocketsBeforeEthRestart();
+      bool heapOkAfterWsClose = heap_caps_check_integrity_all(false);
+      LOG_ERR("[Network] Heap after WS close: ok=%d\n", heapOkAfterWsClose ? 1 : 0);
+
+      LOG_ERR("[Network] Calling ETH.end() from NetRecover core=%u\n", (unsigned)xPortGetCoreID());
       ETH.end();
-      vTaskDelay(pdMS_TO_TICKS(300));
+      vTaskDelay(pdMS_TO_TICKS(500));
+      bool heapOkAfterEthEnd = heap_caps_check_integrity_all(false);
+      LOG_ERR("[Network] Heap after ETH.end(): ok=%d\n", heapOkAfterEthEnd ? 1 : 0);
 
       spiW5500.end(); // USED LOCKED SPI
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -280,6 +335,7 @@ static void NetworkRecoveryTask(void* pvParameters) {
           ETH.config(staticIP, staticGateway, staticSubnet, staticDns1, staticDns2);
       }
 
+      LOG_ERR("[Network] Calling ETH.begin() from NetRecover core=%u\n", (unsigned)xPortGetCoreID());
       bool ethStarted = ETH.begin(
         ETH_PHY_TYPE,
         ETH_PHY_ADDR,
@@ -289,6 +345,10 @@ static void NetworkRecoveryTask(void* pvParameters) {
         spiW5500, // USED LOCKED SPI
         ETH_SPI_FREQ_MHZ
       );
+      bool heapOkAfterEthBegin = heap_caps_check_integrity_all(false);
+      LOG_ERR("[Network] Heap after ETH.begin(): ok=%d free8=%u\n",
+              heapOkAfterEthBegin ? 1 : 0,
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
 
       if (!ethStarted) {
         s_ethRestartInProgress = false;
@@ -333,14 +393,14 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
     case ARDUINO_EVENT_ETH_START:
       incrementNetworkCounter(&s_netDiag.ethStartCount);
       recordNetworkEvent("Ethernet Started");
-      LOG_CAT(DBG_NET, "[Network] Ethernet Started\n");
+      LOG_CAT(DBG_NET, "[Network] Ethernet Started core=%u\n", (unsigned)xPortGetCoreID());
       ETH.setHostname("esp32s3-solar");
       break;
 
         case ARDUINO_EVENT_ETH_CONNECTED:
       incrementNetworkCounter(&s_netDiag.ethConnectedCount);
       recordNetworkEvent("Ethernet Connected");
-      LOG_CAT(DBG_NET, "[Network] Ethernet Connected\n");
+      LOG_CAT(DBG_NET, "[Network] Ethernet Connected core=%u\n", (unsigned)xPortGetCoreID());
       eth_link_up = true;
       s_lastLinkUpMs = millis();
       break;
@@ -349,7 +409,7 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
       incrementNetworkCounter(&s_netDiag.ethGotIpCount);
       recordNetworkEvent("Ethernet Got IP");
       recordNetworkIp(ETH.localIP());
-      LOG_CAT(DBG_NET, "[Network] Ethernet Got IP: %s\n", ETH.localIP().toString().c_str());
+      LOG_CAT(DBG_NET, "[Network] Ethernet Got IP: %s core=%u\n", ETH.localIP().toString().c_str(), (unsigned)xPortGetCoreID());
       eth_link_up = true;
       eth_connected = true;
       s_lastLinkUpMs = millis();
@@ -360,7 +420,7 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
     case ARDUINO_EVENT_ETH_LOST_IP:
       incrementNetworkCounter(&s_netDiag.ethLostIpCount);
       recordNetworkEvent("Ethernet Lost IP");
-      LOG_ERR("[Network] Ethernet Lost IP\n");
+      LOG_ERR("[Network] Ethernet Lost IP core=%u\n", (unsigned)xPortGetCoreID());
       AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet Lost IP");
       // IMPORTANT:
       // Keep link_up true here. LOST_IP is not the same as PHY/link-down.
@@ -375,7 +435,7 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       incrementNetworkCounter(&s_netDiag.ethDisconnectedCount);
       recordNetworkEvent("Ethernet Disconnected");
-      LOG_ERR("[Network] Ethernet Disconnected\n");
+      LOG_ERR("[Network] Ethernet Disconnected core=%u\n", (unsigned)xPortGetCoreID());
       AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet Disconnected");
       eth_link_up = false;
       eth_connected = false;
@@ -388,7 +448,7 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
     case ARDUINO_EVENT_ETH_STOP:
       incrementNetworkCounter(&s_netDiag.ethStoppedCount);
       recordNetworkEvent("Ethernet Stopped");
-      LOG_ERR("[Network] Ethernet Stopped\n");
+      LOG_ERR("[Network] Ethernet Stopped core=%u\n", (unsigned)xPortGetCoreID());
       AlarmManager_event(ALM_NETWORK_FAULT, ALM_WARN, "Ethernet Stopped");
       eth_link_up = false;
       eth_connected = false;
@@ -404,6 +464,14 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
 }
 
 void setupNetwork() {
+  logNetworkCoreTrace("setupNetwork entered");
+  LOG_ERR("[Network] AsyncTCP build config: core=%d priority=%d queue=%d stack=%d ack=%d\n",
+          (int)CONFIG_ASYNC_TCP_RUNNING_CORE,
+          (int)CONFIG_ASYNC_TCP_PRIORITY,
+          (int)CONFIG_ASYNC_TCP_QUEUE_SIZE,
+          (int)CONFIG_ASYNC_TCP_STACK_SIZE,
+          (int)CONFIG_ASYNC_TCP_MAX_ACK_TIME);
+
   // Natively mute the noisy W5500 and ETH drivers at the ESP-IDF core level 
   // instead of using a stack-crushing custom vprintf interceptor.
   esp_log_level_set("w5500.mac", ESP_LOG_NONE);
@@ -437,7 +505,7 @@ void setupNetwork() {
   Network.onEvent(onEvent);
   
   // Spawn the Active Socket Watchdog 
-  xTaskCreate(TaskNetworkWatchdog, "NetWatchdog", 3072, NULL, 2, NULL);
+  xTaskCreatePinnedToCore(TaskNetworkWatchdog, "NetWatchdog", 4096, NULL, 2, NULL, 1);
 
   LOG_CAT(DBG_NET, "[Network] Attempting initial setup...\n");
 
@@ -446,6 +514,7 @@ void setupNetwork() {
       ETH.config(staticIP, staticGateway, staticSubnet, staticDns1, staticDns2);
   }
 
+  LOG_ERR("[Network] Calling initial ETH.begin() from core=%u\n", (unsigned)xPortGetCoreID());
   bool ethStarted = ETH.begin(
     ETH_PHY_TYPE,
     ETH_PHY_ADDR,
