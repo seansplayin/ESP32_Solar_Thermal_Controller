@@ -543,7 +543,9 @@ The most important result is whether heap is already bad **before** `ETH.end()`,
 [1]: https://github.com/me-no-dev/ESPAsyncWebServer/blob/master/README.ESP32Async.md "ESPAsyncWebServer/README.ESP32Async.md at master · me-no-dev/ESPAsyncWebServer · GitHub"
 "
 
+ESP32_Solar_Thermal_Controller_20260621230045 - Changes Made to Ethernet recovery
 
+Waveshare_ESP32-S3 - ported project to Waveshare controller. currently working: Relays, RTC, Logging, Ethernet, Max31865/PT1000, Onewire, Dashboard. Added support for TF Card.
 
 
 
